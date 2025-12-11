@@ -1,0 +1,53 @@
+[[accounts]]
+username = "1001"
+domain = "sip.example.com"
+password = "secretpassword"
+register = true
+
+# Strategy: Answer immediately and Echo
+[accounts.answer]
+echo = true
+
+[[accounts]]
+username = "1002"
+domain = "sip.example.com"
+password = "secretpassword"
+
+# Strategy: Answer, Play file, then Hangup after 10s
+[accounts.answer]
+wav_file = "welcome.wav"
+echo = false
+
+[accounts.hangup]
+code = 200
+after_secs = 10
+
+[[accounts]]
+username = "1003"
+domain = "sip.example.com"
+password = "secretpassword"
+
+# Strategy: Ring for 5 seconds, then Reject
+[accounts.ring]
+duration_secs = 5
+# No ringback specified -> Send 180 Ringing
+
+[accounts.hangup]
+code = 486 # Busy Here
+
+[[accounts]]
+username = "1004"
+domain = "sip.example.com"
+password = "secretpassword"
+
+# Strategy: Early Media (Color Ring), Wait 10s, Answer, Play file
+[accounts.early_media]
+wav_file = "ringback.wav"
+
+[accounts.ring]
+duration_secs = 10
+ringback = "custom_ring.wav" # Send 183 and play file
+
+[accounts.answer]
+wav_file = "agent_hello.wav"
+echo = false
