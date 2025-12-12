@@ -27,7 +27,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
+
+const ANSWER_WAV: &[u8] = include_bytes!("../wavs/answer.wav");
 // use voice_engine::net_tool::extract_rtp_addresses_from_sdp;
 
 pub struct SipBot {
@@ -301,7 +303,12 @@ impl SipBot {
         // Create MediaSession and Offer
         let srtp_enabled = self.account.srtp_enabled.unwrap_or(false);
         let (media_session, local_sdp) =
-            MediaSession::new_offer(srtp_enabled, self.global_config.external_ip.clone()).await?;
+            MediaSession::new_offer(srtp_enabled, self.global_config.external_ip.clone(), true)
+                .await?;
+        debug!(
+            "[{}] Generated Offer SDP:\n{}",
+            self.account.username, local_sdp
+        );
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -349,6 +356,10 @@ impl SipBot {
                 rsip::status_code::StatusCodeKind::Successful
             ) {
                 let answer_sdp = String::from_utf8_lossy(&res.body);
+                debug!(
+                    "[{}] Received Answer SDP:\n{}",
+                    self.account.username, answer_sdp
+                );
                 media_session.set_remote_answer(&answer_sdp).await?;
                 info!("[{}] Set remote answer", self.account.username);
             } else {
@@ -365,17 +376,19 @@ impl SipBot {
         }
 
         let hangup_secs = self.account.hangup.as_ref().and_then(|h| h.after_secs);
+        let record_path = self.account.record.clone().map(PathBuf::from);
 
         let media_session_clone = media_session.clone();
         let answer_config = self.account.answer.clone();
         let username = self.account.username.clone();
         let play_future = async move {
+            let record_path_ref = record_path.as_deref();
             if let Some(answer_config) = answer_config {
                 match answer_config {
                     AnswerConfig::Play { wav_file } => {
                         let file_path = PathBuf::from(wav_file);
                         if let Err(e) = media_session_clone
-                            .play_file(username, &file_path, None)
+                            .play_file(username, &file_path, record_path_ref)
                             .await
                         {
                             error!("Failed to play file: {:?}", e);
@@ -384,8 +397,11 @@ impl SipBot {
                     _ => {}
                 }
             } else {
-                if let Err(e) = media_session_clone.play_beeps(username).await {
-                    warn!("Play beeps stopped: {:?}", e);
+                if let Err(e) = media_session_clone
+                    .play_wav_bytes(username, ANSWER_WAV, record_path_ref)
+                    .await
+                {
+                    warn!("Play built-in answer stopped: {:?}", e);
                 }
             }
         };
@@ -407,7 +423,7 @@ impl SipBot {
                 self.account.username, secs
             );
 
-            tokio::spawn(play_future);
+            let play_handle = tokio::spawn(play_future);
 
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(secs)) => {
@@ -417,9 +433,11 @@ impl SipBot {
                     info!("[{}] Ctrl-C received.", self.account.username);
                 }
                 _ = monitor_future => {
+                    play_handle.abort();
                     return Ok(());
                 }
             }
+            play_handle.abort();
         } else {
             info!(
                 "[{}] Call established. Waiting for playback or Ctrl-C to hang up...",
@@ -580,10 +598,7 @@ impl SipBot {
         } else {
             None
         };
-        let contact_str = format!(
-            "sip:{}@{}:{}",
-            self.account.username, local_ip, local_port
-        );
+        let contact_str = format!("sip:{}@{}:{}", self.account.username, local_ip, local_port);
         let server_dialog = dialog_layer.get_or_create_server_invite(
             &transaction,
             tx,
@@ -696,7 +711,8 @@ impl SipBot {
                 }
 
                 // Stage 2: Answer or Reject
-                if let Some(ref cfg) = account.answer {
+                // Always answer with configured or default media
+                {
                     info!("[{}] Stage 2: Answering (200 OK)", account.username);
                     let mut headers = vec![];
                     let mut body = None;
@@ -719,28 +735,43 @@ impl SipBot {
                     }
 
                     let username_media = account.username.clone();
-                    let answer_config = cfg.clone();
+                    let answer_config = account.answer.clone();
                     let hangup_config = account.hangup.clone();
 
                     let media_future = async {
                         if let Some(mut media) = media_session {
-                            match answer_config {
-                                AnswerConfig::Echo => {
-                                    info!("[{}] Stage 2: Starting Echo", username_media);
-                                    media
-                                        .start_echo(username_media.clone(), Some(&recording_path))
-                                        .await
+                            if let Some(cfg) = answer_config {
+                                match cfg {
+                                    AnswerConfig::Echo => {
+                                        info!("[{}] Stage 2: Starting Echo", username_media);
+                                        media
+                                            .start_echo(
+                                                username_media.clone(),
+                                                Some(&recording_path),
+                                            )
+                                            .await
+                                    }
+                                    AnswerConfig::Play { wav_file } => {
+                                        info!("[{}] Stage 2: Playing {}", username_media, wav_file);
+                                        media
+                                            .play_file(
+                                                username_media.clone(),
+                                                std::path::Path::new(&wav_file),
+                                                Some(&recording_path),
+                                            )
+                                            .await
+                                    }
                                 }
-                                AnswerConfig::Play { wav_file } => {
-                                    info!("[{}] Stage 2: Playing {}", username_media, wav_file);
-                                    media
-                                        .play_file(
-                                            username_media.clone(),
-                                            std::path::Path::new(&wav_file),
-                                            Some(&recording_path),
-                                        )
-                                        .await
-                                }
+                            } else {
+                                // Default answer
+                                info!("[{}] Stage 2: Playing default answer", username_media);
+                                media
+                                    .play_wav_bytes(
+                                        username_media,
+                                        ANSWER_WAV,
+                                        Some(&recording_path),
+                                    )
+                                    .await
                             }
                         } else {
                             Ok(())
@@ -777,33 +808,6 @@ impl SipBot {
                         if let Err(e) = media_future.await {
                             error!("[{}] Media error: {:?}", account.username, e);
                         }
-                    }
-                } else {
-                    // No Answer config -> Reject
-                    if let Some(ref hangup) = account.hangup {
-                        info!(
-                            "[{}] No answer config, rejecting with code {}",
-                            account.username, hangup.code
-                        );
-                        match StatusCode::try_from(hangup.code) {
-                            Ok(code) => {
-                                let _ = server_dialog_clone.reject(Some(code), None);
-                            }
-                            Err(_) => {
-                                error!(
-                                    "[{}] Invalid status code: {}",
-                                    account.username, hangup.code
-                                );
-                                let _ = server_dialog_clone
-                                    .reject(Some(StatusCode::ServerInternalError), None);
-                            }
-                        }
-                    } else {
-                        warn!(
-                            "[{}] No answer/hangup config. Rejecting with 603 Decline.",
-                            account.username
-                        );
-                        let _ = server_dialog_clone.reject(Some(StatusCode::Decline), None);
                     }
                 }
             };

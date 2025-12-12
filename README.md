@@ -33,21 +33,38 @@ You can also run `sipbot` with CLI arguments for quick testing.
 
 #### Global Options
 - `-C, --conf <FILE>`: Path to the configuration file.
-- `-E, --external-ip <IP>`: External IP address for SDP (NAT traversal).
+- `-E, --external <IP>`: External IP address for SDP (NAT traversal).
 
 #### Initiate a Call
 ```bash
-cargo run -- call --target sip:user@domain --caller sip:me@mydomain --play-file audio.wav --hangup 10
+cargo run -- call sip:user@domain --caller sip:me@mydomain --play audio.wav --hangup 10
 ```
-- `--target`: The SIP URI to call.
-- `--caller`: The caller's SIP URI or username.
-- `--play-file`: Path to a WAV file to play when the call is answered.
-- `--hangup`: Hangup after specified seconds.
+- `<TARGET>`: Target URI (e.g., sip:user@domain).
+- `-c, --caller <URI>`: Caller (username or full URI).
+- `--auth-user <USER>`: Auth username (optional).
+- `--password <PASS>`: Auth password.
+- `--hangup <SECONDS>`: Hangup after seconds.
+- `--play <FILE>`: Play file (wav).
+- `--srtp`: Enable SRTP/SDES.
 
 #### Wait for Calls
 ```bash
-cargo run -- wait --addr 0.0.0.0:5060 --username sipbot --answer-file welcome.wav
+cargo run -- wait --addr 0.0.0.0:5060 --username sipbot --answer welcome.wav
 ```
+- `-a, --addr <ADDR>`: Bind address (e.g., 0.0.0.0:5060).
+- `-u, --username <USER>`: Username (e.g., sipbot).
+- `-d, --domain <DOMAIN>`: Domain (e.g., 127.0.0.1).
+- `--ringback <FILE>`: Ringback file (wav).
+- `--ring-duration <SECONDS>`: Ring duration in seconds.
+- `--answer <FILE>`: Answer and play file (wav).
+- `--echo`: Answer and echo.
+- `--hangup <SECONDS>`: Hangup after seconds.
+- `--reject <CODE>`: Reject with code (e.g. 486, 603).
+- `--srtp`: Enable SRTP/SDES.
+
+#### Other Commands
+- `options`: Send OPTIONS request.
+- `info`: Send INFO request.
 
 ## Configuration
 

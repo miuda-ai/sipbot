@@ -13,6 +13,12 @@ enum AudioPacket {
     Stop,
 }
 
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        let _ = self.tx.send(AudioPacket::Stop);
+    }
+}
+
 impl Recorder {
     pub fn new(username: String, path: PathBuf) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -99,12 +105,6 @@ impl Recorder {
 
     pub fn record_tx(&self, samples: &[i16]) {
         let _ = self.tx.send(AudioPacket::Tx(samples.to_vec()));
-    }
-}
-
-impl Drop for Recorder {
-    fn drop(&mut self) {
-        let _ = self.tx.send(AudioPacket::Stop);
     }
 }
 

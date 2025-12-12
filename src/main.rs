@@ -16,7 +16,7 @@ struct Args {
 
     /// External IP address
     #[arg(short = 'E', long, global = true)]
-    external_ip: Option<String>,
+    external: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -27,7 +27,6 @@ enum Commands {
     /// Initiate a call
     Call {
         /// Target URI (e.g., sip:user@domain)
-        #[arg(short, long)]
         target: Option<String>,
         /// Caller (username or full URI e.g. sip:user@domain)
         #[arg(short, long)]
@@ -43,7 +42,10 @@ enum Commands {
         hangup: Option<u64>,
         /// Play file (wav)
         #[arg(long)]
-        play_file: Option<String>,
+        play: Option<String>,
+        /// Record to file (wav)
+        #[arg(long)]
+        record: Option<String>,
         /// Enable SRTP/SDES
         #[arg(long)]
         srtp: bool,
@@ -67,16 +69,16 @@ enum Commands {
         ring_duration: Option<u64>,
         /// Answer and play file (wav)
         #[arg(long)]
-        answer_file: Option<String>,
+        answer: Option<String>,
         /// Answer and echo
         #[arg(long)]
         echo: bool,
         /// Hangup after seconds
         #[arg(long)]
-        hangup_after: Option<u64>,
+        hangup: Option<u64>,
         /// Reject with code (e.g. 486, 603)
         #[arg(long)]
-        reject_code: Option<u16>,
+        reject: Option<u16>,
         /// Enable SRTP/SDES
         #[arg(long)]
         srtp: bool,
@@ -137,6 +139,7 @@ async fn main() -> Result<()> {
                         proxy: None,
                         register: Some(false),
                         target: None,
+                        record: None,
                         srtp_enabled: None,
                         early_media: None,
                         ring: None,
@@ -151,10 +154,10 @@ async fn main() -> Result<()> {
                 domain,
                 ringback,
                 ring_duration,
-                answer_file,
+                answer,
                 echo,
-                hangup_after,
-                reject_code,
+                hangup,
+                reject,
                 srtp,
             } => {
                 info!("Configuration file not found, using default configuration for wait command");
@@ -170,7 +173,7 @@ async fn main() -> Result<()> {
 
                 let answer_config = if *echo {
                     Some(sipbot::config::AnswerConfig::Echo)
-                } else if let Some(file) = answer_file {
+                } else if let Some(file) = answer {
                     Some(sipbot::config::AnswerConfig::Play {
                         wav_file: file.clone(),
                     })
@@ -178,12 +181,12 @@ async fn main() -> Result<()> {
                     None
                 };
 
-                let hangup_config = if let Some(code) = reject_code {
+                let hangup_config = if let Some(code) = reject {
                     Some(sipbot::config::HangupConfig {
                         code: *code,
                         after_secs: None,
                     })
-                } else if let Some(secs) = hangup_after {
+                } else if let Some(secs) = hangup {
                     Some(sipbot::config::HangupConfig {
                         code: 200,
                         after_secs: Some(*secs),
@@ -204,6 +207,7 @@ async fn main() -> Result<()> {
                         proxy: None,
                         register: Some(false),
                         target: None,
+                        record: None,
                         srtp_enabled: Some(*srtp),
                         early_media: None,
                         ring: ring_config,
@@ -219,7 +223,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    if let Some(external_ip) = args.external_ip {
+    if let Some(external_ip) = args.external {
         config.external_ip = Some(external_ip);
     }
 
@@ -231,6 +235,7 @@ async fn main() -> Result<()> {
         password_override,
         hangup_override,
         play_file_override,
+        record_override,
         srtp_override,
     ) = match args.command {
         Commands::Call {
@@ -239,14 +244,17 @@ async fn main() -> Result<()> {
             auth_user,
             password,
             hangup,
-            play_file,
+            play,
+            record,
             srtp,
         } => (
-            "call", target, caller, auth_user, password, hangup, play_file, srtp,
+            "call", target, caller, auth_user, password, hangup, play, record, srtp,
         ),
-        Commands::Wait { srtp, .. } => ("wait", None, None, None, None, None, None, srtp),
-        Commands::Options { target } => ("options", target, None, None, None, None, None, false),
-        Commands::Info { target } => ("info", target, None, None, None, None, None, false),
+        Commands::Wait { srtp, .. } => ("wait", None, None, None, None, None, None, None, srtp),
+        Commands::Options { target } => {
+            ("options", target, None, None, None, None, None, None, false)
+        }
+        Commands::Info { target } => ("info", target, None, None, None, None, None, None, false),
     };
 
     let mut handles = vec![];
@@ -259,9 +267,14 @@ async fn main() -> Result<()> {
         let auth_user_override = auth_user_override.clone();
         let password_override = password_override.clone();
         let play_file_override = play_file_override.clone();
+        let record_override = record_override.clone();
 
         if let Some(target) = &target_override {
             account.target = Some(target.clone());
+        }
+
+        if let Some(record) = &record_override {
+            account.record = Some(record.clone());
         }
 
         if srtp_override {

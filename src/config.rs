@@ -30,6 +30,7 @@ pub struct AccountConfig {
     pub proxy: Option<String>,
     pub register: Option<bool>,     // Default to true if missing
     pub target: Option<String>,     // Target URI for outbound calls
+    pub record: Option<String>,     // Recording file path
     pub srtp_enabled: Option<bool>, // Enable SRTP/SDES
 
     // Stage 1: Early Media (183)
