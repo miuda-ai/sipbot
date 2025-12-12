@@ -581,7 +581,7 @@ impl SipBot {
             None
         };
         let contact_str = format!(
-            "<sip:{}@{}:{}>",
+            "sip:{}@{}:{}",
             self.account.username, local_ip, local_port
         );
         let server_dialog = dialog_layer.get_or_create_server_invite(
