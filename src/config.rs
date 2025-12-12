@@ -6,6 +6,7 @@ use tokio::fs;
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub addr: Option<String>,
+    pub external_ip: Option<String>,
     pub recorders: Option<String>,
     pub accounts: Vec<AccountConfig>,
 }
@@ -27,8 +28,9 @@ pub struct AccountConfig {
     pub domain: String,
     pub password: Option<String>,
     pub proxy: Option<String>,
-    pub register: Option<bool>, // Default to true if missing
-    pub target: Option<String>, // Target URI for outbound calls
+    pub register: Option<bool>,     // Default to true if missing
+    pub target: Option<String>,     // Target URI for outbound calls
+    pub srtp_enabled: Option<bool>, // Enable SRTP/SDES
 
     // Stage 1: Early Media (183)
     pub early_media: Option<EarlyMediaConfig>,

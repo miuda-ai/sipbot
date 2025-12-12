@@ -25,18 +25,23 @@ pub struct MediaSession {
 }
 
 impl MediaSession {
-    pub async fn new(remote_sdp: &str) -> Result<(Self, String)> {
+    pub async fn new(
+        remote_sdp: &str,
+        srtp_enabled: bool,
+        external_ip: Option<String>,
+    ) -> Result<(Self, String)> {
         let mut config = RtcConfiguration::default();
-        config.transport_mode = TransportMode::Rtp;
+        if let Some(ip) = external_ip {
+            config.external_ip = Some(ip);
+        }
+        config.transport_mode = if srtp_enabled {
+            TransportMode::Srtp
+        } else {
+            TransportMode::Rtp
+        };
         config.ice_servers = vec![]; // No STUN/TURN servers
         config.media_capabilities = Some(MediaCapabilities {
-            audio: vec![AudioCapability {
-                payload_type: 0,
-                codec_name: "PCMU".to_string(),
-                clock_rate: 8000,
-                channels: 1,
-                fmtp: None,
-            }],
+            audio: vec![AudioCapability::pcmu()],
             video: vec![],
             application: None,
         });
@@ -76,9 +81,19 @@ impl MediaSession {
         ))
     }
 
-    pub async fn new_offer() -> Result<(Self, String)> {
+    pub async fn new_offer(
+        srtp_enabled: bool,
+        external_ip: Option<String>,
+    ) -> Result<(Self, String)> {
         let mut config = RtcConfiguration::default();
-        config.transport_mode = TransportMode::Rtp;
+        if let Some(ip) = external_ip {
+            config.external_ip = Some(ip);
+        }
+        config.transport_mode = if srtp_enabled {
+            TransportMode::Srtp
+        } else {
+            TransportMode::Rtp
+        };
         config.ice_servers = vec![]; // No STUN/TURN servers
         config.media_capabilities = Some(MediaCapabilities {
             audio: vec![AudioCapability {
@@ -129,12 +144,17 @@ impl MediaSession {
         Ok(())
     }
 
-    pub async fn play_file(&self, file_path: &Path, recording_path: Option<&Path>) -> Result<()> {
-        info!("Playing file: {:?}", file_path);
+    pub async fn play_file(
+        &self,
+        username: String,
+        file_path: &Path,
+        recording_path: Option<&Path>,
+    ) -> Result<()> {
+        info!("[{}] Playing file: {:?}", username, file_path);
 
         if let Some(path) = recording_path {
             let mut rec = self.recorder.lock().await;
-            *rec = Some(Recorder::new(path.to_path_buf()));
+            *rec = Some(Recorder::new(username.clone(), path.to_path_buf()));
         }
 
         let mut reader = hound::WavReader::open(file_path).context("Failed to open WAV file")?;
@@ -143,8 +163,8 @@ impl MediaSession {
 
         let samples = if spec.sample_rate != 8000 || spec.channels != 1 {
             info!(
-                "Resampling audio from {}Hz {}ch to 8000Hz 1ch",
-                spec.sample_rate, spec.channels
+                "[{}] Resampling audio from {}Hz {}ch to 8000Hz 1ch",
+                username, spec.sample_rate, spec.channels
             );
             resample_audio(raw_samples, spec.sample_rate, spec.channels)?
         } else {
@@ -188,22 +208,83 @@ impl MediaSession {
         }
 
         // Stop recorder
-        {
-            let mut rec = self.recorder.lock().await;
-            if let Some(r) = rec.take() {
-                r.stop();
-            }
-        }
+        self.recorder.lock().await.take();
 
         Ok(())
     }
 
-    pub async fn start_echo(&mut self, recording_path: Option<&Path>) -> Result<()> {
-        info!("Starting echo...");
+    pub async fn play_beeps(&self, username: String) -> Result<()> {
+        info!("[{}] Playing beeps (no input file provided)...", username);
+        let mut encoder = PcmuEncoder::new();
+
+        let mut ticker = interval(Duration::from_millis(20));
+        let chunk_size = 160; // 20ms at 8000Hz
+
+        let mut seq_no = 0u16;
+        let mut timestamp = Duration::from_secs(0);
+
+        let freq = 425.0;
+        let sample_rate = 8000.0;
+        let mut phase = 0.0;
+
+        // Loop indefinitely until error (call closed) or cancelled
+        loop {
+            // 500ms beep (25 chunks), 500ms silence (25 chunks)
+            for i in 0..50 {
+                ticker.tick().await;
+
+                let is_beep = i < 25;
+                let mut chunk = vec![0i16; chunk_size];
+
+                if is_beep {
+                    for s in chunk.iter_mut() {
+                        let val = (phase * 2.0 * std::f32::consts::PI).sin();
+                        *s = (val * 10000.0) as i16;
+                        phase += freq / sample_rate;
+                        if phase > 1.0 {
+                            phase -= 1.0;
+                        }
+                    }
+                }
+
+                // Record TX
+                {
+                    let rec = self.recorder.lock().await;
+                    if let Some(r) = rec.as_ref() {
+                        r.record_tx(&chunk);
+                    }
+                }
+
+                let encoded = encoder.encode(&chunk);
+
+                let frame = AudioFrame {
+                    data: Bytes::from(encoded),
+                    sample_rate: 8000,
+                    channels: 1,
+                    samples: chunk.len() as u32,
+                    timestamp,
+                    format: AudioSampleFormat::Unspecified,
+                    payload_type: Some(0),
+                    sequence_number: Some(seq_no),
+                };
+                seq_no = seq_no.wrapping_add(1);
+                timestamp += Duration::from_millis(20);
+
+                self.audio_source.send_audio(frame).await?;
+            }
+        }
+    }
+
+    pub async fn start_echo(
+        &mut self,
+        username: String,
+        recording_path: Option<&Path>,
+    ) -> Result<()> {
+        info!("[{}] Starting echo...", username);
 
         if let Some(path) = recording_path {
             let mut rec = self.recorder.lock().await;
-            *rec = Some(Recorder::new(path.to_path_buf()));
+            *rec = Some(Recorder::new(username.clone(), path.to_path_buf()));
         }
 
         let audio_source = self.audio_source.clone();
@@ -215,18 +296,25 @@ impl MediaSession {
                     if let Some(receiver) = transceiver.receiver().as_ref() {
                         let track = receiver.track();
                         let audio_source = audio_source.clone();
+                        let username_clone = username.clone();
                         tokio::spawn(async move {
                             loop {
                                 match track.recv().await {
                                     Ok(sample) => {
                                         // Echo
                                         if let Err(e) = audio_source.send(sample).await {
-                                            error!("Failed to send echo sample: {:?}", e);
+                                            error!(
+                                                "[{}] Failed to send echo sample: {:?}",
+                                                username_clone, e
+                                            );
                                             break;
                                         }
                                     }
                                     Err(e) => {
-                                        error!("Track recv error: {:?}", e);
+                                        error!(
+                                            "[{}] Failed to receive sample for echo: {:?}",
+                                            username_clone, e
+                                        );
                                         break;
                                     }
                                 }

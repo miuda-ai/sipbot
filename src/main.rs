@@ -14,6 +14,10 @@ struct Args {
     #[arg(short = 'C', long, global = true)]
     conf: Option<PathBuf>,
 
+    /// External IP address
+    #[arg(short = 'E', long, global = true)]
+    external_ip: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -27,12 +31,21 @@ enum Commands {
         /// Caller (username or full URI e.g. sip:user@domain)
         #[arg(short, long)]
         caller: Option<String>,
+        /// Auth username (optional)
+        #[arg(long)]
+        auth_user: Option<String>,
+        /// Auth password
+        #[arg(long)]
+        password: Option<String>,
         /// Hangup after seconds
         #[arg(long)]
         hangup: Option<u64>,
         /// Play file (wav)
         #[arg(long)]
         play_file: Option<String>,
+        /// Enable SRTP/SDES
+        #[arg(long)]
+        srtp: bool,
     },
     /// Wait for incoming calls
     Wait {
@@ -63,6 +76,9 @@ enum Commands {
         /// Reject with code (e.g. 486, 603)
         #[arg(long)]
         reject_code: Option<u16>,
+        /// Enable SRTP/SDES
+        #[arg(long)]
+        srtp: bool,
     },
     /// Send OPTIONS request
     Options {
@@ -95,7 +111,7 @@ async fn main() -> Result<()> {
         PathBuf::from(home).join(".sipbot.toml")
     };
 
-    let config = if config_path.exists() {
+    let mut config = if config_path.exists() {
         info!("Loading configuration from {:?}", config_path);
         Config::load(&config_path).await?
     } else {
@@ -110,6 +126,7 @@ async fn main() -> Result<()> {
                 );
                 Config {
                     addr: Some("0.0.0.0:0".to_string()),
+                    external_ip: None,
                     recorders: None,
                     accounts: vec![AccountConfig {
                         username: "sipbot".to_string(),
@@ -119,6 +136,7 @@ async fn main() -> Result<()> {
                         proxy: None,
                         register: Some(false),
                         target: None,
+                        srtp_enabled: None,
                         early_media: None,
                         ring: None,
                         answer: None,
@@ -136,6 +154,7 @@ async fn main() -> Result<()> {
                 echo,
                 hangup_after,
                 reject_code,
+                srtp,
             } => {
                 info!("Configuration file not found, using default configuration for wait command");
 
@@ -174,6 +193,7 @@ async fn main() -> Result<()> {
 
                 Config {
                     addr: addr.clone().or(Some("0.0.0.0:5060".to_string())),
+                    external_ip: None,
                     recorders: None,
                     accounts: vec![AccountConfig {
                         username: username.clone().unwrap_or("sipbot".to_string()),
@@ -183,6 +203,7 @@ async fn main() -> Result<()> {
                         proxy: None,
                         register: Some(false),
                         target: None,
+                        srtp_enabled: Some(*srtp),
                         early_media: None,
                         ring: ring_config,
                         answer: answer_config,
@@ -197,18 +218,35 @@ async fn main() -> Result<()> {
         }
     };
 
-    let (command_name, target_override, caller_override, hangup_override, play_file_override) =
-        match args.command {
-            Commands::Call {
-                target,
-                caller,
-                hangup,
-                play_file,
-            } => ("call", target, caller, hangup, play_file),
-            Commands::Wait { .. } => ("wait", None, None, None, None),
-            Commands::Options { target } => ("options", target, None, None, None),
-            Commands::Info { target } => ("info", target, None, None, None),
-        };
+    if let Some(external_ip) = args.external_ip {
+        config.external_ip = Some(external_ip);
+    }
+
+    let (
+        command_name,
+        target_override,
+        caller_override,
+        auth_user_override,
+        password_override,
+        hangup_override,
+        play_file_override,
+        srtp_override,
+    ) = match args.command {
+        Commands::Call {
+            target,
+            caller,
+            auth_user,
+            password,
+            hangup,
+            play_file,
+            srtp,
+        } => (
+            "call", target, caller, auth_user, password, hangup, play_file, srtp,
+        ),
+        Commands::Wait { srtp, .. } => ("wait", None, None, None, None, None, None, srtp),
+        Commands::Options { target } => ("options", target, None, None, None, None, None, false),
+        Commands::Info { target } => ("info", target, None, None, None, None, None, false),
+    };
 
     let mut handles = vec![];
     let global_config = config.clone();
@@ -217,10 +255,16 @@ async fn main() -> Result<()> {
         let global_config = global_config.clone();
         let target_override = target_override.clone();
         let caller_override = caller_override.clone();
+        let auth_user_override = auth_user_override.clone();
+        let password_override = password_override.clone();
         let play_file_override = play_file_override.clone();
 
         if let Some(target) = &target_override {
             account.target = Some(target.clone());
+        }
+
+        if srtp_override {
+            account.srtp_enabled = Some(true);
         }
 
         if let Some(play_file) = &play_file_override {
@@ -252,6 +296,14 @@ async fn main() -> Result<()> {
             } else {
                 account.username = caller.clone();
             }
+        }
+
+        if let Some(auth_user) = &auth_user_override {
+            account.auth_username = Some(auth_user.clone());
+        }
+
+        if let Some(password) = &password_override {
+            account.password = Some(password.clone());
         }
 
         let handle = tokio::spawn(async move {

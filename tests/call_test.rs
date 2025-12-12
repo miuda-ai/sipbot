@@ -11,9 +11,10 @@ async fn test_call_flow() -> Result<()> {
         .try_init();
 
     // 1. Configure Server (Wait)
-    let server_addr = "127.0.0.1:5060";
+    let server_addr = "127.0.0.1:5080";
     let server_config = Config {
         addr: Some(server_addr.to_string()),
+        external_ip: None,
         recorders: Some("/tmp/recorders_test".to_string()),
         accounts: vec![AccountConfig {
             username: "server".to_string(),
@@ -23,6 +24,7 @@ async fn test_call_flow() -> Result<()> {
             proxy: None,
             register: Some(false),
             target: None,
+            srtp_enabled: None,
             early_media: None,
             ring: None,
             answer: Some(AnswerConfig::Echo),
@@ -31,9 +33,10 @@ async fn test_call_flow() -> Result<()> {
     };
 
     // 2. Configure Client (Call)
-    let client_addr = "127.0.0.1:5061";
+    let client_addr = "127.0.0.1:5081";
     let client_config = Config {
         addr: Some(client_addr.to_string()),
+        external_ip: None,
         recorders: None,
         accounts: vec![AccountConfig {
             username: "client".to_string(),
@@ -43,10 +46,14 @@ async fn test_call_flow() -> Result<()> {
             proxy: None,
             register: Some(false),
             target: Some(format!("sip:server@{}", server_addr)),
+            srtp_enabled: None,
             early_media: None,
             ring: None,
             answer: None,
-            hangup: None,
+            hangup: Some(sipbot::config::HangupConfig {
+                code: 200,
+                after_secs: Some(5),
+            }),
         }],
     };
 
@@ -101,6 +108,7 @@ async fn test_options_flow() -> Result<()> {
     let server_addr = "127.0.0.1:5070";
     let server_config = Config {
         addr: Some(server_addr.to_string()),
+        external_ip: None,
         recorders: None,
         accounts: vec![AccountConfig {
             username: "server".to_string(),
@@ -110,6 +118,7 @@ async fn test_options_flow() -> Result<()> {
             proxy: None,
             register: Some(false),
             target: None,
+            srtp_enabled: None,
             early_media: None,
             ring: None,
             answer: None,
@@ -121,6 +130,7 @@ async fn test_options_flow() -> Result<()> {
     let client_addr = "127.0.0.1:5071";
     let client_config = Config {
         addr: Some(client_addr.to_string()),
+        external_ip: None,
         recorders: None,
         accounts: vec![AccountConfig {
             username: "client".to_string(),
@@ -130,6 +140,7 @@ async fn test_options_flow() -> Result<()> {
             proxy: None,
             register: Some(false),
             target: Some(format!("sip:server@{}", server_addr)),
+            srtp_enabled: None,
             early_media: None,
             ring: None,
             answer: None,

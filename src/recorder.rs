@@ -14,11 +14,11 @@ enum AudioPacket {
 }
 
 impl Recorder {
-    pub fn new(path: PathBuf) -> Self {
+    pub fn new(username: String, path: PathBuf) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         tokio::spawn(async move {
-            info!("Recorder started: {:?}", path);
+            info!("[{}] Recorder started: {:?}", username, path);
             let spec = hound::WavSpec {
                 channels: 2,
                 sample_rate: 8000,
@@ -28,7 +28,7 @@ impl Recorder {
             let mut writer = match hound::WavWriter::create(&path, spec) {
                 Ok(w) => w,
                 Err(e) => {
-                    error!("Failed to create wav writer: {:?}", e);
+                    error!("[{}] Failed to create wav writer: {:?}", username, e);
                     return;
                 }
             };
@@ -62,10 +62,10 @@ impl Recorder {
                         for i in 0..chunk_size {
                             // Interleaved: Left=RX, Right=TX
                             if let Err(e) = writer.write_sample(rx_chunk[i]) {
-                                error!("Failed to write RX sample: {:?}", e);
+                                error!("[{}] Failed to write RX sample: {:?}", username, e);
                             }
                             if let Err(e) = writer.write_sample(tx_chunk[i]) {
-                                error!("Failed to write TX sample: {:?}", e);
+                                error!("[{}] Failed to write TX sample: {:?}", username, e);
                             }
                         }
                     }
@@ -78,7 +78,6 @@ impl Recorder {
                                 tx_buffer.extend(samples);
                             }
                             Some(AudioPacket::Stop) | None => {
-                                info!("Recorder stopping");
                                 break;
                             }
                         }
@@ -88,7 +87,7 @@ impl Recorder {
             if let Err(e) = writer.finalize() {
                 error!("Failed to finalize wav writer: {:?}", e);
             }
-            info!("Recorder stopped: {:?}", path);
+            info!("[{}] Recorder stopped: {:?}", username, path);
         });
 
         Self { tx }
@@ -101,8 +100,10 @@ impl Recorder {
     pub fn record_tx(&self, samples: &[i16]) {
         let _ = self.tx.send(AudioPacket::Tx(samples.to_vec()));
     }
+}
 
-    pub fn stop(&self) {
+impl Drop for Recorder {
+    fn drop(&mut self) {
         let _ = self.tx.send(AudioPacket::Stop);
     }
 }
@@ -119,7 +120,7 @@ mod tests {
             std::fs::remove_file(&path).unwrap();
         }
 
-        let recorder = Recorder::new(path.clone());
+        let recorder = Recorder::new("mock".to_string(), path.clone());
 
         // Send 160 samples (20ms)
         let samples = vec![1000; 160];
@@ -129,7 +130,7 @@ mod tests {
         // Wait for at least one tick (20ms) + some buffer
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        recorder.stop();
+        drop(recorder);
         // Wait for task to finish
         tokio::time::sleep(Duration::from_millis(50)).await;
 

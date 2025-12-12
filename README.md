@@ -31,6 +31,10 @@ cargo install sipbot
 
 You can also run `sipbot` with CLI arguments for quick testing.
 
+#### Global Options
+- `-C, --conf <FILE>`: Path to the configuration file.
+- `-E, --external-ip <IP>`: External IP address for SDP (NAT traversal).
+
 #### Initiate a Call
 ```bash
 cargo run -- call --target sip:user@domain --caller sip:me@mydomain --play-file audio.wav --hangup 10
@@ -54,6 +58,7 @@ Create a `config.toml` file in the root directory. The configuration allows you 
 ```toml
 # Global settings
 addr = "0.0.0.0:5060"           # Local bind address
+external_ip = "1.2.3.4"         # External IP for SDP (NAT traversal)
 recorders = "/tmp/recorders"    # Directory for recordings
 
 [[accounts]]
@@ -91,6 +96,7 @@ after_secs = 10                 # Send BYE after 10 seconds
 ### Configuration Reference
 
 - **`addr`**: (Optional) The local IP and port to bind to. Defaults to `0.0.0.0:35060`.
+- **`external_ip`**: (Optional) The external IP address to use in SDP offers/answers (useful for NAT).
 - **`recorders`**: (Optional) Path to save call recordings.
 - **`accounts`**: List of account configurations.
     - `username`: SIP username.
