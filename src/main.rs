@@ -27,6 +27,7 @@ enum Commands {
     /// Initiate a call
     Call {
         /// Target URI (e.g., sip:user@domain)
+        #[arg(short, long)]
         target: Option<String>,
         /// Caller (username or full URI e.g. sip:user@domain)
         #[arg(short, long)]
