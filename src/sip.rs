@@ -3,16 +3,16 @@ use crate::media::MediaSession;
 use anyhow::{Context, Result};
 use chrono::Local;
 use rsip::headers::{
-    CallId, Contact as UntypedContact, From as UntypedFrom, To as UntypedTo, UntypedHeader,
-    Via as UntypedVia,
+    CallId, From as UntypedFrom, To as UntypedTo, UntypedHeader, Via as UntypedVia,
 };
 use rsip::message::HeadersExt;
 use rsip::typed::{From, To, Via};
 use rsip::{Header, Method, StatusCode, Uri};
+use rsipstack::dialog::DialogId;
+use rsipstack::dialog::dialog::DialogState;
 use rsipstack::{
     EndpointBuilder,
     dialog::authenticate::Credential,
-    dialog::dialog::Dialog,
     dialog::dialog_layer::DialogLayer,
     dialog::invitation::InviteOption,
     dialog::registration::Registration,
@@ -164,7 +164,12 @@ impl SipBot {
                 "[{}] Starting outbound call to {}",
                 self.account.username, target
             );
-            self.make_call(target).await?;
+            tokio::select! {
+                _ = self.listen_loop() => {}
+                r = self.make_call(target) => {
+                    info!("[{}] Call ended result: {:?}", self.account.username, r);
+                }
+            }
         } else {
             warn!(
                 "[{}] No target configured for outbound call",
@@ -288,58 +293,17 @@ impl SipBot {
             .dialog_layer
             .as_ref()
             .context("DialogLayer not initialized")?;
-        let endpoint = self.endpoint.as_ref().context("Endpoint not initialized")?;
-
-        let req_uri = Uri::try_from(target_uri)?;
-        let addrs = endpoint.get_addrs();
-        let local_sip_addr = addrs.first().context("No local address found")?;
-        let local_socket = local_sip_addr.get_socketaddr()?;
-        let local_ip = local_socket.ip();
-        let local_port = local_socket.port();
-
-        let via_str = format!(
-            "SIP/2.0/UDP {}:{};branch=z9hG4bK{}",
-            local_ip,
-            local_port,
-            generate_random_string()
-        );
-        let untyped_via = UntypedVia::try_from(via_str.as_str())?;
-        let _via = Via::try_from(untyped_via)?;
-
-        let from_str = format!(
-            "sip:{}@{};tag={}",
-            self.account.username,
-            self.account.domain,
-            generate_random_string()
-        );
-        let untyped_from = UntypedFrom::try_from(from_str.as_str())?;
-        let from = From::try_from(untyped_from)?;
-
-        let to_str = target_uri;
-        let untyped_to = UntypedTo::try_from(to_str)?;
-        let to = To::try_from(untyped_to)?;
-
-        let call_id_str = format!("{}@{}", generate_random_string(), local_ip);
-        let call_id = CallId::try_from(call_id_str.as_str())?;
-
-        let contact_str = format!(
-            "<sip:{}@{}:{}>",
-            self.account.username, local_ip, local_port
-        );
-        let contact_header = UntypedContact::try_from(contact_str.as_str())?;
-
+        let from: rsip::Uri =
+            format!("sip:{}@{}", self.account.username, self.account.domain).try_into()?;
+        let to: rsip::Uri = target_uri.try_into()?;
+        let contact =
+            dialog_layer.build_local_contact(Some(self.account.username.clone()), None)?;
         // Create MediaSession and Offer
         let srtp_enabled = self.account.srtp_enabled.unwrap_or(false);
         let (media_session, local_sdp) =
             MediaSession::new_offer(srtp_enabled, self.global_config.external_ip.clone()).await?;
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let username = self.account.username.clone();
-        tokio::spawn(async move {
-            while let Some(event) = rx.recv().await {
-                info!("[{}] Call Status: {}", username, event);
-            }
-        });
 
         let credential = if let Some(password) = &self.account.password {
             Some(Credential {
@@ -356,18 +320,14 @@ impl SipBot {
         };
 
         let opt = InviteOption {
-            destination: Some(req_uri.host_with_port.clone().into()),
-            caller: from.uri.clone(),
-            callee: to.uri.clone(),
-            call_id: Some(call_id.value().to_string()),
-            contact: contact_header.uri()?.clone(),
-            caller_display_name: None,
-            caller_params: Default::default(),
+            destination: Some(to.host_with_port.clone().into()),
+            caller: from.clone(),
+            callee: to.clone(),
+            contact,
             content_type: Some("application/sdp".to_string()),
             offer: Some(local_sdp.into_bytes()),
-            headers: Default::default(),
             credential,
-            support_prack: false,
+            ..Default::default()
         };
 
         let (dialog, response) = tokio::select! {
@@ -384,47 +344,16 @@ impl SipBot {
                 self.account.username,
                 res.status_code()
             );
-            if *res.status_code() == StatusCode::OK {
-                info!("[{}] Call answered!", self.account.username);
-
-                let body = res.body();
-                if !body.is_empty() {
-                    let remote_sdp = String::from_utf8_lossy(body);
-                    media_session.set_remote_answer(&remote_sdp).await?;
-                }
-
-                // Start listener for in-dialog requests
-                let endpoint = self
-                    .endpoint
-                    .as_ref()
-                    .context("Endpoint not initialized")?
-                    .clone();
-                let dialog_layer = self
-                    .dialog_layer
-                    .as_ref()
-                    .context("DialogLayer not initialized")?
-                    .clone();
-                let username = self.account.username.clone();
-
-                tokio::spawn(async move {
-                    if let Ok(mut incoming) = endpoint.incoming_transactions() {
-                        while let Some(mut transaction) = incoming.recv().await {
-                            if let Some(dialog) = dialog_layer.match_dialog(&transaction.original) {
-                                match dialog {
-                                    Dialog::ClientInvite(mut dlg) => {
-                                        if let Err(e) = dlg.handle(&mut transaction).await {
-                                            warn!("[{}] Dialog handle error: {:?}", username, e);
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                });
+            if matches!(
+                res.status_code().kind(),
+                rsip::status_code::StatusCodeKind::Successful
+            ) {
+                let answer_sdp = String::from_utf8_lossy(&res.body);
+                media_session.set_remote_answer(&answer_sdp).await?;
+                info!("[{}] Set remote answer", self.account.username);
             } else {
                 warn!(
-                    "[{}] Call failed: {}",
+                    "[{}] Call failed with status: {}",
                     self.account.username,
                     res.status_code()
                 );
@@ -461,6 +390,17 @@ impl SipBot {
             }
         };
 
+        let username_monitor = self.account.username.clone();
+        let monitor_future = async move {
+            while let Some(event) = rx.recv().await {
+                info!("[{}] Call Status: {}", username_monitor, event);
+                if matches!(event, DialogState::Terminated(..)) {
+                    info!("[{}] Call terminated remotely.", username_monitor);
+                    return;
+                }
+            }
+        };
+
         if let Some(secs) = hangup_secs {
             info!(
                 "[{}] Call established. Waiting for {} seconds (or Ctrl-C) before hanging up...",
@@ -476,6 +416,9 @@ impl SipBot {
                 _ = tokio::signal::ctrl_c() => {
                     info!("[{}] Ctrl-C received.", self.account.username);
                 }
+                _ = monitor_future => {
+                    return Ok(());
+                }
             }
         } else {
             info!(
@@ -489,13 +432,15 @@ impl SipBot {
                 _ = tokio::signal::ctrl_c() => {
                     info!("[{}] Ctrl-C received.", self.account.username);
                 }
+                _ = monitor_future => {
+                    return Ok(());
+                }
             }
         }
 
         info!("[{}] Sending BYE...", self.account.username);
-        dialog.bye().await?;
+        dialog.hangup().await?;
         info!("[{}] BYE sent.", self.account.username);
-
         Ok(())
     }
 
@@ -566,7 +511,20 @@ impl SipBot {
                 Method::Ack => info!("[{}] Received ACK", self.account.username),
                 Method::Bye => {
                     info!("[{}] Received BYE", self.account.username);
-                    transaction.reply(StatusCode::OK).await?;
+                    let id = DialogId::try_from(&transaction.original)?;
+                    let dialog = self
+                        .dialog_layer
+                        .as_ref()
+                        .map(|d| d.get_dialog(&id))
+                        .flatten();
+                    if let Some(mut dlg) = dialog {
+                        let _ = dlg.handle(&mut transaction).await?;
+                    } else {
+                        transaction
+                            .reply(rsip::StatusCode::CallTransactionDoesNotExist)
+                            .await
+                            .ok();
+                    }
                 }
                 Method::Options => {
                     info!("[{}] Received OPTIONS", self.account.username);
@@ -633,190 +591,233 @@ impl SipBot {
             contact_str.try_into().ok(),
         )?;
 
-        // Stage 1: Ringing (Alerting)
-        let mut media_session: Option<MediaSession> = None;
-        let mut local_sdp: Option<String> = None;
+        // Clone for spawn
+        let account = self.account.clone();
+        let global_config = self.global_config.clone();
+        let server_dialog_clone = server_dialog.clone();
         let offer_body = transaction.original.body().clone();
-        let mut server_dialog_clone = server_dialog.clone();
 
         tokio::spawn(async move {
-            let handle_state_loop = async {
+            // Spawn transaction handler
+            let mut server_dialog_handler = server_dialog_clone.clone();
+            tokio::spawn(async move {
+                if let Err(e) = server_dialog_handler.handle(&mut transaction).await {
+                    error!("Transaction handler error: {:?}", e);
+                }
+            });
+
+            // Monitor loop
+            let username_monitor = username.clone();
+            let monitor_future = async move {
                 while let Some(state) = rx.recv().await {
-                    info!(%state, "[{}] Dialog state changed", username);
+                    info!(%state, "[{}] Dialog state changed", username_monitor);
+                    if matches!(state, DialogState::Terminated(..)) {
+                        info!("[{}] Call terminated remotely", username_monitor);
+                        return;
+                    }
                 }
             };
-            let (_, _) = tokio::join!(
-                handle_state_loop,
-                server_dialog_clone.handle(&mut transaction)
-            );
-        });
 
-        if !offer_body.is_empty() {
-            if let Ok(body_str) = std::str::from_utf8(&offer_body) {
-                let srtp_enabled = self.account.srtp_enabled.unwrap_or(false);
-                match MediaSession::new(
-                    body_str,
-                    srtp_enabled,
-                    self.global_config.external_ip.clone(),
-                )
-                .await
-                {
-                    Ok((session, sdp)) => {
-                        media_session = Some(session);
-                        local_sdp = Some(sdp);
+            // Call logic
+            let call_logic = async move {
+                // Stage 1: Ringing (Alerting)
+                let mut media_session: Option<MediaSession> = None;
+                let mut local_sdp: Option<String> = None;
+
+                if !offer_body.is_empty() {
+                    if let Ok(body_str) = std::str::from_utf8(&offer_body) {
+                        let srtp_enabled = account.srtp_enabled.unwrap_or(false);
+                        match MediaSession::new(
+                            body_str,
+                            srtp_enabled,
+                            global_config.external_ip.clone(),
+                        )
+                        .await
+                        {
+                            Ok((session, sdp)) => {
+                                media_session = Some(session);
+                                local_sdp = Some(sdp);
+                            }
+                            Err(e) => {
+                                error!(
+                                    "[{}] Failed to create media session: {:?}",
+                                    account.username, e
+                                );
+                            }
+                        }
                     }
-                    Err(e) => {
-                        error!(
-                            "[{}] Failed to create media session: {:?}",
-                            self.account.username, e
+                }
+
+                if let Some(ref cfg) = account.ring {
+                    if let Some(ref wav) = cfg.ringback {
+                        info!(
+                            "[{}] Stage 1: Ringing with media (183) - Playing {}",
+                            account.username, wav
                         );
-                    }
-                }
-            }
-        }
 
-        if let Some(ref cfg) = self.account.ring {
-            if let Some(ref wav) = cfg.ringback {
-                info!(
-                    "[{}] Stage 1: Ringing with media (183) - Playing {}",
-                    self.account.username, wav
-                );
-
-                // Send 183 with SDP if we have local SDP
-                if let Some(sdp) = local_sdp.as_ref() {
-                    let headers = vec![Header::ContentType("application/sdp".into())];
-                    server_dialog.ringing(Some(headers), Some(sdp.clone().into_bytes()))?;
-                } else {
-                    server_dialog.ringing(None, None)?;
-                }
-
-                if let Some(media) = &mut media_session {
-                    // Play file with timeout
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(cfg.duration_secs),
-                        media.play_file(
-                            self.account.username.clone(),
-                            std::path::Path::new(wav),
-                            None,
-                        ),
-                    )
-                    .await;
-                } else {
-                    tokio::time::sleep(Duration::from_secs(cfg.duration_secs)).await;
-                }
-            } else {
-                info!("[{}] Stage 1: Sending 180 Ringing", self.account.username);
-                server_dialog.ringing(None, None)?;
-                tokio::time::sleep(Duration::from_secs(cfg.duration_secs)).await;
-            }
-        }
-
-        // Stage 2: Answer or Reject
-        if let Some(ref cfg) = self.account.answer {
-            info!("[{}] Stage 2: Answering (200 OK)", self.account.username);
-            let mut headers = vec![];
-            let mut body = None;
-            // Add SDP if we have local SDP
-            if let Some(sdp) = local_sdp.as_ref() {
-                body = Some(sdp.clone().into_bytes());
-                headers.push(Header::ContentType("application/sdp".into()));
-            }
-
-            server_dialog.accept(Some(headers), body)?;
-
-            if media_session.is_none() {
-                warn!(
-                    "[{}] No media session established (missing SDP?)",
-                    self.account.username
-                );
-            }
-
-            let username = self.account.username.clone();
-            let answer_config = cfg.clone();
-            let hangup_config = self.account.hangup.clone();
-
-            // Move server_dialog into the task
-            tokio::spawn(async move {
-                let username_media = username.clone();
-                let media_future = async {
-                    if let Some(mut media) = media_session {
-                        match answer_config {
-                            AnswerConfig::Echo => {
-                                info!("[{}] Stage 2: Starting Echo", username_media);
-                                media
-                                    .start_echo(username_media.clone(), Some(&recording_path))
-                                    .await
+                        // Send 183 with SDP if we have local SDP
+                        if let Some(sdp) = local_sdp.as_ref() {
+                            let headers = vec![Header::ContentType("application/sdp".into())];
+                            if let Err(e) = server_dialog_clone
+                                .ringing(Some(headers), Some(sdp.clone().into_bytes()))
+                            {
+                                error!("Ringing error: {:?}", e);
+                                return;
                             }
-                            AnswerConfig::Play { wav_file } => {
-                                info!("[{}] Stage 2: Playing {}", username_media, wav_file);
-                                media
-                                    .play_file(
-                                        username_media.clone(),
-                                        std::path::Path::new(&wav_file),
-                                        Some(&recording_path),
-                                    )
-                                    .await
+                        } else {
+                            if let Err(e) = server_dialog_clone.ringing(None, None) {
+                                error!("Ringing error: {:?}", e);
+                                return;
                             }
+                        }
+
+                        if let Some(media) = &mut media_session {
+                            // Play file with timeout
+                            let _ = tokio::time::timeout(
+                                Duration::from_secs(cfg.duration_secs),
+                                media.play_file(
+                                    account.username.clone(),
+                                    std::path::Path::new(wav),
+                                    None,
+                                ),
+                            )
+                            .await;
+                        } else {
+                            tokio::time::sleep(Duration::from_secs(cfg.duration_secs)).await;
                         }
                     } else {
-                        Ok(())
-                    }
-                };
-
-                if let Some(ref hangup) = hangup_config {
-                    if let Some(secs) = hangup.after_secs {
-                        info!("[{}] Stage 3: Will hangup after {} seconds", username, secs);
-                        tokio::select! {
-                            res = media_future => {
-                                if let Err(e) = res {
-                                    error!("[{}] Media error: {:?}", username, e);
-                                }
-                                info!("[{}] Media finished", username);
-                            }
-                            _ = tokio::time::sleep(Duration::from_secs(secs)) => {
-                                info!("[{}] Hangup timer expired", username);
-                            }
+                        info!("[{}] Stage 1: Sending 180 Ringing", account.username);
+                        if let Err(e) = server_dialog_clone.ringing(None, None) {
+                            error!("Ringing error: {:?}", e);
+                            return;
                         }
-                        info!("[{}] Stage 3: Sending BYE", username);
-                        if let Err(e) = server_dialog.bye().await {
-                            error!("[{}] Failed to send BYE: {:?}", username, e);
+                        tokio::time::sleep(Duration::from_secs(cfg.duration_secs)).await;
+                    }
+                }
+
+                // Stage 2: Answer or Reject
+                if let Some(ref cfg) = account.answer {
+                    info!("[{}] Stage 2: Answering (200 OK)", account.username);
+                    let mut headers = vec![];
+                    let mut body = None;
+                    // Add SDP if we have local SDP
+                    if let Some(sdp) = local_sdp.as_ref() {
+                        body = Some(sdp.clone().into_bytes());
+                        headers.push(Header::ContentType("application/sdp".into()));
+                    }
+
+                    if let Err(e) = server_dialog_clone.accept(Some(headers), body) {
+                        error!("Accept error: {:?}", e);
+                        return;
+                    }
+
+                    if media_session.is_none() {
+                        warn!(
+                            "[{}] No media session established (missing SDP?)",
+                            account.username
+                        );
+                    }
+
+                    let username_media = account.username.clone();
+                    let answer_config = cfg.clone();
+                    let hangup_config = account.hangup.clone();
+
+                    let media_future = async {
+                        if let Some(mut media) = media_session {
+                            match answer_config {
+                                AnswerConfig::Echo => {
+                                    info!("[{}] Stage 2: Starting Echo", username_media);
+                                    media
+                                        .start_echo(username_media.clone(), Some(&recording_path))
+                                        .await
+                                }
+                                AnswerConfig::Play { wav_file } => {
+                                    info!("[{}] Stage 2: Playing {}", username_media, wav_file);
+                                    media
+                                        .play_file(
+                                            username_media.clone(),
+                                            std::path::Path::new(&wav_file),
+                                            Some(&recording_path),
+                                        )
+                                        .await
+                                }
+                            }
+                        } else {
+                            Ok(())
+                        }
+                    };
+
+                    if let Some(ref hangup) = hangup_config {
+                        if let Some(secs) = hangup.after_secs {
+                            info!(
+                                "[{}] Stage 3: Will hangup after {} seconds",
+                                account.username, secs
+                            );
+                            tokio::select! {
+                                res = media_future => {
+                                    if let Err(e) = res {
+                                        error!("[{}] Media error: {:?}", account.username, e);
+                                    }
+                                    info!("[{}] Media finished", account.username);
+                                }
+                                _ = tokio::time::sleep(Duration::from_secs(secs)) => {
+                                    info!("[{}] Hangup timer expired", account.username);
+                                }
+                            }
+                            info!("[{}] Stage 3: Sending BYE", account.username);
+                            if let Err(e) = server_dialog_clone.bye().await {
+                                error!("[{}] Failed to send BYE: {:?}", account.username, e);
+                            }
+                        } else {
+                            if let Err(e) = media_future.await {
+                                error!("[{}] Media error: {:?}", account.username, e);
+                            }
                         }
                     } else {
                         if let Err(e) = media_future.await {
-                            error!("[{}] Media error: {:?}", username, e);
+                            error!("[{}] Media error: {:?}", account.username, e);
                         }
                     }
                 } else {
-                    if let Err(e) = media_future.await {
-                        error!("[{}] Media error: {:?}", username, e);
-                    }
-                }
-            });
-        } else {
-            // No Answer config -> Reject
-            if let Some(ref hangup) = self.account.hangup {
-                info!(
-                    "[{}] No answer config, rejecting with code {}",
-                    self.account.username, hangup.code
-                );
-                match StatusCode::try_from(hangup.code) {
-                    Ok(code) => server_dialog.reject(Some(code), None)?,
-                    Err(_) => {
-                        error!(
-                            "[{}] Invalid status code: {}",
-                            self.account.username, hangup.code
+                    // No Answer config -> Reject
+                    if let Some(ref hangup) = account.hangup {
+                        info!(
+                            "[{}] No answer config, rejecting with code {}",
+                            account.username, hangup.code
                         );
-                        server_dialog.reject(Some(StatusCode::ServerInternalError), None)?;
+                        match StatusCode::try_from(hangup.code) {
+                            Ok(code) => {
+                                let _ = server_dialog_clone.reject(Some(code), None);
+                            }
+                            Err(_) => {
+                                error!(
+                                    "[{}] Invalid status code: {}",
+                                    account.username, hangup.code
+                                );
+                                let _ = server_dialog_clone
+                                    .reject(Some(StatusCode::ServerInternalError), None);
+                            }
+                        }
+                    } else {
+                        warn!(
+                            "[{}] No answer/hangup config. Rejecting with 603 Decline.",
+                            account.username
+                        );
+                        let _ = server_dialog_clone.reject(Some(StatusCode::Decline), None);
                     }
                 }
-            } else {
-                warn!(
-                    "[{}] No answer/hangup config. Rejecting with 603 Decline.",
-                    self.account.username
-                );
-                server_dialog.reject(Some(StatusCode::Decline), None)?;
+            };
+
+            tokio::select! {
+                _ = monitor_future => {
+                    // Terminated early
+                }
+                _ = call_logic => {
+                    // Finished normally
+                }
             }
-        }
+        });
+
         Ok(())
     }
 }
