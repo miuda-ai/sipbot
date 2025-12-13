@@ -37,7 +37,7 @@ You can also run `sipbot` with CLI arguments for quick testing.
 
 #### Initiate a Call
 ```bash
-cargo run -- call sip:user@domain --caller sip:me@mydomain --play audio.wav --hangup 10
+cargo run -- call sip:user@domain --caller sip:me@mydomain --play audio.wav --hangup 10 --total 10 --concurrent 2
 ```
 - `<TARGET>`: Target URI (e.g., sip:user@domain).
 - `-c, --caller <URI>`: Caller (username or full URI).
@@ -45,7 +45,10 @@ cargo run -- call sip:user@domain --caller sip:me@mydomain --play audio.wav --ha
 - `--password <PASS>`: Auth password.
 - `--hangup <SECONDS>`: Hangup after seconds.
 - `--play <FILE>`: Play file (wav).
+- `--record <FILE>`: Record to file (wav). If multiple calls are made, the filename will be suffixed with the call index (e.g., `record_1.wav`).
 - `--srtp`: Enable SRTP/SDES.
+- `--total <COUNT>`: Total number of calls to make (default: 1).
+- `--concurrent <COUNT>`: Max concurrent calls (default: 1).
 
 #### Wait for Calls
 ```bash

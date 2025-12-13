@@ -175,6 +175,9 @@ impl MediaSession {
                 channels: 1,
             };
             pc.add_track(track.clone(), params)?;
+            for t in pc.get_transceivers() {
+                t.set_direction(TransceiverDirection::SendRecv);
+            }
         } else {
             pc.add_transceiver(rustrtc::MediaKind::Audio, TransceiverDirection::RecvOnly);
         }
@@ -216,6 +219,7 @@ impl MediaSession {
         username: String,
         file_path: &Path,
         recording_path: Option<&Path>,
+        keep_alive: bool,
     ) -> Result<()> {
         info!("[{}] Playing file: {:?}", username, file_path);
 
@@ -274,13 +278,31 @@ impl MediaSession {
                 }
             }
         };
+        tokio::pin!(rx_task);
 
-        tokio::select! {
-            res = self.play_samples(username, samples) => {
-                cancel_token.cancel();
-                res
-            },
-            _ = rx_task => Ok(()),
+        let play_fut = self.play_samples(username.clone(), samples);
+        tokio::pin!(play_fut);
+
+        let mut play_done = false;
+
+        loop {
+            tokio::select! {
+                res = &mut play_fut, if !play_done => {
+                    play_done = true;
+                    if let Err(e) = res {
+                        cancel_token.cancel();
+                        return Err(e);
+                    }
+                    if !keep_alive {
+                        cancel_token.cancel();
+                        return Ok(());
+                    }
+                    info!("[{}] Playback finished, keeping alive...", username);
+                }
+                _ = &mut rx_task => {
+                    return Ok(());
+                }
+            }
         }
     }
 
@@ -289,6 +311,7 @@ impl MediaSession {
         username: String,
         wav_bytes: &[u8],
         recording_path: Option<&Path>,
+        keep_alive: bool,
     ) -> Result<()> {
         info!("[{}] Playing embedded wav...", username);
 
@@ -355,13 +378,31 @@ impl MediaSession {
                 }
             }
         };
+        tokio::pin!(rx_task);
 
-        tokio::select! {
-            res = self.play_samples(username, samples) => {
-                cancel_token.cancel();
-                res
-            },
-            _ = rx_task => Ok(()),
+        let play_fut = self.play_samples(username.clone(), samples);
+        tokio::pin!(play_fut);
+
+        let mut play_done = false;
+
+        loop {
+            tokio::select! {
+                res = &mut play_fut, if !play_done => {
+                    play_done = true;
+                    if let Err(e) = res {
+                        cancel_token.cancel();
+                        return Err(e);
+                    }
+                    if !keep_alive {
+                        cancel_token.cancel();
+                        return Ok(());
+                    }
+                    info!("[{}] Playback finished, keeping alive...", username);
+                }
+                _ = &mut rx_task => {
+                    return Ok(());
+                }
+            }
         }
     }
 
@@ -380,46 +421,45 @@ impl MediaSession {
         let mut timestamp = Duration::from_secs(0);
         let mut seq_no = 0u16;
 
-        loop {
-            for chunk in samples.chunks(chunk_size) {
-                ticker.tick().await;
+        for chunk in samples.chunks(chunk_size) {
+            ticker.tick().await;
 
-                // Record TX
-                {
-                    let rec = self.recorder.lock().await;
-                    if let Some(r) = rec.as_ref() {
-                        r.record_tx(chunk);
-                    }
+            // Record TX
+            {
+                let rec = self.recorder.lock().await;
+                if let Some(r) = rec.as_ref() {
+                    r.record_tx(chunk);
                 }
-
-                let encoded = encoder.encode(chunk);
-
-                if !encoded.is_empty() {
-                    let all_ff = encoded.iter().all(|&b| b == 0xFF);
-                    if all_ff {
-                        let input_silence = chunk.iter().all(|&s| s == 0);
-                        if !input_silence {
-                            error!("ENCODER BUG: Produced all 0xFF for non-silent input!");
-                        }
-                    }
-                }
-
-                let frame = AudioFrame {
-                    data: Bytes::from(encoded),
-                    sample_rate: 8000,
-                    channels: 1,
-                    samples: chunk.len() as u32,
-                    timestamp,
-                    format: AudioSampleFormat::Unspecified,
-                    payload_type: Some(0),
-                    sequence_number: Some(seq_no),
-                };
-                seq_no = seq_no.wrapping_add(1);
-                timestamp += Duration::from_millis(20);
-
-                self.audio_source.send_audio(frame).await?;
             }
+
+            let encoded = encoder.encode(chunk);
+
+            if !encoded.is_empty() {
+                let all_ff = encoded.iter().all(|&b| b == 0xFF);
+                if all_ff {
+                    let input_silence = chunk.iter().all(|&s| s == 0);
+                    if !input_silence {
+                        error!("ENCODER BUG: Produced all 0xFF for non-silent input!");
+                    }
+                }
+            }
+
+            let frame = AudioFrame {
+                data: Bytes::from(encoded),
+                sample_rate: 8000,
+                channels: 1,
+                samples: chunk.len() as u32,
+                timestamp,
+                format: AudioSampleFormat::Unspecified,
+                payload_type: Some(0),
+                sequence_number: Some(seq_no),
+            };
+            seq_no = seq_no.wrapping_add(1);
+            timestamp += Duration::from_millis(20);
+
+            self.audio_source.send_audio(frame).await?;
         }
+        Ok(())
     }
 
     pub async fn start_echo(
@@ -436,6 +476,62 @@ impl MediaSession {
 
         let audio_source = self.audio_source.clone();
         let recorder = self.recorder.clone();
+
+        // Handle existing transceivers
+        let transceivers = self.pc.get_transceivers();
+        info!(
+            "[{}] Found {} existing transceivers for echo",
+            username,
+            transceivers.len()
+        );
+        for transceiver in transceivers {
+            if let Some(receiver) = transceiver.receiver().as_ref() {
+                let track = receiver.track();
+                info!("[{}] Existing Track ID: {}", username, track.id());
+                let audio_source = audio_source.clone();
+                let username_clone = username.clone();
+                let recorder = recorder.clone();
+                tokio::spawn(async move {
+                    let mut decoder = PcmuDecoder::new();
+                    loop {
+                        match track.recv().await {
+                            Ok(sample) => {
+                                // Record RX
+                                {
+                                    let rec = recorder.lock().await;
+                                    if let Some(r) = rec.as_ref() {
+                                        if let MediaSample::Audio(frame) = &sample {
+                                            let decoded = decoder.decode(&frame.data);
+                                            r.record_rx(&decoded);
+                                            // Also record TX since we are echoing
+                                            r.record_tx(&decoded);
+                                        } else {
+                                            error!("RX SAMPLE: NOT AUDIO");
+                                        }
+                                    }
+                                }
+
+                                // Echo
+                                if let Err(e) = audio_source.send(sample).await {
+                                    error!(
+                                        "[{}] Failed to send echo sample: {:?}",
+                                        username_clone, e
+                                    );
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                error!(
+                                    "[{}] Failed to receive sample for echo: {:?}",
+                                    username_clone, e
+                                );
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        }
 
         while let Some(event) = self.pc.recv().await {
             match event {
@@ -582,4 +678,52 @@ fn spawn_track_recorder(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resample_audio_identity() {
+        let samples = vec![100, 200, 300, 400];
+        let result = resample_audio(samples.clone(), 8000, 1).unwrap();
+        assert_eq!(result, samples);
+    }
+
+    #[test]
+    fn test_resample_audio_stereo_to_mono() {
+        // 8000Hz stereo -> 8000Hz mono
+        // Left: 100, Right: 200 -> Avg: 150
+        let samples = vec![100, 200, 300, 500];
+        let result = resample_audio(samples, 8000, 2).unwrap();
+        assert_eq!(result, vec![150, 400]);
+    }
+
+    #[test]
+    fn test_resample_audio_resampling() {
+        // 16000Hz mono -> 8000Hz mono
+        // Just checking it produces output of roughly half size
+        let samples: Vec<i16> = (0..1600).map(|i| (i % 1000) as i16).collect();
+        let result = resample_audio(samples.clone(), 16000, 1).unwrap();
+
+        // 1600 samples at 16k is 0.1s
+        // 0.1s at 8k is 800 samples
+        // The resampler works in chunks, so exact size might vary slightly due to padding/buffering
+        // but should be close.
+        assert!(result.len() >= 800);
+        assert!(result.len() < 1200); // Allow some padding overhead
+    }
+
+    #[tokio::test]
+    async fn test_media_session_offer() {
+        let (_session, sdp) = MediaSession::new_offer(false, None, true).await.unwrap();
+        assert!(sdp.contains("m=audio"));
+        assert!(sdp.contains("a=sendrecv")); // We set direction to SendRecv
+
+        // Check if we can create an answer session
+        let (_answer_session, answer_sdp) = MediaSession::new(&sdp, false, None).await.unwrap();
+        assert!(answer_sdp.contains("m=audio"));
+        assert!(answer_sdp.contains("a=sendrecv"));
+    }
 }

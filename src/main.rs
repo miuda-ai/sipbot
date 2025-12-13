@@ -49,6 +49,12 @@ enum Commands {
         /// Enable SRTP/SDES
         #[arg(long)]
         srtp: bool,
+        /// Total number of calls to make
+        #[arg(long, default_value = "1")]
+        total: u32,
+        /// Max concurrent calls
+        #[arg(long, default_value = "1")]
+        concurrent: u32,
     },
     /// Wait for incoming calls
     Wait {
@@ -237,6 +243,8 @@ async fn main() -> Result<()> {
         play_file_override,
         record_override,
         srtp_override,
+        total_calls,
+        concurrent_calls,
     ) = match args.command {
         Commands::Call {
             target,
@@ -247,14 +255,21 @@ async fn main() -> Result<()> {
             play,
             record,
             srtp,
+            total,
+            concurrent,
         } => (
-            "call", target, caller, auth_user, password, hangup, play, record, srtp,
+            "call", target, caller, auth_user, password, hangup, play, record, srtp, total,
+            concurrent,
         ),
-        Commands::Wait { srtp, .. } => ("wait", None, None, None, None, None, None, None, srtp),
-        Commands::Options { target } => {
-            ("options", target, None, None, None, None, None, None, false)
+        Commands::Wait { srtp, .. } => {
+            ("wait", None, None, None, None, None, None, None, srtp, 1, 1)
         }
-        Commands::Info { target } => ("info", target, None, None, None, None, None, None, false),
+        Commands::Options { target } => (
+            "options", target, None, None, None, None, None, None, false, 1, 1,
+        ),
+        Commands::Info { target } => (
+            "info", target, None, None, None, None, None, None, false, 1, 1,
+        ),
     };
 
     let mut handles = vec![];
@@ -324,7 +339,7 @@ async fn main() -> Result<()> {
             let mut bot = sip::SipBot::new(account, global_config);
             match command_name {
                 "call" => {
-                    if let Err(e) = bot.run_call().await {
+                    if let Err(e) = bot.run_call(total_calls, concurrent_calls).await {
                         error!("Bot call error: {:?}", e);
                     }
                 }

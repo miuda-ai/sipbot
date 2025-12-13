@@ -73,7 +73,7 @@ async fn test_call_flow() -> Result<()> {
     // 4. Start Client
     let client_handle = tokio::spawn(async move {
         let mut bot = SipBot::new(client_config.accounts[0].clone(), client_config);
-        if let Err(e) = bot.run_call().await {
+        if let Err(e) = bot.run_call(1, 1).await {
             eprintln!("Client error: {:?}", e);
             panic!("Client failed: {:?}", e);
         }
