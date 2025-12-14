@@ -55,6 +55,9 @@ enum Commands {
         /// Max concurrent calls
         #[arg(long, default_value = "1")]
         concurrent: u32,
+        /// Verbose output (show info logs)
+        #[arg(long)]
+        verbose: bool,
     },
     /// Wait for incoming calls
     Wait {
@@ -85,6 +88,9 @@ enum Commands {
         /// Reject with code (e.g. 486, 603)
         #[arg(long)]
         reject: Option<u16>,
+        /// Reject probability (1-99%)
+        #[arg(long)]
+        reject_prob: Option<u8>,
         /// Enable SRTP/SDES
         #[arg(long)]
         srtp: bool,
@@ -103,15 +109,20 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+
+    let log_level = match &args.command {
+        Commands::Call { verbose, .. } if !*verbose => "error",
+        _ => "info",
+    };
+
     let timer = ChronoLocal::new("%Y-%m-%d %H:%M:%S%.6f%:z".to_string());
     tracing_subscriber::fmt()
         .with_timer(timer)
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level)),
         )
         .init();
-
-    let args = Args::parse();
 
     let config_path = if let Some(path) = args.conf {
         path
@@ -147,6 +158,7 @@ async fn main() -> Result<()> {
                         target: None,
                         record: None,
                         srtp_enabled: None,
+                        reject_prob: None,
                         early_media: None,
                         ring: None,
                         answer: None,
@@ -164,6 +176,7 @@ async fn main() -> Result<()> {
                 echo,
                 hangup,
                 reject,
+                reject_prob,
                 srtp,
             } => {
                 info!("Configuration file not found, using default configuration for wait command");
@@ -215,6 +228,7 @@ async fn main() -> Result<()> {
                         target: None,
                         record: None,
                         srtp_enabled: Some(*srtp),
+                        reject_prob: *reject_prob,
                         early_media: None,
                         ring: ring_config,
                         answer: answer_config,
@@ -257,6 +271,7 @@ async fn main() -> Result<()> {
             srtp,
             total,
             concurrent,
+            verbose: _,
         } => (
             "call", target, caller, auth_user, password, hangup, play, record, srtp, total,
             concurrent,

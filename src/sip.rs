@@ -1,5 +1,6 @@
 use crate::config::{AccountConfig, AnswerConfig, Config};
 use crate::media::MediaSession;
+use crate::stats::CallStats;
 use anyhow::{Context, Result};
 use chrono::Local;
 use rsip::headers::{
@@ -38,10 +39,30 @@ struct CallRunner {
     dialog_layer: Arc<DialogLayer>,
     account: AccountConfig,
     global_config: Config,
+    stats: Arc<CallStats>,
+}
+
+struct CallGuard {
+    stats: Arc<CallStats>,
+    start_time: std::time::Instant,
+}
+
+impl Drop for CallGuard {
+    fn drop(&mut self) {
+        self.stats.dec_current();
+        self.stats.inc_finished();
+        self.stats.add_duration(self.start_time.elapsed());
+    }
 }
 
 impl CallRunner {
     async fn make_call(&self, target_uri: String, call_index: u32) -> Result<()> {
+        self.stats.inc_current();
+        let _guard = CallGuard {
+            stats: self.stats.clone(),
+            start_time: std::time::Instant::now(),
+        };
+
         let dialog_layer = &self.dialog_layer;
         let from: rsip::Uri =
             format!("sip:{}@{}", self.account.username, self.account.domain).try_into()?;
@@ -94,6 +115,9 @@ impl CallRunner {
         };
 
         if let Some(res) = response {
+            self.stats
+                .add_status(res.status_code().clone().into())
+                .await;
             info!(
                 "[{}] Received INVITE response: {}",
                 self.account.username,
@@ -258,21 +282,18 @@ impl SipBot {
         );
 
         // Ensure recorders directory exists
-        let recorders_dir = self
-            .global_config
-            .recorders
-            .as_deref()
-            .unwrap_or("/tmp/recorders");
-        if let Err(e) = tokio::fs::create_dir_all(recorders_dir).await {
-            warn!(
-                "[{}] Failed to create recorders directory {}: {:?}",
-                self.account.username, recorders_dir, e
-            );
-        } else {
-            info!(
-                "[{}] Recorders directory: {}",
-                self.account.username, recorders_dir
-            );
+        if let Some(recorders_dir) = &self.global_config.recorders {
+            if let Err(e) = tokio::fs::create_dir_all(recorders_dir).await {
+                warn!(
+                    "[{}] Failed to create recorders directory {}: {:?}",
+                    self.account.username, recorders_dir, e
+                );
+            } else {
+                info!(
+                    "[{}] Recorders directory: {}",
+                    self.account.username, recorders_dir
+                );
+            }
         }
 
         let cancel_token = CancellationToken::new();
@@ -326,17 +347,13 @@ impl SipBot {
         Ok(())
     }
 
-    fn get_recording_path(&self, call_id: &str) -> PathBuf {
-        let dir = self
-            .global_config
-            .recorders
-            .as_deref()
-            .unwrap_or("/tmp/recorders");
+    fn get_recording_path(&self, call_id: &str) -> Option<PathBuf> {
+        let dir = self.global_config.recorders.as_deref()?;
         let now = Local::now().format("%Y%m%d%H%M%S");
         // Sanitize call_id to be safe for filename
         let safe_call_id = call_id.replace(|c: char| !c.is_alphanumeric(), "_");
         let filename = format!("{}_{}.wav", now, safe_call_id);
-        Path::new(dir).join(filename)
+        Some(Path::new(dir).join(filename))
     }
 
     pub async fn run_wait(&mut self) -> Result<()> {
@@ -367,6 +384,49 @@ impl SipBot {
                 self.account.username, target, total, concurrent
             );
 
+            let stats = Arc::new(CallStats::new());
+            let monitor_stats = stats.clone();
+            let monitor_total = total;
+
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(5));
+                loop {
+                    interval.tick().await;
+                    let finished = monitor_stats
+                        .finished_calls
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let current = monitor_stats
+                        .current_calls
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let total_dur = monitor_stats
+                        .total_duration
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let avg_dur = if finished > 0 {
+                        total_dur as f64 / finished as f64 / 1000.0
+                    } else {
+                        0.0
+                    };
+
+                    let status_map = monitor_stats.status_codes.lock().await;
+                    let mut status_str = String::new();
+                    // Sort keys for consistent output
+                    let mut keys: Vec<_> = status_map.keys().collect();
+                    keys.sort();
+                    for key in keys {
+                        status_str.push_str(&format!("{}:{}, ", key, status_map[key]));
+                    }
+
+                    println!(
+                        "Progress: {}/{} (Current: {}), Avg Duration: {:.2}s, Status: [{}]",
+                        finished, monitor_total, current, avg_dur, status_str
+                    );
+
+                    if finished >= monitor_total {
+                        break;
+                    }
+                }
+            });
+
             let runner = CallRunner {
                 dialog_layer: self
                     .dialog_layer
@@ -375,6 +435,7 @@ impl SipBot {
                     .clone(),
                 account: self.account.clone(),
                 global_config: self.global_config.clone(),
+                stats: stats.clone(),
             };
 
             let semaphore = Arc::new(Semaphore::new(concurrent as usize));
@@ -638,10 +699,12 @@ impl SipBot {
         let local_port = local_socket.port();
 
         let recording_path = self.get_recording_path(call_id);
-        info!(
-            "[{}] Recording will be saved to: {:?}",
-            self.account.username, recording_path
-        );
+        if let Some(path) = &recording_path {
+            info!(
+                "[{}] Recording will be saved to: {:?}",
+                self.account.username, path
+            );
+        }
 
         let dialog_layer = self
             .dialog_layer
@@ -697,6 +760,24 @@ impl SipBot {
 
             // Call logic
             let call_logic = async move {
+                // Random rejection check
+                if let Some(prob) = account.reject_prob {
+                    use rand::Rng;
+                    let mut rng = rand::rng();
+                    if rng.random_range(1..=100) <= prob {
+                        info!(
+                            "[{}] Randomly rejecting call (prob: {}%)",
+                            account.username, prob
+                        );
+                        if let Err(e) = server_dialog_clone
+                            .reject(Some(StatusCode::TemporarilyUnavailable), None)
+                        {
+                            error!("Reject error: {:?}", e);
+                        }
+                        return;
+                    }
+                }
+
                 // Stage 1: Ringing (Alerting)
                 let mut media_session: Option<MediaSession> = None;
                 let mut local_sdp: Option<String> = None;
@@ -811,7 +892,7 @@ impl SipBot {
                                         media
                                             .start_echo(
                                                 username_media.clone(),
-                                                Some(&recording_path),
+                                                recording_path.as_deref(),
                                             )
                                             .await
                                     }
@@ -821,7 +902,7 @@ impl SipBot {
                                             .play_file(
                                                 username_media.clone(),
                                                 std::path::Path::new(&wav_file),
-                                                Some(&recording_path),
+                                                recording_path.as_deref(),
                                                 keep_alive,
                                             )
                                             .await
@@ -834,7 +915,7 @@ impl SipBot {
                                     .play_wav_bytes(
                                         username_media,
                                         ANSWER_WAV,
-                                        Some(&recording_path),
+                                        recording_path.as_deref(),
                                         keep_alive,
                                     )
                                     .await

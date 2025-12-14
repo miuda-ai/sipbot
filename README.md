@@ -16,7 +16,7 @@ The media transport uses [rustrtc](https://github.com/restsend/rustrtc).
         - **Echo**: Echo received RTP packets back to the sender (Latency testing).
     - **Hangup (Stage 3)**: Automatically hang up after a configurable duration or reject calls with specific SIP codes.
 - **Outbound Calls**: Ability to initiate calls to a target URI.
-- **Call Recording**: (Experimental) Record call audio to WAV files.
+- **Call Recording**: (Experimental) Record call audio to WAV files. (Requires configuration)
 - **Registration**: Supports SIP registration with authentication (WIP).
 
 ## Quick start
@@ -63,7 +63,10 @@ cargo run -- wait --addr 0.0.0.0:5060 --username sipbot --answer welcome.wav
 - `--echo`: Answer and echo.
 - `--hangup <SECONDS>`: Hangup after seconds.
 - `--reject <CODE>`: Reject with code (e.g. 486, 603).
+- `--reject-prob <PROB>`: Randomly reject call with probability 1-99% (default code 480).
 - `--srtp`: Enable SRTP/SDES.
+
+> **Note**: By default, `wait` mode does not record calls. To enable recording, you must use a configuration file and specify the `recorders` directory.
 
 #### Other Commands
 - `options`: Send OPTIONS request.
@@ -79,13 +82,14 @@ Create a `config.toml` file in the root directory. The configuration allows you 
 # Global settings
 addr = "0.0.0.0:5060"           # Local bind address
 external_ip = "1.2.3.4"         # External IP for SDP (NAT traversal)
-recorders = "/tmp/recorders"    # Directory for recordings
+recorders = "/tmp/recorders"    # Directory for recordings (Required for recording)
 
 [[accounts]]
 username = "1001"
 domain = "sip.example.com"
 password = "secretpassword"
 register = true                 # Enable registration
+reject_prob = 20                # Randomly reject 20% of calls with 480
 
 # --- Call Handling Flow ---
 
@@ -123,6 +127,7 @@ after_secs = 10                 # Send BYE after 10 seconds
     - `domain`: SIP domain/registrar.
     - `password`: SIP password.
     - `register`: (Bool) Whether to register with the domain.
+    - `reject_prob`: (Optional) Probability (1-99) to randomly reject incoming calls with 480.
     - `target`: (Optional) URI to call on startup (for outbound bot).
     - **`ring`**: Configuration for the ringing phase.
         - `duration_secs`: How long to stay in ringing state.
