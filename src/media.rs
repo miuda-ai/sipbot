@@ -121,6 +121,10 @@ impl MediaSession {
             .context("Failed to get local description")?
             .to_sdp_string();
 
+        if local_sdp.is_empty() {
+            anyhow::bail!("Failed to gather ICE candidates");
+        }
+
         info!("Local SDP (Answer): {}", local_sdp);
 
         Ok((
@@ -197,6 +201,10 @@ impl MediaSession {
             .local_description()
             .context("Failed to get local description")?
             .to_sdp_string();
+
+        if local_sdp.is_empty() {
+            anyhow::bail!("Failed to gather ICE candidates");
+        }
 
         Ok((
             Self {

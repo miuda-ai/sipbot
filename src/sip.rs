@@ -675,6 +675,10 @@ impl SipBot {
                     info!("[{}] Received INFO", self.account.username);
                     transaction.reply(StatusCode::OK).await?;
                 }
+                Method::Update => {
+                    info!("[{}] Received UPDATE", self.account.username);
+                    transaction.reply(StatusCode::OK).await?;
+                }
                 _ => info!(
                     "[{}] Received other method: {:?}",
                     self.account.username, transaction.original.method
@@ -801,6 +805,12 @@ impl SipBot {
                                     "[{}] Failed to create media session: {:?}",
                                     account.username, e
                                 );
+                                if let Err(e) = server_dialog_clone
+                                    .reject(Some(StatusCode::TemporarilyUnavailable), None)
+                                {
+                                    error!("Reject error: {:?}", e);
+                                }
+                                return;
                             }
                         }
                     }
