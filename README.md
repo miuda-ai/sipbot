@@ -37,9 +37,9 @@ You can also run `sipbot` with CLI arguments for quick testing.
 
 #### Initiate a Call
 ```bash
-cargo run -- call sip:user@domain --caller sip:me@mydomain --play audio.wav --hangup 10 --total 10 --concurrent 2
+cargo run -- call -t sip:user@domain --caller sip:me@mydomain --play audio.wav --hangup 10 --total 10 --concurrent 2
 ```
-- `<TARGET>`: Target URI (e.g., sip:user@domain).
+- `-t, --target <TARGET>`: Target URI (e.g., sip:user@domain).
 - `-c, --caller <URI>`: Caller (username or full URI).
 - `--auth-user <USER>`: Auth username (optional).
 - `--password <PASS>`: Auth password.

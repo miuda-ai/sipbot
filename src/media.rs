@@ -20,7 +20,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use voice_engine::media::codecs::pcmu::{PcmuDecoder, PcmuEncoder};
 use voice_engine::media::codecs::{Decoder, Encoder};
 
@@ -82,7 +82,7 @@ impl MediaSession {
                 ));
                 t.set_sender(Some(sender));
             } else {
-                info!("Transceiver has no sender, setting one");
+                debug!("Transceiver has no sender, setting one");
                 let params = RtpCodecParameters {
                     payload_type: 0,
                     clock_rate: 8000,
@@ -125,7 +125,7 @@ impl MediaSession {
             anyhow::bail!("Failed to gather ICE candidates");
         }
 
-        info!("Local SDP (Answer): {}", local_sdp);
+        debug!("Local SDP (Answer): {}", local_sdp);
 
         Ok((
             Self {
@@ -426,7 +426,7 @@ impl MediaSession {
         let mut encoder = PcmuEncoder::new();
         let mut ticker = interval(Duration::from_millis(20));
         let chunk_size = 160; // 20ms at 8000Hz
-        let mut timestamp = Duration::from_secs(0);
+        let mut rtp_timestamp = 0;
         let mut seq_no = 0u16;
 
         for chunk in samples.chunks(chunk_size) {
@@ -457,13 +457,13 @@ impl MediaSession {
                 sample_rate: 8000,
                 channels: 1,
                 samples: chunk.len() as u32,
-                timestamp,
+                rtp_timestamp,
                 format: AudioSampleFormat::Unspecified,
                 payload_type: Some(0),
                 sequence_number: Some(seq_no),
             };
             seq_no = seq_no.wrapping_add(1);
-            timestamp += Duration::from_millis(20);
+            rtp_timestamp += chunk.len() as u32;
 
             self.audio_source.send_audio(frame).await?;
         }
