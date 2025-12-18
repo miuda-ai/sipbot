@@ -30,6 +30,7 @@ async fn test_call_flow() -> Result<()> {
             ring: None,
             answer: Some(AnswerConfig::Echo),
             hangup: None,
+            reject_prob: None,
         }],
     };
 
@@ -56,6 +57,7 @@ async fn test_call_flow() -> Result<()> {
                 code: 200,
                 after_secs: Some(5),
             }),
+            reject_prob: None,
         }],
     };
 
@@ -122,6 +124,7 @@ async fn test_options_flow() -> Result<()> {
             target: None,
             record: None,
             srtp_enabled: None,
+            reject_prob: None,
             early_media: None,
             ring: None,
             answer: None,
@@ -145,6 +148,7 @@ async fn test_options_flow() -> Result<()> {
             target: Some(format!("sip:server@{}", server_addr)),
             record: None,
             srtp_enabled: None,
+            reject_prob: None,
             early_media: None,
             ring: None,
             answer: None,
