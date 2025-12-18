@@ -6,7 +6,7 @@ register = true
 
 # Strategy: Answer immediately and Echo
 [accounts.answer]
-echo = true
+action = "echo"
 
 [[accounts]]
 username = "1002"
@@ -15,8 +15,8 @@ password = "secretpassword"
 
 # Strategy: Answer, Play file, then Hangup after 10s
 [accounts.answer]
+action = "play"
 wav_file = "welcome.wav"
-echo = false
 
 [accounts.hangup]
 code = 200
@@ -49,5 +49,5 @@ duration_secs = 10
 ringback = "custom_ring.wav" # Send 183 and play file
 
 [accounts.answer]
+action = "play"
 wav_file = "agent_hello.wav"
-echo = false
