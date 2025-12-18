@@ -38,6 +38,9 @@ enum Commands {
         /// Auth password
         #[arg(long)]
         password: Option<String>,
+        /// Register to SIP server before calling (optional domain)
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        register: Option<String>,
         /// Hangup after seconds
         #[arg(long)]
         hangup: Option<u64>,
@@ -68,9 +71,15 @@ enum Commands {
         /// Username (e.g., sipbot)
         #[arg(short, long)]
         username: Option<String>,
-        /// Domain (e.g., 127.0.0.1)
-        #[arg(short, long)]
+        /// Domain/Realm (e.g., 127.0.0.1)
+        #[arg(short, long, alias = "realm")]
         domain: Option<String>,
+        /// Password for registration
+        #[arg(short, long)]
+        password: Option<String>,
+        /// Register to SIP server (optional domain)
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        register: Option<String>,
         /// Ringback file (wav)
         #[arg(long)]
         ringback: Option<String>,
@@ -171,6 +180,8 @@ async fn main() -> Result<()> {
                 addr,
                 username,
                 domain,
+                password,
+                register,
                 ringback,
                 ring_duration,
                 answer,
@@ -215,6 +226,13 @@ async fn main() -> Result<()> {
                     None
                 };
 
+                let is_register = register.is_some() || password.is_some();
+                let reg_target = if let Some(r) = register {
+                    if r.is_empty() { None } else { Some(r.clone()) }
+                } else {
+                    None
+                };
+
                 Config {
                     addr: addr.clone().or(Some("0.0.0.0:5060".to_string())),
                     external_ip: None,
@@ -222,10 +240,13 @@ async fn main() -> Result<()> {
                     accounts: vec![AccountConfig {
                         username: username.clone().unwrap_or("sipbot".to_string()),
                         auth_username: None,
-                        domain: domain.clone().unwrap_or("127.0.0.1".to_string()),
-                        password: None,
-                        proxy: None,
-                        register: Some(false),
+                        domain: domain
+                            .clone()
+                            .or(reg_target.clone())
+                            .unwrap_or("127.0.0.1".to_string()),
+                        password: password.clone(),
+                        proxy: reg_target,
+                        register: Some(is_register),
                         target: None,
                         record: None,
                         srtp_enabled: Some(*srtp),
@@ -260,12 +281,15 @@ async fn main() -> Result<()> {
         srtp_override,
         total_calls,
         concurrent_calls,
-    ) = match args.command {
+        register_override,
+        proxy_override,
+    ) = match &args.command {
         Commands::Call {
             target,
             caller,
             auth_user,
             password,
+            register,
             hangup,
             play,
             record,
@@ -273,18 +297,86 @@ async fn main() -> Result<()> {
             total,
             concurrent,
             verbose: _,
-        } => (
-            "call", target, caller, auth_user, password, hangup, play, record, srtp, total,
-            concurrent,
-        ),
-        Commands::Wait { srtp, .. } => {
-            ("wait", None, None, None, None, None, None, None, srtp, 1, 1)
+        } => {
+            let is_register = register.is_some() || password.is_some();
+            let reg_target = if let Some(r) = register {
+                if r.is_empty() { None } else { Some(r.clone()) }
+            } else {
+                None
+            };
+            (
+                "call",
+                target.clone(),
+                caller.clone(),
+                auth_user.clone(),
+                password.clone(),
+                *hangup,
+                play.clone(),
+                record.clone(),
+                *srtp,
+                *total,
+                *concurrent,
+                is_register,
+                reg_target,
+            )
+        }
+        Commands::Wait {
+            srtp,
+            password,
+            register,
+            ..
+        } => {
+            let is_register = register.is_some() || password.is_some();
+            let reg_target = if let Some(r) = register {
+                if r.is_empty() { None } else { Some(r.clone()) }
+            } else {
+                None
+            };
+            (
+                "wait",
+                None,
+                None,
+                None,
+                password.clone(),
+                None,
+                None,
+                None,
+                *srtp,
+                1,
+                1,
+                is_register,
+                reg_target,
+            )
         }
         Commands::Options { target } => (
-            "options", target, None, None, None, None, None, None, false, 1, 1,
+            "options",
+            target.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            1,
+            1,
+            false,
+            None,
         ),
         Commands::Info { target } => (
-            "info", target, None, None, None, None, None, None, false, 1, 1,
+            "info",
+            target.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            1,
+            1,
+            false,
+            None,
         ),
     };
 
@@ -349,6 +441,14 @@ async fn main() -> Result<()> {
 
         if let Some(password) = &password_override {
             account.password = Some(password.clone());
+        }
+
+        if register_override {
+            account.register = Some(true);
+        }
+
+        if let Some(proxy) = &proxy_override {
+            account.proxy = Some(proxy.clone());
         }
 
         let handle = tokio::spawn(async move {

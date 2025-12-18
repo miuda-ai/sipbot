@@ -95,8 +95,15 @@ impl CallRunner {
             None
         };
 
+        let destination = if let Some(proxy) = &self.account.proxy {
+            let proxy_uri = Uri::try_from(format!("sip:{}", proxy).as_str())?;
+            proxy_uri.host_with_port.clone().into()
+        } else {
+            to.host_with_port.clone().into()
+        };
+
         let opt = InviteOption {
-            destination: Some(to.host_with_port.clone().into()),
+            destination: Some(destination),
             caller: from.clone(),
             callee: to.clone(),
             contact,
@@ -592,10 +599,12 @@ impl SipBot {
             .context("Registration not initialized")?;
         let username = self.account.username.clone();
         let domain = self.account.domain.clone();
+        let proxy = self.account.proxy.clone();
 
         tokio::spawn(async move {
             info!("[{}] Starting registration loop", username);
-            let uri_str = format!("sip:{}", domain);
+            let target = proxy.unwrap_or(domain);
+            let uri_str = format!("sip:{}", target);
             let server_uri = match Uri::try_from(uri_str.as_str()) {
                 Ok(u) => u,
                 Err(e) => {
