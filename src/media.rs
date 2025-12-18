@@ -5,9 +5,9 @@ use rubato::{FftFixedIn, Resampler};
 use rustrtc::config::{
     AudioCapability, BundlePolicy, MediaCapabilities, RtcConfiguration, TransportMode,
 };
-use rustrtc::media::MediaKind;
 use rustrtc::media::frame::{AudioFrame, AudioSampleFormat, MediaSample};
 use rustrtc::media::track::{MediaStreamTrack, SampleStreamSource, sample_track};
+use rustrtc::media::{MediaError, MediaKind};
 use rustrtc::peer_connection::{
     PeerConnection, PeerConnectionEvent, RtpCodecParameters, RtpSender, TransceiverDirection,
 };
@@ -529,10 +529,12 @@ impl MediaSession {
                                 }
                             }
                             Err(e) => {
-                                error!(
-                                    "[{}] Failed to receive sample for echo: {:?}",
-                                    username_clone, e
-                                );
+                                if !matches!(e, MediaError::EndOfStream) {
+                                    error!(
+                                        "[{}] Failed to receive sample for echo: {:?}",
+                                        username_clone, e
+                                    );
+                                }
                                 break;
                             }
                         }
@@ -582,10 +584,12 @@ impl MediaSession {
                                         }
                                     }
                                     Err(e) => {
-                                        error!(
-                                            "[{}] Failed to receive sample for echo: {:?}",
-                                            username_clone, e
-                                        );
+                                        if !matches!(e, MediaError::EndOfStream) {
+                                            error!(
+                                                "[{}] Failed to receive sample for echo: {:?}",
+                                                username_clone, e
+                                            );
+                                        }
                                         break;
                                     }
                                 }
