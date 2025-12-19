@@ -255,19 +255,22 @@ impl MediaSession {
         let cancel_token = CancellationToken::new();
         let child_token = cancel_token.clone();
 
+        let recording = recording_path.is_some();
         // Handle existing transceivers
         let transceivers = pc.get_transceivers();
         info!("[{}] Found {} transceivers", username, transceivers.len());
-        for transceiver in transceivers {
-            if let Some(receiver) = transceiver.receiver().as_ref() {
-                info!(
-                    "[{}] Transceiver has receiver, track id={}",
-                    username,
-                    receiver.track().id()
-                );
-                spawn_track_recorder(receiver.track(), recorder.clone(), child_token.clone());
-            } else {
-                info!("[{}] Transceiver has NO receiver", username);
+        if recording {
+            for transceiver in transceivers {
+                if let Some(receiver) = transceiver.receiver().as_ref() {
+                    info!(
+                        "[{}] Transceiver has receiver, track id={}",
+                        username,
+                        receiver.track().id()
+                    );
+                    spawn_track_recorder(receiver.track(), recorder.clone(), child_token.clone());
+                } else {
+                    info!("[{}] Transceiver has NO receiver", username);
+                }
             }
         }
 
@@ -307,7 +310,7 @@ impl MediaSession {
                     }
                     info!("[{}] Playback finished, keeping alive...", username);
                 }
-                _ = &mut rx_task => {
+                _ = &mut rx_task, if recording => {
                     return Ok(());
                 }
             }
