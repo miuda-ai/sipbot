@@ -20,6 +20,9 @@ struct Args {
 
     #[command(subcommand)]
     command: Commands,
+
+    #[arg(short, long, global = true)]
+    verbose: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -59,18 +62,15 @@ enum Commands {
         /// Max concurrent calls
         #[arg(long, default_value = "1")]
         concurrent: u32,
-        /// Verbose output (show info logs)
-        #[arg(long)]
-        verbose: bool,
     },
     /// Wait for incoming calls
     Wait {
         /// Bind address (e.g., 0.0.0.0:5060)
-        #[arg(short, long)]
-        addr: Option<String>,
+        #[arg(short, long, default_value = "0.0.0.0:5060")]
+        addr: String,
         /// Username (e.g., sipbot)
-        #[arg(short, long)]
-        username: Option<String>,
+        #[arg(short, long, default_value = "sipbot")]
+        username: String,
         /// Domain/Realm (e.g., 127.0.0.1)
         #[arg(short, long, alias = "realm")]
         domain: Option<String>,
@@ -121,9 +121,9 @@ enum Commands {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let log_level = match &args.command {
-        Commands::Call { verbose, .. } if !*verbose => "error",
-        _ => "info",
+    let log_level = match &args.verbose {
+        true => "info",
+        _ => "error",
     };
 
     let timer = ChronoLocal::new("%Y-%m-%d %H:%M:%S%.6f%:z".to_string());
@@ -234,11 +234,11 @@ async fn main() -> Result<()> {
                 };
 
                 Config {
-                    addr: addr.clone().or(Some("0.0.0.0:5060".to_string())),
+                    addr: Some(addr.clone()),
                     external_ip: None,
                     recorders: None,
                     accounts: vec![AccountConfig {
-                        username: username.clone().unwrap_or("sipbot".to_string()),
+                        username: username.clone(),
                         auth_username: None,
                         domain: domain
                             .clone()
@@ -296,7 +296,6 @@ async fn main() -> Result<()> {
             srtp,
             total,
             concurrent,
-            verbose: _,
         } => {
             let is_register = register.is_some() || password.is_some();
             let reg_target = if let Some(r) = register {

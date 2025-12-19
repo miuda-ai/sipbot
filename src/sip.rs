@@ -943,7 +943,7 @@ impl SipBot {
                     let keep_alive = hangup_config.is_some();
 
                     let media_future = async {
-                        if let Some(mut media) = media_session {
+                        if let Some(media) = media_session {
                             if let Some(cfg) = answer_config {
                                 match cfg {
                                     AnswerConfig::Echo => {

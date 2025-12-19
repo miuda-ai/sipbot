@@ -6,9 +6,9 @@ use rubato::{FftFixedIn, Resampler};
 use rustrtc::config::{
     AudioCapability, BundlePolicy, MediaCapabilities, RtcConfiguration, TransportMode,
 };
+use rustrtc::media::MediaKind;
 use rustrtc::media::frame::{AudioFrame, AudioSampleFormat, MediaSample};
 use rustrtc::media::track::{MediaStreamTrack, SampleStreamSource, sample_track};
-use rustrtc::media::{MediaError, MediaKind};
 use rustrtc::peer_connection::{
     PeerConnection, PeerConnectionEvent, RtpCodecParameters, RtpSender, TransceiverDirection,
 };
@@ -19,9 +19,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::sync::broadcast;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 use voice_engine::media::codecs::pcmu::{PcmuDecoder, PcmuEncoder};
 use voice_engine::media::codecs::{Decoder, Encoder};
 
@@ -31,6 +32,7 @@ pub struct MediaSession {
     audio_source: Arc<SampleStreamSource>,
     recorder: Arc<Mutex<Option<Recorder>>>,
     stats: Arc<CallStats>,
+    sample_tx: broadcast::Sender<MediaSample>,
 }
 
 impl MediaSession {
@@ -58,11 +60,63 @@ impl MediaSession {
 
         let pc = Arc::new(PeerConnection::new(config));
         let ssrc_id = random_u32();
-        let (source, track, _feedback) = sample_track(MediaKind::Audio, ssrc_id as usize);
+        let (source, track, _feedback) = sample_track(MediaKind::Audio, 1000);
         let audio_source = Arc::new(source);
 
         let recorder: Arc<Mutex<Option<Recorder>>> = Arc::new(Mutex::new(None));
-        let _recorder_clone = recorder.clone();
+
+        let (sample_tx, _) = broadcast::channel(100);
+        let sample_tx_clone = sample_tx.clone();
+        let pc_clone = pc.clone();
+        let stats_clone = stats.clone();
+        tokio::spawn(async move {
+            while let Some(event) = pc_clone.recv().await {
+                if let PeerConnectionEvent::Track(transceiver) = event {
+                    if let Some(receiver) = transceiver.receiver().as_ref() {
+                        let track = receiver.track();
+                        let tx = sample_tx_clone.clone();
+                        let s = stats_clone.clone();
+                        tokio::spawn(async move {
+                            info!("Track receiver task started");
+                            let mut last_seq: Option<u16> = None;
+                            loop {
+                                match track.recv().await {
+                                    Ok(sample) => {
+                                        if let MediaSample::Audio(frame) = &sample {
+                                            if let Some(seq) = frame.sequence_number {
+                                                if let Some(last) = last_seq {
+                                                    let expected = last.wrapping_add(1);
+                                                    if seq != expected {
+                                                        let lost = if seq > expected {
+                                                            (seq - expected) as u64
+                                                        } else {
+                                                            (u16::MAX - expected + seq + 1) as u64
+                                                        };
+                                                        if lost < 1000 {
+                                                            s.inc_rx_lost(lost);
+                                                        }
+                                                    }
+                                                }
+                                                last_seq = Some(seq);
+                                            }
+                                            s.inc_rx(1, frame.data.len() as u64);
+                                        }
+
+                                        if let Err(_) = tx.send(sample) {
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("Track recv error: {:?}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        });
 
         let remote_desc = SessionDescription::parse(SdpType::Offer, remote_sdp)?;
         pc.set_remote_description(remote_desc).await?;
@@ -70,39 +124,20 @@ impl MediaSession {
         // Attach track to the active transceiver
         let transceivers = pc.get_transceivers();
         if let Some(t) = transceivers.first() {
-            // Try to use sender() as Option
-            if let Some(_sender) = t.sender() {
-                let params = RtpCodecParameters {
-                    payload_type: 0,
-                    clock_rate: 8000,
-                    channels: 1,
-                };
-                let sender = Arc::new(RtpSender::new(
-                    track.clone(),
-                    ssrc_id,
-                    "audio".to_string(),
-                    params,
-                ));
-                t.set_sender(Some(sender));
-            } else {
-                debug!("Transceiver has no sender, setting one");
-                let params = RtpCodecParameters {
-                    payload_type: 0,
-                    clock_rate: 8000,
-                    channels: 1,
-                };
-                let sender = Arc::new(RtpSender::new(
-                    track.clone(),
-                    ssrc_id,
-                    "audio".to_string(),
-                    params,
-                ));
-                t.set_sender(Some(sender));
-            }
+            let params = RtpCodecParameters {
+                payload_type: 0,
+                clock_rate: 8000,
+                channels: 1,
+            };
+            let sender = Arc::new(RtpSender::new(
+                track.clone(),
+                ssrc_id,
+                "audio".to_string(),
+                params,
+            ));
+            t.set_sender(Some(sender));
             t.set_direction(TransceiverDirection::SendRecv);
         } else {
-            info!("No transceivers found, adding track");
-            // Fallback
             let params = RtpCodecParameters {
                 payload_type: 0,
                 clock_rate: 8000,
@@ -113,7 +148,6 @@ impl MediaSession {
 
         let answer = pc.create_answer()?;
         let sdp_str = answer.to_sdp_string();
-
         let answer = SessionDescription::parse(SdpType::Answer, &sdp_str)?;
 
         pc.set_local_description(answer.clone())?;
@@ -128,14 +162,13 @@ impl MediaSession {
             anyhow::bail!("Failed to gather ICE candidates");
         }
 
-        debug!("Local SDP (Answer): {}", local_sdp);
-
         Ok((
             Self {
                 pc,
                 audio_source,
                 recorder,
                 stats,
+                sample_tx,
             },
             local_sdp,
         ))
@@ -157,7 +190,7 @@ impl MediaSession {
             TransportMode::Rtp
         };
         config.bundle_policy = BundlePolicy::MaxBundle;
-        config.ice_servers = vec![]; // No STUN/TURN servers
+        config.ice_servers = vec![];
         config.media_capabilities = Some(MediaCapabilities {
             audio: vec![AudioCapability {
                 payload_type: 0,
@@ -171,13 +204,10 @@ impl MediaSession {
         });
 
         let pc = Arc::new(PeerConnection::new(config));
-
-        // Create audio track
-        let (source, track, _feedback) = sample_track(MediaKind::Audio, 11111);
+        let (source, track, _feedback) = sample_track(MediaKind::Audio, 1000);
         let audio_source = Arc::new(source);
 
         if send_audio {
-            // Add real track
             let params = RtpCodecParameters {
                 payload_type: 0,
                 clock_rate: 8000,
@@ -193,10 +223,46 @@ impl MediaSession {
 
         let recorder: Arc<Mutex<Option<Recorder>>> = Arc::new(Mutex::new(None));
 
+        let (sample_tx, _sample_rx) = broadcast::channel(1000);
+        let sample_tx_clone = sample_tx.clone();
+        let pc_clone = pc.clone();
+        tokio::spawn(async move {
+            while let Some(event) = pc_clone.recv().await {
+                if let PeerConnectionEvent::Track(transceiver) = event {
+                    if let Some(receiver) = transceiver.receiver().as_ref() {
+                        let track = receiver.track();
+                        let tx = sample_tx_clone.clone();
+                        tokio::spawn(async move {
+                            info!("Track receiver task started (new_offer)");
+                            let mut count = 0;
+                            loop {
+                                match track.recv().await {
+                                    Ok(sample) => {
+                                        count += 1;
+                                        if count % 100 == 0 {
+                                            info!(
+                                                "Received {} samples from track (new_offer)",
+                                                count
+                                            );
+                                        }
+                                        if let Err(_) = tx.send(sample) {
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("Track recv error (new_offer): {:?}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        });
+
         let offer = pc.create_offer()?;
-
         let sdp_str = offer.to_sdp_string();
-
         let offer = SessionDescription::parse(SdpType::Offer, &sdp_str)?;
 
         pc.set_local_description(offer.clone())?;
@@ -217,6 +283,7 @@ impl MediaSession {
                 audio_source,
                 recorder,
                 stats,
+                sample_tx,
             },
             local_sdp,
         ))
@@ -256,74 +323,30 @@ impl MediaSession {
             raw_samples
         };
 
-        let pc = self.pc.clone();
-        let recorder = self.recorder.clone();
-        let cancel_token = CancellationToken::new();
-        let child_token = cancel_token.clone();
-
-        let recording = recording_path.is_some();
-        // Handle existing transceivers
-        let transceivers = pc.get_transceivers();
-        info!("[{}] Found {} transceivers", username, transceivers.len());
-        if recording {
-            for transceiver in transceivers {
-                if let Some(receiver) = transceiver.receiver().as_ref() {
-                    info!(
-                        "[{}] Transceiver has receiver, track id={}",
-                        username,
-                        receiver.track().id()
-                    );
-                    spawn_track_recorder(
-                        receiver.track(),
-                        recorder.clone(),
-                        child_token.clone(),
-                        self.stats.clone(),
-                    );
-                } else {
-                    info!("[{}] Transceiver has NO receiver", username);
-                }
-            }
-        }
-
-        let username_rx = username.clone();
+        let recorder_clone = self.recorder.clone();
+        let sample_tx = self.sample_tx.clone();
+        let child_token = CancellationToken::new();
         let rx_task = async move {
-            while let Some(event) = pc.recv().await {
-                if let PeerConnectionEvent::Track(transceiver) = event {
-                    info!("[{}] Received PC event: Track", username_rx);
-                    if let Some(receiver) = transceiver.receiver().as_ref() {
-                        spawn_track_recorder(
-                            receiver.track(),
-                            recorder.clone(),
-                            child_token.clone(),
-                            self.stats.clone(),
-                        );
-                    }
-                }
-            }
+            run_recorder_loop(sample_tx.subscribe(), recorder_clone, child_token).await
         };
-        tokio::pin!(rx_task);
 
         let play_fut = self.play_samples(username.clone(), samples);
         tokio::pin!(play_fut);
-
-        let mut play_done = false;
+        tokio::pin!(rx_task);
 
         loop {
             tokio::select! {
-                res = &mut play_fut, if !play_done => {
-                    play_done = true;
+                res = &mut play_fut => {
                     if let Err(e) = res {
-                        cancel_token.cancel();
-                        return Err(e);
+                        error!("[{}] Playback error: {:?}", username, e);
                     }
                     if !keep_alive {
-                        cancel_token.cancel();
                         return Ok(());
                     }
                     info!("[{}] Playback finished, keeping alive...", username);
                 }
-                _ = &mut rx_task, if recording => {
-                    return Ok(());
+                _ = &mut rx_task => {
+                    return Ok(())
                 }
             }
         }
@@ -358,72 +381,25 @@ impl MediaSession {
             raw_samples
         };
 
-        let pc = self.pc.clone();
-        let recorder = self.recorder.clone();
-        let _username_rx = username.clone();
-        let cancel_token = CancellationToken::new();
-        let child_token = cancel_token.clone();
-
-        // Handle existing transceivers
-        let transceivers = pc.get_transceivers();
-        info!("[{}] Found {} transceivers", username, transceivers.len());
-        for (i, transceiver) in transceivers.iter().enumerate() {
-            info!(
-                "[{}] Transceiver {}: mid={:?} direction={:?}",
-                username,
-                i,
-                transceiver.mid(),
-                transceiver.direction()
-            );
-            if let Some(receiver) = transceiver.receiver().as_ref() {
-                info!(
-                    "[{}] Transceiver {} has receiver, track id={}",
-                    username,
-                    i,
-                    receiver.track().id()
-                );
-                spawn_track_recorder(
-                    receiver.track(),
-                    recorder.clone(),
-                    child_token.clone(),
-                    self.stats.clone(),
-                );
-            } else {
-                info!("[{}] Transceiver {} has NO receiver", username, i);
-            }
-        }
-
+        let recorder_clone = self.recorder.clone();
+        let sample_tx = self.sample_tx.clone();
+        let child_token = CancellationToken::new();
         let rx_task = async move {
-            while let Some(event) = pc.recv().await {
-                if let PeerConnectionEvent::Track(transceiver) = event {
-                    if let Some(receiver) = transceiver.receiver().as_ref() {
-                        spawn_track_recorder(
-                            receiver.track(),
-                            recorder.clone(),
-                            child_token.clone(),
-                            self.stats.clone(),
-                        );
-                    }
-                }
-            }
+            run_recorder_loop(sample_tx.subscribe(), recorder_clone, child_token).await
         };
-        tokio::pin!(rx_task);
 
         let play_fut = self.play_samples(username.clone(), samples);
         tokio::pin!(play_fut);
-
-        let mut play_done = false;
+        tokio::pin!(rx_task);
 
         loop {
             tokio::select! {
-                res = &mut play_fut, if !play_done => {
-                    play_done = true;
+
+                res = &mut play_fut => {
                     if let Err(e) = res {
-                        cancel_token.cancel();
-                        return Err(e);
+                        error!("[{}] Playback error: {:?}", username, e);
                     }
                     if !keep_alive {
-                        cancel_token.cancel();
                         return Ok(());
                     }
                     info!("[{}] Playback finished, keeping alive...", username);
@@ -436,19 +412,19 @@ impl MediaSession {
     }
 
     async fn play_samples(&self, username: String, samples: Vec<i16>) -> Result<()> {
-        let non_zero = samples.iter().filter(|&&s| s != 0).count();
-        info!(
-            "[{}] play_samples total: {}, non-zero: {}",
-            username,
-            samples.len(),
-            non_zero
-        );
-
         let mut encoder = PcmuEncoder::new();
         let mut ticker = interval(Duration::from_millis(20));
         let chunk_size = 160; // 20ms at 8000Hz
         let mut rtp_timestamp = 0;
-        let mut seq_no = 0u16;
+        let total_chunks = samples.chunks(chunk_size).count();
+        let mut sent_chunks = 0;
+
+        info!(
+            "[{}] Playback started: {} samples ({} chunks)",
+            username,
+            samples.len(),
+            total_chunks
+        );
 
         for chunk in samples.chunks(chunk_size) {
             ticker.tick().await;
@@ -464,16 +440,6 @@ impl MediaSession {
             let encoded = encoder.encode(chunk);
             self.stats.inc_tx(1, encoded.len() as u64);
 
-            if !encoded.is_empty() {
-                let all_ff = encoded.iter().all(|&b| b == 0xFF);
-                if all_ff {
-                    let input_silence = chunk.iter().all(|&s| s == 0);
-                    if !input_silence {
-                        error!("ENCODER BUG: Produced all 0xFF for non-silent input!");
-                    }
-                }
-            }
-
             let frame = AudioFrame {
                 data: Bytes::from(encoded),
                 sample_rate: 8000,
@@ -482,199 +448,53 @@ impl MediaSession {
                 rtp_timestamp,
                 format: AudioSampleFormat::Unspecified,
                 payload_type: Some(0),
-                sequence_number: Some(seq_no),
+                sequence_number: None,
             };
-            seq_no = seq_no.wrapping_add(1);
             rtp_timestamp += chunk.len() as u32;
 
             self.audio_source.send_audio(frame).await?;
+            sent_chunks += 1;
+            if sent_chunks % 100 == 0 {
+                info!(
+                    "[{}] Sent {}/{} chunks",
+                    username, sent_chunks, total_chunks
+                );
+            }
         }
+        info!("[{}] Playback finished successfully", username);
         Ok(())
     }
 
-    pub async fn start_echo(
-        &mut self,
-        username: String,
-        recording_path: Option<&Path>,
-    ) -> Result<()> {
-        info!("[{}] Starting echo...", username);
-
-        if let Some(path) = recording_path {
-            let mut rec = self.recorder.lock().await;
-            *rec = Some(Recorder::new(username.clone(), path.to_path_buf()));
-        }
+    pub async fn start_echo(&self, username: String, recording_path: Option<&Path>) -> Result<()> {
+        info!("[{}] Starting echo service", username);
 
         let audio_source = self.audio_source.clone();
         let recorder = self.recorder.clone();
+        let sample_tx = self.sample_tx.clone();
 
-        // Handle existing transceivers
-        let transceivers = self.pc.get_transceivers();
-        info!(
-            "[{}] Found {} existing transceivers for echo",
-            username,
-            transceivers.len()
-        );
-        for transceiver in transceivers {
-            if let Some(receiver) = transceiver.receiver().as_ref() {
-                let track = receiver.track();
-                info!("[{}] Existing Track ID: {}", username, track.id());
-                let audio_source = audio_source.clone();
-                let username_clone = username.clone();
-                let recorder = recorder.clone();
-                let stats = self.stats.clone();
-                tokio::spawn(async move {
-                    let mut decoder = PcmuDecoder::new();
-                    let mut last_seq: Option<u16> = None;
-                    loop {
-                        match track.recv().await {
-                            Ok(sample) => {
-                                // Record RX
-                                {
-                                    if let MediaSample::Audio(frame) = &sample {
-                                        if let Some(seq) = frame.sequence_number {
-                                            if let Some(last) = last_seq {
-                                                let expected = last.wrapping_add(1);
-                                                if seq != expected {
-                                                    let lost = if seq > expected {
-                                                        (seq - expected) as u64
-                                                    } else {
-                                                        (u16::MAX - expected + seq + 1) as u64
-                                                    };
-                                                    if lost < 1000 {
-                                                        stats.inc_rx_lost(lost);
-                                                    }
-                                                }
-                                            }
-                                            last_seq = Some(seq);
-                                        }
+        // 1. Subscription for recording
+        if let Some(path) = recording_path {
+            let mut rec = self.recorder.lock().await;
+            *rec = Some(Recorder::new(username.clone(), path.to_path_buf()));
 
-                                        stats.inc_rx(1, frame.data.len() as u64);
-                                        // Also record TX since we are echoing
-                                        stats.inc_tx(1, frame.data.len() as u64);
-
-                                        let rec = recorder.lock().await;
-                                        if let Some(r) = rec.as_ref() {
-                                            let decoded = decoder.decode(&frame.data);
-                                            r.record_rx(&decoded);
-                                            r.record_tx(&decoded);
-                                        }
-                                    } else {
-                                        error!("RX SAMPLE: NOT AUDIO");
-                                    }
-                                }
-
-                                // Echo
-                                if let Err(e) = audio_source.send(sample).await {
-                                    error!(
-                                        "[{}] Failed to send echo sample: {:?}",
-                                        username_clone, e
-                                    );
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                if !matches!(e, MediaError::EndOfStream) {
-                                    error!(
-                                        "[{}] Failed to receive sample for echo: {:?}",
-                                        username_clone, e
-                                    );
-                                }
-                                break;
-                            }
-                        }
-                    }
-                });
-            }
+            let recorder_clone = recorder.clone();
+            let sample_tx_clone = sample_tx.clone();
+            tokio::spawn(async move {
+                run_recorder_loop(
+                    sample_tx_clone.subscribe(),
+                    recorder_clone,
+                    CancellationToken::new(),
+                )
+                .await;
+            });
         }
 
-        while let Some(event) = self.pc.recv().await {
-            match event {
-                PeerConnectionEvent::Track(transceiver) => {
-                    let mid = transceiver.mid();
-                    info!("[{}] Received PC event: Track (mid: {:?})", username, mid);
-                    if let Some(receiver) = transceiver.receiver().as_ref() {
-                        let track = receiver.track();
-                        info!("[{}] Track ID: {}", username, track.id());
-                        let audio_source = audio_source.clone();
-                        let username_clone = username.clone();
-                        let recorder = recorder.clone();
-                        let stats = self.stats.clone();
-                        tokio::spawn(async move {
-                            let mut decoder = PcmuDecoder::new();
-                            let mut last_seq: Option<u16> = None;
-                            loop {
-                                match track.recv().await {
-                                    Ok(sample) => {
-                                        // Record RX
-                                        {
-                                            if let MediaSample::Audio(frame) = &sample {
-                                                if let Some(seq) = frame.sequence_number {
-                                                    if let Some(last) = last_seq {
-                                                        let expected = last.wrapping_add(1);
-                                                        if seq != expected {
-                                                            let lost = if seq > expected {
-                                                                (seq - expected) as u64
-                                                            } else {
-                                                                (u16::MAX - expected + seq + 1)
-                                                                    as u64
-                                                            };
-                                                            if lost < 1000 {
-                                                                stats.inc_rx_lost(lost);
-                                                            }
-                                                        }
-                                                    }
-                                                    last_seq = Some(seq);
-                                                }
-
-                                                stats.inc_rx(1, frame.data.len() as u64);
-                                                // Also record TX since we are echoing
-                                                stats.inc_tx(1, frame.data.len() as u64);
-
-                                                let rec = recorder.lock().await;
-                                                if let Some(r) = rec.as_ref() {
-                                                    let decoded = decoder.decode(&frame.data);
-                                                    r.record_rx(&decoded);
-                                                    r.record_tx(&decoded);
-                                                }
-                                            } else {
-                                                error!("RX SAMPLE: NOT AUDIO");
-                                            }
-                                        }
-
-                                        // Echo
-                                        if let Err(e) = audio_source.send(sample).await {
-                                            error!(
-                                                "[{}] Failed to send echo sample: {:?}",
-                                                username_clone, e
-                                            );
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        if !matches!(e, MediaError::EndOfStream) {
-                                            error!(
-                                                "[{}] Failed to receive sample for echo: {:?}",
-                                                username_clone, e
-                                            );
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                        });
-                    }
-                }
-                _ => {
-                    info!("[{}] Received PC event: Other", username);
-                }
-            }
-        }
+        // 2. Subscription for echoing
+        tokio::spawn(run_echo_loop(sample_tx.subscribe(), audio_source, username));
 
         Ok(())
     }
-    pub async fn start_recording(&mut self, _path: &Path) -> Result<()> {
-        Ok(())
-    }
+
     pub async fn stop(&self) {
         self.pc.close();
     }
@@ -725,59 +545,75 @@ fn resample_audio(samples: Vec<i16>, source_rate: u32, channels: u16) -> Result<
     Ok(result.into_iter().map(|s| s as i16).collect())
 }
 
-fn spawn_track_recorder(
-    track: Arc<dyn MediaStreamTrack>,
+async fn run_recorder_loop(
+    mut rx: broadcast::Receiver<MediaSample>,
     recorder: Arc<Mutex<Option<Recorder>>>,
     token: CancellationToken,
-    stats: Arc<CallStats>,
 ) {
-    tokio::spawn(async move {
-        let mut decoder = PcmuDecoder::new();
-        let mut last_seq: Option<u16> = None;
-        loop {
-            tokio::select! {
-                _ = token.cancelled() => {
-                    info!("RX task cancelled");
-                    break;
-                },
-                res = track.recv() => {
-                    match res {
-                        Ok(sample) => {
-                            if let MediaSample::Audio(frame) = &sample {
-                                if let Some(seq) = frame.sequence_number {
-                                    if let Some(last) = last_seq {
-                                        let expected = last.wrapping_add(1);
-                                        if seq != expected {
-                                            let lost = if seq > expected {
-                                                (seq - expected) as u64
-                                            } else {
-                                                // Wrapped around
-                                                (u16::MAX - expected + seq + 1) as u64
-                                            };
-                                            if lost < 1000 { // Sanity check for large jumps
-                                                stats.inc_rx_lost(lost);
-                                            }
-                                        }
-                                    }
-                                    last_seq = Some(seq);
-                                }
-
-                                stats.inc_rx(1, frame.data.len() as u64);
-                                let rec = recorder.lock().await;
-                                if let Some(r) = rec.as_ref() {
-                                    let decoded = decoder.decode(&frame.data);
-                                    r.record_rx(&decoded);
-                                }
+    let mut decoder = PcmuDecoder::new();
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => {
+                info!("Recorder task cancelled");
+                break;
+            },
+            res = rx.recv() => {
+                match res {
+                    Ok(sample) => {
+                        if let MediaSample::Audio(frame) = &sample {
+                            let rec = recorder.lock().await;
+                            if let Some(r) = rec.as_ref() {
+                                let decoded = decoder.decode(&frame.data);
+                                r.record_rx(&decoded);
                             }
                         }
-                        Err(_) => {
-                            break;
-                        },
                     }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        error!("Recorder loop lagged");
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        break;
+                    },
                 }
             }
         }
-    });
+    }
+}
+
+async fn run_echo_loop(
+    mut rx: broadcast::Receiver<MediaSample>,
+    audio_source: Arc<SampleStreamSource>,
+    username: String,
+) {
+    let username_clone = username.clone();
+    let mut count = 0;
+    info!("[{}] Echo loop started", username_clone);
+    loop {
+        match rx.recv().await {
+            Ok(sample) => {
+                if let Err(e) = audio_source.send(sample).await {
+                    error!("[{}] Failed to send echo sample: {:?}", username_clone, e);
+                    break;
+                }
+                count += 1;
+                if count % 100 == 0 {
+                    info!("[{}] Echoed {} samples", username_clone, count);
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => {
+                error!("[{}] Echo loop lagged, skipping samples", username_clone);
+                continue;
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                break;
+            }
+        }
+    }
+    info!(
+        "[{}] Echo loop finished after {} samples",
+        username_clone, count
+    );
 }
 
 #[cfg(test)]
