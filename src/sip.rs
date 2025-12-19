@@ -72,8 +72,12 @@ impl CallRunner {
             dialog_layer.build_local_contact(Some(self.account.username.clone()), None)?;
         // Create MediaSession and Offer
         let srtp_enabled = self.account.srtp_enabled.unwrap_or(false);
+        let nack_enabled = self.account.nack_enabled.unwrap_or(false);
+        let jitter_buffer_enabled = self.account.jitter_buffer_enabled.unwrap_or(false);
         let (media_session, local_sdp) = MediaSession::new_offer(
             srtp_enabled,
+            nack_enabled,
+            jitter_buffer_enabled,
             self.global_config.external_ip.clone(),
             true,
             self.stats.clone(),
@@ -274,6 +278,7 @@ pub struct SipBot {
     endpoint: Option<Arc<Endpoint>>,
     dialog_layer: Option<Arc<DialogLayer>>,
     registration: Option<Registration>,
+    stats: Arc<CallStats>,
 }
 
 impl SipBot {
@@ -284,6 +289,7 @@ impl SipBot {
             endpoint: None,
             dialog_layer: None,
             registration: None,
+            stats: Arc::new(CallStats::new()),
         }
     }
 
@@ -396,12 +402,11 @@ impl SipBot {
                 self.account.username, target, total, concurrent
             );
 
-            let stats = Arc::new(CallStats::new());
-            let monitor_stats = stats.clone();
+            let monitor_stats = self.stats.clone();
             let monitor_total = total;
 
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(5));
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
                 loop {
                     interval.tick().await;
                     let finished = monitor_stats
@@ -428,6 +433,15 @@ impl SipBot {
                     let rx_lost = monitor_stats
                         .rx_lost_packets
                         .load(std::sync::atomic::Ordering::Relaxed);
+                    let nack_sent = monitor_stats
+                        .nack_sent
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let nack_recv = monitor_stats
+                        .nack_recv
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let nack_recovered = monitor_stats
+                        .nack_recovered
+                        .load(std::sync::atomic::Ordering::Relaxed);
 
                     let avg_dur = if finished > 0 {
                         total_dur as f64 / finished as f64 / 1000.0
@@ -451,7 +465,7 @@ impl SipBot {
                     }
 
                     println!(
-                        "Progress: {}/{} (Current: {}), Avg Duration: {:.2}s, Status: [{}], TX: {}p/{}b, RX: {}p/{}b, Loss: {:.2}%",
+                        "Progress: {}/{} (Current: {}), Avg Duration: {:.2}s, Status: [{}], TX: {}p/{}b, RX: {}p/{}b, Loss: {:.2}%, NACK: {}s/{}r/{}rec",
                         finished,
                         monitor_total,
                         current,
@@ -461,7 +475,10 @@ impl SipBot {
                         tx_bytes,
                         rx_pkts,
                         rx_bytes,
-                        loss_rate
+                        loss_rate,
+                        nack_sent,
+                        nack_recv,
+                        nack_recovered
                     );
 
                     if finished >= monitor_total {
@@ -478,7 +495,7 @@ impl SipBot {
                     .clone(),
                 account: self.account.clone(),
                 global_config: self.global_config.clone(),
-                stats: stats.clone(),
+                stats: self.stats.clone(),
             };
 
             let semaphore = Arc::new(Semaphore::new(concurrent as usize));
@@ -788,8 +805,14 @@ impl SipBot {
         let global_config = self.global_config.clone();
         let server_dialog_clone = server_dialog.clone();
         let offer_body = transaction.original.body().clone();
-
+        let stats_clone = self.stats.clone();
         tokio::spawn(async move {
+            stats_clone.inc_current();
+            let _guard = CallGuard {
+                stats: stats_clone.clone(),
+                start_time: std::time::Instant::now(),
+            };
+
             // Spawn transaction handler
             let mut server_dialog_handler = server_dialog_clone.clone();
             tokio::spawn(async move {
@@ -837,11 +860,15 @@ impl SipBot {
                 if !offer_body.is_empty() {
                     if let Ok(body_str) = std::str::from_utf8(&offer_body) {
                         let srtp_enabled = account.srtp_enabled.unwrap_or(false);
+                        let nack_enabled = account.nack_enabled.unwrap_or(false);
+                        let jitter_buffer_enabled = account.jitter_buffer_enabled.unwrap_or(false);
                         match MediaSession::new(
                             body_str,
                             srtp_enabled,
+                            nack_enabled,
+                            jitter_buffer_enabled,
                             global_config.external_ip.clone(),
-                            Arc::new(CallStats::new()), // TODO: Use a proper stats object if needed for inbound
+                            stats_clone.clone(),
                         )
                         .await
                         {

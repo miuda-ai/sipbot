@@ -6,11 +6,12 @@ use rubato::{FftFixedIn, Resampler};
 use rustrtc::config::{
     AudioCapability, BundlePolicy, MediaCapabilities, RtcConfiguration, TransportMode,
 };
+use rustrtc::media::MediaError;
 use rustrtc::media::MediaKind;
 use rustrtc::media::frame::{AudioFrame, AudioSampleFormat, MediaSample};
 use rustrtc::media::track::{MediaStreamTrack, SampleStreamSource, sample_track};
 use rustrtc::peer_connection::{
-    PeerConnection, PeerConnectionEvent, RtpCodecParameters, RtpSender, TransceiverDirection,
+    PeerConnection, PeerConnectionEvent, RtpCodecParameters, RtpSenderBuilder, TransceiverDirection,
 };
 use rustrtc::sdp::{SdpType, SessionDescription};
 use rustrtc::transports::ice::stun::random_u32;
@@ -19,10 +20,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tokio::sync::broadcast;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use voice_engine::media::codecs::pcmu::{PcmuDecoder, PcmuEncoder};
 use voice_engine::media::codecs::{Decoder, Encoder};
 
@@ -32,13 +32,18 @@ pub struct MediaSession {
     audio_source: Arc<SampleStreamSource>,
     recorder: Arc<Mutex<Option<Recorder>>>,
     stats: Arc<CallStats>,
-    sample_tx: broadcast::Sender<MediaSample>,
+    jitter_buffer_enabled: bool,
+    last_nack_sent: Arc<std::sync::atomic::AtomicU64>,
+    last_nack_recv: Arc<std::sync::atomic::AtomicU64>,
+    last_nack_recovered: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl MediaSession {
     pub async fn new(
         remote_sdp: &str,
         srtp_enabled: bool,
+        nack_enabled: bool,
+        jitter_buffer_enabled: bool,
         external_ip: Option<String>,
         stats: Arc<CallStats>,
     ) -> Result<(Self, String)> {
@@ -51,72 +56,26 @@ impl MediaSession {
         } else {
             TransportMode::Rtp
         };
+        let mut audio_caps = AudioCapability::pcmu();
+        if nack_enabled {
+            info!("NACK enabled for media session (incoming)");
+            config.nack_buffer_size = 200;
+        } else {
+            audio_caps.rtcp_fbs.retain(|fb| fb != "nack");
+        }
         config.ice_servers = vec![]; // No STUN/TURN servers
         config.media_capabilities = Some(MediaCapabilities {
-            audio: vec![AudioCapability::pcmu()],
+            audio: vec![audio_caps],
             video: vec![],
             application: None,
         });
 
-        let pc = Arc::new(PeerConnection::new(config));
+        let pc = Arc::new(PeerConnection::new(config.clone()));
         let ssrc_id = random_u32();
         let (source, track, _feedback) = sample_track(MediaKind::Audio, 1000);
         let audio_source = Arc::new(source);
 
         let recorder: Arc<Mutex<Option<Recorder>>> = Arc::new(Mutex::new(None));
-
-        let (sample_tx, _) = broadcast::channel(100);
-        let sample_tx_clone = sample_tx.clone();
-        let pc_clone = pc.clone();
-        let stats_clone = stats.clone();
-        tokio::spawn(async move {
-            while let Some(event) = pc_clone.recv().await {
-                if let PeerConnectionEvent::Track(transceiver) = event {
-                    if let Some(receiver) = transceiver.receiver().as_ref() {
-                        let track = receiver.track();
-                        let tx = sample_tx_clone.clone();
-                        let s = stats_clone.clone();
-                        tokio::spawn(async move {
-                            info!("Track receiver task started");
-                            let mut last_seq: Option<u16> = None;
-                            loop {
-                                match track.recv().await {
-                                    Ok(sample) => {
-                                        if let MediaSample::Audio(frame) = &sample {
-                                            if let Some(seq) = frame.sequence_number {
-                                                if let Some(last) = last_seq {
-                                                    let expected = last.wrapping_add(1);
-                                                    if seq != expected {
-                                                        let lost = if seq > expected {
-                                                            (seq - expected) as u64
-                                                        } else {
-                                                            (u16::MAX - expected + seq + 1) as u64
-                                                        };
-                                                        if lost < 1000 {
-                                                            s.inc_rx_lost(lost);
-                                                        }
-                                                    }
-                                                }
-                                                last_seq = Some(seq);
-                                            }
-                                            s.inc_rx(1, frame.data.len() as u64);
-                                        }
-
-                                        if let Err(_) = tx.send(sample) {
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("Track recv error: {:?}", e);
-                                        break;
-                                    }
-                                }
-                            }
-                        });
-                    }
-                }
-            }
-        });
 
         let remote_desc = SessionDescription::parse(SdpType::Offer, remote_sdp)?;
         pc.set_remote_description(remote_desc).await?;
@@ -124,18 +83,41 @@ impl MediaSession {
         // Attach track to the active transceiver
         let transceivers = pc.get_transceivers();
         if let Some(t) = transceivers.first() {
-            let params = RtpCodecParameters {
-                payload_type: 0,
-                clock_rate: 8000,
-                channels: 1,
-            };
-            let sender = Arc::new(RtpSender::new(
-                track.clone(),
-                ssrc_id,
-                "audio".to_string(),
-                params,
-            ));
-            t.set_sender(Some(sender));
+            // Try to use sender() as Option
+            if let Some(_sender) = t.sender() {
+                let params = RtpCodecParameters {
+                    payload_type: 0,
+                    clock_rate: 8000,
+                    channels: 1,
+                };
+                let mut builder = RtpSenderBuilder::new(track.clone(), ssrc_id)
+                    .stream_id("audio".to_string())
+                    .params(params);
+                if nack_enabled {
+                    builder = builder
+                        .nack(pc.config().nack_buffer_size)
+                        .bitrate_controller();
+                }
+                let sender = builder.build();
+                t.set_sender(Some(sender));
+            } else {
+                debug!("Transceiver has no sender, setting one");
+                let params = RtpCodecParameters {
+                    payload_type: 0,
+                    clock_rate: 8000,
+                    channels: 1,
+                };
+                let mut builder = RtpSenderBuilder::new(track.clone(), ssrc_id)
+                    .stream_id("audio".to_string())
+                    .params(params);
+                if nack_enabled {
+                    builder = builder
+                        .nack(pc.config().nack_buffer_size)
+                        .bitrate_controller();
+                }
+                let sender = builder.build();
+                t.set_sender(Some(sender));
+            }
             t.set_direction(TransceiverDirection::SendRecv);
         } else {
             let params = RtpCodecParameters {
@@ -146,12 +128,13 @@ impl MediaSession {
             pc.add_track(track.clone(), params)?;
         }
 
+        pc.wait_for_gathering_complete().await;
+
         let answer = pc.create_answer()?;
         let sdp_str = answer.to_sdp_string();
         let answer = SessionDescription::parse(SdpType::Answer, &sdp_str)?;
 
         pc.set_local_description(answer.clone())?;
-        pc.wait_for_gathering_complete().await;
 
         let local_sdp = pc
             .local_description()
@@ -168,7 +151,10 @@ impl MediaSession {
                 audio_source,
                 recorder,
                 stats,
-                sample_tx,
+                jitter_buffer_enabled,
+                last_nack_sent: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                last_nack_recv: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                last_nack_recovered: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             },
             local_sdp,
         ))
@@ -176,6 +162,8 @@ impl MediaSession {
 
     pub async fn new_offer(
         srtp_enabled: bool,
+        nack_enabled: bool,
+        jitter_buffer_enabled: bool,
         external_ip: Option<String>,
         send_audio: bool,
         stats: Arc<CallStats>,
@@ -189,16 +177,17 @@ impl MediaSession {
         } else {
             TransportMode::Rtp
         };
+        let mut audio_caps = AudioCapability::pcmu();
+        if nack_enabled {
+            info!("NACK enabled for media session (outgoing)");
+            config.nack_buffer_size = 200;
+        } else {
+            audio_caps.rtcp_fbs.retain(|fb| fb != "nack");
+        }
         config.bundle_policy = BundlePolicy::MaxBundle;
         config.ice_servers = vec![];
         config.media_capabilities = Some(MediaCapabilities {
-            audio: vec![AudioCapability {
-                payload_type: 0,
-                codec_name: "PCMU".to_string(),
-                clock_rate: 8000,
-                channels: 1,
-                fmtp: None,
-            }],
+            audio: vec![audio_caps],
             video: vec![],
             application: None,
         });
@@ -223,50 +212,13 @@ impl MediaSession {
 
         let recorder: Arc<Mutex<Option<Recorder>>> = Arc::new(Mutex::new(None));
 
-        let (sample_tx, _sample_rx) = broadcast::channel(1000);
-        let sample_tx_clone = sample_tx.clone();
-        let pc_clone = pc.clone();
-        tokio::spawn(async move {
-            while let Some(event) = pc_clone.recv().await {
-                if let PeerConnectionEvent::Track(transceiver) = event {
-                    if let Some(receiver) = transceiver.receiver().as_ref() {
-                        let track = receiver.track();
-                        let tx = sample_tx_clone.clone();
-                        tokio::spawn(async move {
-                            info!("Track receiver task started (new_offer)");
-                            let mut count = 0;
-                            loop {
-                                match track.recv().await {
-                                    Ok(sample) => {
-                                        count += 1;
-                                        if count % 100 == 0 {
-                                            info!(
-                                                "Received {} samples from track (new_offer)",
-                                                count
-                                            );
-                                        }
-                                        if let Err(_) = tx.send(sample) {
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("Track recv error (new_offer): {:?}", e);
-                                        break;
-                                    }
-                                }
-                            }
-                        });
-                    }
-                }
-            }
-        });
+        pc.wait_for_gathering_complete().await;
 
         let offer = pc.create_offer()?;
         let sdp_str = offer.to_sdp_string();
         let offer = SessionDescription::parse(SdpType::Offer, &sdp_str)?;
 
         pc.set_local_description(offer.clone())?;
-        pc.wait_for_gathering_complete().await;
 
         let local_sdp = pc
             .local_description()
@@ -283,7 +235,10 @@ impl MediaSession {
                 audio_source,
                 recorder,
                 stats,
-                sample_tx,
+                jitter_buffer_enabled,
+                last_nack_sent: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                last_nack_recv: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                last_nack_recovered: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             },
             local_sdp,
         ))
@@ -293,6 +248,137 @@ impl MediaSession {
         let remote_desc = SessionDescription::parse(SdpType::Answer, remote_sdp)?;
         self.pc.set_remote_description(remote_desc).await?;
         Ok(())
+    }
+
+    fn spawn_audio_loop(&self, username: String, track: Arc<dyn MediaStreamTrack>) {
+        let audio_source = self.audio_source.clone();
+        let recorder = self.recorder.clone();
+        let stats = self.stats.clone();
+        let jitter_buffer_enabled = self.jitter_buffer_enabled;
+        let session = self.clone();
+
+        tokio::spawn(async move {
+            let mut decoder = PcmuDecoder::new();
+            let mut last_seq: Option<u16> = None;
+            let mut sync_interval = tokio::time::interval(Duration::from_secs(1));
+
+            if jitter_buffer_enabled {
+                use rustrtc::media::JitterBuffer;
+                let mut jb =
+                    JitterBuffer::new(Duration::from_millis(20), Duration::from_millis(200), 100);
+                loop {
+                    let wait = jb.next_pop_wait().unwrap_or(Duration::from_millis(100));
+                    tokio::select! {
+                        _ = sync_interval.tick() => {
+                            session.sync_nack_stats();
+                        }
+                        res = track.recv() => {
+                            match res {
+                                Ok(sample) => {
+                                    jb.push(sample);
+                                }
+                                Err(e) => {
+                                    if !matches!(e, MediaError::EndOfStream) {
+                                        error!("[{}] Failed to receive sample: {:?}", username, e);
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                        _ = tokio::time::sleep(wait) => {
+                            while let Some(sample) = jb.pop() {
+                                Self::process_sample(&username, sample, &audio_source, &recorder, &stats, &mut decoder, &mut last_seq).await;
+                            }
+                        }
+                    }
+                }
+            } else {
+                loop {
+                    tokio::select! {
+                        _ = sync_interval.tick() => {
+                            session.sync_nack_stats();
+                        }
+                        res = track.recv() => {
+                            match res {
+                                Ok(sample) => {
+                                    Self::process_sample(
+                                        &username,
+                                        sample,
+                                        &audio_source,
+                                        &recorder,
+                                        &stats,
+                                        &mut decoder,
+                                        &mut last_seq,
+                                    )
+                                    .await;
+                                }
+                                Err(e) => {
+                                    if !matches!(e, MediaError::EndOfStream) {
+                                        error!("[{}] Failed to receive sample: {:?}", username, e);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    async fn process_sample(
+        username: &str,
+        sample: MediaSample,
+        audio_source: &Arc<SampleStreamSource>,
+        recorder: &Arc<Mutex<Option<Recorder>>>,
+        stats: &Arc<CallStats>,
+        decoder: &mut PcmuDecoder,
+        last_seq: &mut Option<u16>,
+    ) {
+        // Record RX
+        {
+            if let MediaSample::Audio(frame) = &sample {
+                if let Some(seq) = frame.sequence_number {
+                    if let Some(last) = *last_seq {
+                        let expected = last.wrapping_add(1);
+                        if seq != expected {
+                            let diff = seq.wrapping_sub(last) as i16;
+
+                            if diff > 1 {
+                                // Gap detected, these are lost
+                                stats.inc_rx_lost((diff - 1) as u64);
+                                *last_seq = Some(seq);
+                            } else if diff < 0 {
+                                // Out of order packet
+                                // We don't increment recovered here because sync_nack_stats handles it from rustrtc
+                            }
+                        } else {
+                            *last_seq = Some(seq);
+                        }
+                    } else {
+                        *last_seq = Some(seq);
+                    }
+                }
+
+                stats.inc_rx(1, frame.data.len() as u64);
+                // Also record TX since we are echoing
+                stats.inc_tx(1, frame.data.len() as u64);
+
+                let rec = recorder.lock().await;
+                if let Some(r) = rec.as_ref() {
+                    let decoded = decoder.decode(&frame.data);
+                    r.record_rx(&decoded);
+                    r.record_tx(&decoded);
+                }
+            } else {
+                error!("RX SAMPLE: NOT AUDIO");
+            }
+        }
+
+        // Echo
+        if let Err(e) = audio_source.send(sample).await {
+            error!("[{}] Failed to send echo sample: {:?}", username, e);
+        }
     }
 
     pub async fn play_file(
@@ -323,20 +409,60 @@ impl MediaSession {
             raw_samples
         };
 
-        let recorder_clone = self.recorder.clone();
-        let sample_tx = self.sample_tx.clone();
-        let child_token = CancellationToken::new();
+        let pc = self.pc.clone();
+        let cancel_token = CancellationToken::new();
+        let child_token = cancel_token.clone();
+
+        let recording = recording_path.is_some();
+        // Handle existing transceivers
+        let transceivers = pc.get_transceivers();
+        info!("[{}] Found {} transceivers", username, transceivers.len());
+        if recording {
+            for transceiver in transceivers {
+                if let Some(receiver) = transceiver.receiver().as_ref() {
+                    info!(
+                        "[{}] Transceiver has receiver, track id={}",
+                        username,
+                        receiver.track().id()
+                    );
+                    spawn_track_recorder(self.clone(), receiver.track(), child_token.clone());
+                } else {
+                    info!("[{}] Transceiver has NO receiver", username);
+                }
+            }
+        }
+
+        let username_rx = username.clone();
+        let session_rx = self.clone();
         let rx_task = async move {
-            run_recorder_loop(sample_tx.subscribe(), recorder_clone, child_token).await
+            while let Some(event) = pc.recv().await {
+                if let PeerConnectionEvent::Track(transceiver) = event {
+                    info!("[{}] Received PC event: Track", username_rx);
+                    if let Some(receiver) = transceiver.receiver().as_ref() {
+                        spawn_track_recorder(
+                            session_rx.clone(),
+                            receiver.track(),
+                            child_token.clone(),
+                        );
+                    }
+                }
+            }
         };
 
         let play_fut = self.play_samples(username.clone(), samples);
         tokio::pin!(play_fut);
         tokio::pin!(rx_task);
 
+        let mut play_done = false;
+        let mut sync_interval = tokio::time::interval(Duration::from_secs(1));
+
         loop {
             tokio::select! {
-                res = &mut play_fut => {
+                _ = sync_interval.tick() => {
+                    self.sync_nack_stats();
+                }
+                res = &mut play_fut, if !play_done => {
+                    play_done = true;
                     if let Err(e) = res {
                         error!("[{}] Playback error: {:?}", username, e);
                     }
@@ -381,21 +507,64 @@ impl MediaSession {
             raw_samples
         };
 
-        let recorder_clone = self.recorder.clone();
-        let sample_tx = self.sample_tx.clone();
-        let child_token = CancellationToken::new();
+        let pc = self.pc.clone();
+        let _username_rx = username.clone();
+        let cancel_token = CancellationToken::new();
+        let child_token = cancel_token.clone();
+
+        // Handle existing transceivers
+        let transceivers = pc.get_transceivers();
+        info!("[{}] Found {} transceivers", username, transceivers.len());
+        for (i, transceiver) in transceivers.iter().enumerate() {
+            info!(
+                "[{}] Transceiver {}: mid={:?} direction={:?}",
+                username,
+                i,
+                transceiver.mid(),
+                transceiver.direction()
+            );
+            if let Some(receiver) = transceiver.receiver().as_ref() {
+                info!(
+                    "[{}] Transceiver {} has receiver, track id={}",
+                    username,
+                    i,
+                    receiver.track().id()
+                );
+                spawn_track_recorder(self.clone(), receiver.track(), child_token.clone());
+            } else {
+                info!("[{}] Transceiver {} has NO receiver", username, i);
+            }
+        }
+
+        let session_rx = self.clone();
         let rx_task = async move {
-            run_recorder_loop(sample_tx.subscribe(), recorder_clone, child_token).await
+            while let Some(event) = pc.recv().await {
+                if let PeerConnectionEvent::Track(transceiver) = event {
+                    if let Some(receiver) = transceiver.receiver().as_ref() {
+                        spawn_track_recorder(
+                            session_rx.clone(),
+                            receiver.track(),
+                            child_token.clone(),
+                        );
+                    }
+                }
+            }
         };
 
         let play_fut = self.play_samples(username.clone(), samples);
         tokio::pin!(play_fut);
         tokio::pin!(rx_task);
 
+        let mut play_done = false;
+        let mut sync_interval = tokio::time::interval(Duration::from_secs(1));
+
         loop {
             tokio::select! {
-
-                res = &mut play_fut => {
+                _ = sync_interval.tick() => {
+                    self.sync_nack_stats();
+                }
+                res = &mut play_fut, if !play_done => {
+                    play_done = true;
                     if let Err(e) = res {
                         error!("[{}] Playback error: {:?}", username, e);
                     }
@@ -465,38 +634,92 @@ impl MediaSession {
         Ok(())
     }
 
-    pub async fn start_echo(&self, username: String, recording_path: Option<&Path>) -> Result<()> {
+    pub async fn start_echo(&self, username: String, _recording_path: Option<&Path>) -> Result<()> {
         info!("[{}] Starting echo service", username);
 
-        let audio_source = self.audio_source.clone();
-        let recorder = self.recorder.clone();
-        let sample_tx = self.sample_tx.clone();
-
-        // 1. Subscription for recording
-        if let Some(path) = recording_path {
-            let mut rec = self.recorder.lock().await;
-            *rec = Some(Recorder::new(username.clone(), path.to_path_buf()));
-
-            let recorder_clone = recorder.clone();
-            let sample_tx_clone = sample_tx.clone();
-            tokio::spawn(async move {
-                run_recorder_loop(
-                    sample_tx_clone.subscribe(),
-                    recorder_clone,
-                    CancellationToken::new(),
-                )
-                .await;
-            });
+        // Handle existing transceivers
+        let transceivers = self.pc.get_transceivers();
+        info!(
+            "[{}] Found {} existing transceivers for echo",
+            username,
+            transceivers.len()
+        );
+        for transceiver in transceivers {
+            if let Some(receiver) = transceiver.receiver().as_ref() {
+                self.spawn_audio_loop(username.clone(), receiver.track());
+            }
         }
 
-        // 2. Subscription for echoing
-        tokio::spawn(run_echo_loop(sample_tx.subscribe(), audio_source, username));
+        while let Some(event) = self.pc.recv().await {
+            match event {
+                PeerConnectionEvent::Track(transceiver) => {
+                    let mid = transceiver.mid();
+                    info!("[{}] Received PC event: Track (mid: {:?})", username, mid);
+                    if let Some(receiver) = transceiver.receiver().as_ref() {
+                        self.spawn_audio_loop(username.clone(), receiver.track());
+                    }
+                }
+                _ => {
+                    info!("[{}] Received PC event: Other", username);
+                }
+            }
+        }
 
         Ok(())
     }
 
     pub async fn stop(&self) {
         self.pc.close();
+    }
+
+    pub fn sync_nack_stats(&self) {
+        let mut total_sent = 0;
+        let mut total_recv = 0;
+        let mut total_recovered = 0;
+
+        let transceivers = self.pc.get_transceivers();
+        for transceiver in transceivers {
+            if let Some(sender) = transceiver.sender() {
+                if let Some(handler) = sender.nack_handler() {
+                    total_recv += handler.get_nack_count();
+                }
+            }
+            if let Some(receiver) = transceiver.receiver() {
+                if let Some(handler) = receiver.nack_handler() {
+                    total_sent += handler.get_nack_count();
+                    total_recovered += handler.get_recovered_count();
+                }
+            }
+        }
+
+        if total_sent > 0 || total_recv > 0 || total_recovered > 0 {
+            info!(
+                "sync_nack_stats: total_sent={}, total_recv={}, total_recovered={}",
+                total_sent, total_recv, total_recovered
+            );
+        }
+
+        let last_sent = self
+            .last_nack_sent
+            .swap(total_sent, std::sync::atomic::Ordering::Relaxed);
+        if total_sent > last_sent {
+            self.stats.inc_nack_sent(total_sent - last_sent);
+        }
+
+        let last_recv = self
+            .last_nack_recv
+            .swap(total_recv, std::sync::atomic::Ordering::Relaxed);
+        if total_recv > last_recv {
+            self.stats.inc_nack_recv(total_recv - last_recv);
+        }
+
+        let last_recovered = self
+            .last_nack_recovered
+            .swap(total_recovered, std::sync::atomic::Ordering::Relaxed);
+        if total_recovered > last_recovered {
+            self.stats
+                .inc_nack_recovered(total_recovered - last_recovered);
+        }
     }
 }
 
@@ -545,75 +768,104 @@ fn resample_audio(samples: Vec<i16>, source_rate: u32, channels: u16) -> Result<
     Ok(result.into_iter().map(|s| s as i16).collect())
 }
 
-async fn run_recorder_loop(
-    mut rx: broadcast::Receiver<MediaSample>,
-    recorder: Arc<Mutex<Option<Recorder>>>,
+fn spawn_track_recorder(
+    session: MediaSession,
+    track: Arc<dyn MediaStreamTrack>,
     token: CancellationToken,
 ) {
-    let mut decoder = PcmuDecoder::new();
-    loop {
-        tokio::select! {
-            _ = token.cancelled() => {
-                info!("Recorder task cancelled");
-                break;
-            },
-            res = rx.recv() => {
-                match res {
-                    Ok(sample) => {
-                        if let MediaSample::Audio(frame) = &sample {
-                            let rec = recorder.lock().await;
-                            if let Some(r) = rec.as_ref() {
-                                let decoded = decoder.decode(&frame.data);
-                                r.record_rx(&decoded);
-                            }
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        error!("Recorder loop lagged");
-                        continue;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
+    let recorder = session.recorder.clone();
+    let stats = session.stats.clone();
+    let jitter_buffer_enabled = session.jitter_buffer_enabled;
+    tokio::spawn(async move {
+        let mut decoder = PcmuDecoder::new();
+        let mut last_seq: Option<u16> = None;
+
+        if jitter_buffer_enabled {
+            use rustrtc::media::JitterBuffer;
+            let mut jb =
+                JitterBuffer::new(Duration::from_millis(20), Duration::from_millis(200), 100);
+            loop {
+                let wait = jb.next_pop_wait().unwrap_or(Duration::from_millis(100));
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        info!("RX task cancelled");
                         break;
                     },
+                    res = track.recv() => {
+                        match res {
+                            Ok(sample) => {
+                                jb.push(sample);
+                            }
+                            Err(_) => {
+                                break;
+                            },
+                        }
+                    }
+                    _ = tokio::time::sleep(wait) => {
+                        while let Some(sample) = jb.pop() {
+                            process_recorded_sample(sample, &recorder, &stats, &mut decoder, &mut last_seq).await;
+                        }
+                    }
+                }
+            }
+        } else {
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        info!("RX task cancelled");
+                        break;
+                    },
+                    res = track.recv() => {
+                        match res {
+                            Ok(sample) => {
+                                process_recorded_sample(sample, &recorder, &stats, &mut decoder, &mut last_seq).await;
+                            }
+                            Err(_) => {
+                                break;
+                            },
+                        }
+                    }
                 }
             }
         }
-    }
+    });
 }
 
-async fn run_echo_loop(
-    mut rx: broadcast::Receiver<MediaSample>,
-    audio_source: Arc<SampleStreamSource>,
-    username: String,
+async fn process_recorded_sample(
+    sample: MediaSample,
+    recorder: &Arc<Mutex<Option<Recorder>>>,
+    stats: &Arc<CallStats>,
+    decoder: &mut PcmuDecoder,
+    last_seq: &mut Option<u16>,
 ) {
-    let username_clone = username.clone();
-    let mut count = 0;
-    info!("[{}] Echo loop started", username_clone);
-    loop {
-        match rx.recv().await {
-            Ok(sample) => {
-                if let Err(e) = audio_source.send(sample).await {
-                    error!("[{}] Failed to send echo sample: {:?}", username_clone, e);
-                    break;
+    if let MediaSample::Audio(frame) = &sample {
+        if let Some(seq) = frame.sequence_number {
+            if let Some(last) = *last_seq {
+                let expected = last.wrapping_add(1);
+                if seq != expected {
+                    let diff = seq.wrapping_sub(last) as i16;
+
+                    if diff > 1 {
+                        stats.inc_rx_lost((diff - 1) as u64);
+                        *last_seq = Some(seq);
+                    } else if diff < 0 {
+                        // Out of order packet
+                    }
+                } else {
+                    *last_seq = Some(seq);
                 }
-                count += 1;
-                if count % 100 == 0 {
-                    info!("[{}] Echoed {} samples", username_clone, count);
-                }
-            }
-            Err(broadcast::error::RecvError::Lagged(_)) => {
-                error!("[{}] Echo loop lagged, skipping samples", username_clone);
-                continue;
-            }
-            Err(broadcast::error::RecvError::Closed) => {
-                break;
+            } else {
+                *last_seq = Some(seq);
             }
         }
+
+        stats.inc_rx(1, frame.data.len() as u64);
+        let rec = recorder.lock().await;
+        if let Some(r) = rec.as_ref() {
+            let decoded = decoder.decode(&frame.data);
+            r.record_rx(&decoded);
+        }
     }
-    info!(
-        "[{}] Echo loop finished after {} samples",
-        username_clone, count
-    );
 }
 
 #[cfg(test)]
@@ -654,15 +906,18 @@ mod tests {
     #[tokio::test]
     async fn test_media_session_offer() {
         let stats = Arc::new(CallStats::new());
-        let (_session, sdp) = MediaSession::new_offer(false, None, true, stats.clone())
-            .await
-            .unwrap();
+        let (_session, sdp) =
+            MediaSession::new_offer(false, false, false, None, true, stats.clone())
+                .await
+                .unwrap();
         assert!(sdp.contains("m=audio"));
         assert!(sdp.contains("a=sendrecv")); // We set direction to SendRecv
 
         // Check if we can create an answer session
         let (_answer_session, answer_sdp) =
-            MediaSession::new(&sdp, false, None, stats).await.unwrap();
+            MediaSession::new(&sdp, false, false, false, None, stats)
+                .await
+                .unwrap();
         assert!(answer_sdp.contains("m=audio"));
         assert!(answer_sdp.contains("a=sendrecv"));
     }

@@ -15,6 +15,9 @@ pub struct CallStats {
     pub tx_bytes: AtomicU64,
     pub rx_bytes: AtomicU64,
     pub rx_lost_packets: AtomicU64,
+    pub nack_sent: AtomicU64,
+    pub nack_recv: AtomicU64,
+    pub nack_recovered: AtomicU64,
 }
 
 impl CallStats {
@@ -24,6 +27,18 @@ impl CallStats {
 
     pub fn inc_rx_lost(&self, count: u64) {
         self.rx_lost_packets.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn inc_nack_sent(&self, count: u64) {
+        self.nack_sent.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn inc_nack_recv(&self, count: u64) {
+        self.nack_recv.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn inc_nack_recovered(&self, count: u64) {
+        self.nack_recovered.fetch_add(count, Ordering::Relaxed);
     }
 
     pub fn inc_tx(&self, packets: u64, bytes: u64) {

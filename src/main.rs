@@ -56,6 +56,12 @@ enum Commands {
         /// Enable SRTP/SDES
         #[arg(long)]
         srtp: bool,
+        /// Enable NACK
+        #[arg(long)]
+        nack: bool,
+        /// Enable Jitter Buffer
+        #[arg(long)]
+        jitter: bool,
         /// Total number of calls to make
         #[arg(long, default_value = "1")]
         total: u32,
@@ -104,6 +110,12 @@ enum Commands {
         /// Enable SRTP/SDES
         #[arg(long)]
         srtp: bool,
+        /// Enable NACK
+        #[arg(long)]
+        nack: bool,
+        /// Enable Jitter Buffer
+        #[arg(long)]
+        jitter: bool,
     },
     /// Send OPTIONS request
     Options {
@@ -168,6 +180,8 @@ async fn main() -> Result<()> {
                         target: None,
                         record: None,
                         srtp_enabled: None,
+                        nack_enabled: None,
+                        jitter_buffer_enabled: None,
                         reject_prob: None,
                         early_media: None,
                         ring: None,
@@ -190,6 +204,8 @@ async fn main() -> Result<()> {
                 reject,
                 reject_prob,
                 srtp,
+                nack,
+                jitter,
             } => {
                 info!("Configuration file not found, using default configuration for wait command");
 
@@ -227,6 +243,7 @@ async fn main() -> Result<()> {
                 };
 
                 let is_register = register.is_some() || password.is_some();
+                info!("Parsed config: nack={}, jitter={}", *nack, *jitter);
                 let reg_target = if let Some(r) = register {
                     if r.is_empty() { None } else { Some(r.clone()) }
                 } else {
@@ -250,6 +267,8 @@ async fn main() -> Result<()> {
                         target: None,
                         record: None,
                         srtp_enabled: Some(*srtp),
+                        nack_enabled: Some(*nack),
+                        jitter_buffer_enabled: Some(*jitter),
                         reject_prob: *reject_prob,
                         early_media: None,
                         ring: ring_config,
@@ -279,6 +298,8 @@ async fn main() -> Result<()> {
         play_file_override,
         record_override,
         srtp_override,
+        nack_override,
+        jitter_buffer_override,
         total_calls,
         concurrent_calls,
         register_override,
@@ -294,6 +315,8 @@ async fn main() -> Result<()> {
             play,
             record,
             srtp,
+            nack,
+            jitter,
             total,
             concurrent,
         } => {
@@ -313,6 +336,8 @@ async fn main() -> Result<()> {
                 play.clone(),
                 record.clone(),
                 *srtp,
+                Some(*nack),
+                Some(*jitter),
                 *total,
                 *concurrent,
                 is_register,
@@ -321,6 +346,8 @@ async fn main() -> Result<()> {
         }
         Commands::Wait {
             srtp,
+            nack,
+            jitter,
             password,
             register,
             ..
@@ -341,6 +368,8 @@ async fn main() -> Result<()> {
                 None,
                 None,
                 *srtp,
+                Some(*nack),
+                Some(*jitter),
                 1,
                 1,
                 is_register,
@@ -357,6 +386,8 @@ async fn main() -> Result<()> {
             None,
             None,
             false,
+            None,
+            None,
             1,
             1,
             false,
@@ -372,6 +403,8 @@ async fn main() -> Result<()> {
             None,
             None,
             false,
+            None,
+            None,
             1,
             1,
             false,
@@ -401,6 +434,14 @@ async fn main() -> Result<()> {
 
         if srtp_override {
             account.srtp_enabled = Some(true);
+        }
+
+        if let Some(nack) = nack_override {
+            account.nack_enabled = Some(nack);
+        }
+
+        if let Some(jb) = jitter_buffer_override {
+            account.jitter_buffer_enabled = Some(jb);
         }
 
         if let Some(play_file) = &play_file_override {

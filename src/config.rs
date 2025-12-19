@@ -28,11 +28,13 @@ pub struct AccountConfig {
     pub domain: String,
     pub password: Option<String>,
     pub proxy: Option<String>,
-    pub register: Option<bool>,     // Default to true if missing
-    pub target: Option<String>,     // Target URI for outbound calls
-    pub record: Option<String>,     // Recording file path
-    pub srtp_enabled: Option<bool>, // Enable SRTP/SDES
-    pub reject_prob: Option<u8>,    // Reject probability (1-99%)
+    pub register: Option<bool>,              // Default to true if missing
+    pub target: Option<String>,              // Target URI for outbound calls
+    pub record: Option<String>,              // Recording file path
+    pub srtp_enabled: Option<bool>,          // Enable SRTP/SDES
+    pub nack_enabled: Option<bool>,          // Enable NACK
+    pub jitter_buffer_enabled: Option<bool>, // Enable Jitter Buffer
+    pub reject_prob: Option<u8>,             // Reject probability (1-99%)
 
     // Stage 1: Early Media (183)
     pub early_media: Option<EarlyMediaConfig>,
