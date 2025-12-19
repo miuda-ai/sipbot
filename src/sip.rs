@@ -32,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 const ANSWER_WAV: &[u8] = include_bytes!("../wavs/answer.wav");
+const PLAY_WAV: &[u8] = include_bytes!("../wavs/play.wav");
 // use voice_engine::net_tool::extract_rtp_addresses_from_sdp;
 
 #[derive(Clone)]
@@ -71,9 +72,13 @@ impl CallRunner {
             dialog_layer.build_local_contact(Some(self.account.username.clone()), None)?;
         // Create MediaSession and Offer
         let srtp_enabled = self.account.srtp_enabled.unwrap_or(false);
-        let (media_session, local_sdp) =
-            MediaSession::new_offer(srtp_enabled, self.global_config.external_ip.clone(), true)
-                .await?;
+        let (media_session, local_sdp) = MediaSession::new_offer(
+            srtp_enabled,
+            self.global_config.external_ip.clone(),
+            true,
+            self.stats.clone(),
+        )
+        .await?;
         debug!(
             "[{}] Generated Offer SDP:\n{}",
             self.account.username, local_sdp
@@ -198,7 +203,7 @@ impl CallRunner {
                 }
             } else {
                 if let Err(e) = media_session_clone
-                    .play_wav_bytes(username, ANSWER_WAV, record_path_ref, keep_alive)
+                    .play_wav_bytes(username, PLAY_WAV, record_path_ref, keep_alive)
                     .await
                 {
                     warn!("Play built-in answer stopped: {:?}", e);
@@ -408,8 +413,30 @@ impl SipBot {
                     let total_dur = monitor_stats
                         .total_duration
                         .load(std::sync::atomic::Ordering::Relaxed);
+                    let tx_pkts = monitor_stats
+                        .tx_packets
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let rx_pkts = monitor_stats
+                        .rx_packets
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let tx_bytes = monitor_stats
+                        .tx_bytes
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let rx_bytes = monitor_stats
+                        .rx_bytes
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let rx_lost = monitor_stats
+                        .rx_lost_packets
+                        .load(std::sync::atomic::Ordering::Relaxed);
+
                     let avg_dur = if finished > 0 {
                         total_dur as f64 / finished as f64 / 1000.0
+                    } else {
+                        0.0
+                    };
+
+                    let loss_rate = if rx_pkts + rx_lost > 0 {
+                        (rx_lost as f64 / (rx_pkts + rx_lost) as f64) * 100.0
                     } else {
                         0.0
                     };
@@ -424,8 +451,17 @@ impl SipBot {
                     }
 
                     println!(
-                        "Progress: {}/{} (Current: {}), Avg Duration: {:.2}s, Status: [{}]",
-                        finished, monitor_total, current, avg_dur, status_str
+                        "Progress: {}/{} (Current: {}), Avg Duration: {:.2}s, Status: [{}], TX: {}p/{}b, RX: {}p/{}b, Loss: {:.2}%",
+                        finished,
+                        monitor_total,
+                        current,
+                        avg_dur,
+                        status_str,
+                        tx_pkts,
+                        tx_bytes,
+                        rx_pkts,
+                        rx_bytes,
+                        loss_rate
                     );
 
                     if finished >= monitor_total {
@@ -699,9 +735,12 @@ impl SipBot {
 
     async fn handle_invite(&self, mut transaction: Transaction) -> Result<()> {
         let call_id = transaction.original.call_id_header()?.value();
+        let caller = transaction.original.from_header()?.uri()?.to_string();
+        let callee = transaction.original.to_header()?.uri()?.to_string();
+
         info!(
-            "[{}] Handling INVITE for {} (Call-ID: {})",
-            self.account.username, self.account.username, call_id
+            "[{}] Handling INVITE for {} (Call-ID: {}) from: {}",
+            self.account.username, caller, call_id, callee
         );
 
         let endpoint = self.endpoint.as_ref().context("Endpoint not initialized")?;
@@ -802,6 +841,7 @@ impl SipBot {
                             body_str,
                             srtp_enabled,
                             global_config.external_ip.clone(),
+                            Arc::new(CallStats::new()), // TODO: Use a proper stats object if needed for inbound
                         )
                         .await
                         {

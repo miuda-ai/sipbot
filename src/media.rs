@@ -1,4 +1,5 @@
 use crate::recorder::Recorder;
+use crate::stats::CallStats;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use rubato::{FftFixedIn, Resampler};
@@ -29,6 +30,7 @@ pub struct MediaSession {
     pc: Arc<PeerConnection>,
     audio_source: Arc<SampleStreamSource>,
     recorder: Arc<Mutex<Option<Recorder>>>,
+    stats: Arc<CallStats>,
 }
 
 impl MediaSession {
@@ -36,6 +38,7 @@ impl MediaSession {
         remote_sdp: &str,
         srtp_enabled: bool,
         external_ip: Option<String>,
+        stats: Arc<CallStats>,
     ) -> Result<(Self, String)> {
         let mut config = RtcConfiguration::default();
         if let Some(ip) = external_ip {
@@ -132,6 +135,7 @@ impl MediaSession {
                 pc,
                 audio_source,
                 recorder,
+                stats,
             },
             local_sdp,
         ))
@@ -141,6 +145,7 @@ impl MediaSession {
         srtp_enabled: bool,
         external_ip: Option<String>,
         send_audio: bool,
+        stats: Arc<CallStats>,
     ) -> Result<(Self, String)> {
         let mut config = RtcConfiguration::default();
         if let Some(ip) = external_ip {
@@ -211,6 +216,7 @@ impl MediaSession {
                 pc,
                 audio_source,
                 recorder,
+                stats,
             },
             local_sdp,
         ))
@@ -267,7 +273,12 @@ impl MediaSession {
                         username,
                         receiver.track().id()
                     );
-                    spawn_track_recorder(receiver.track(), recorder.clone(), child_token.clone());
+                    spawn_track_recorder(
+                        receiver.track(),
+                        recorder.clone(),
+                        child_token.clone(),
+                        self.stats.clone(),
+                    );
                 } else {
                     info!("[{}] Transceiver has NO receiver", username);
                 }
@@ -284,6 +295,7 @@ impl MediaSession {
                             receiver.track(),
                             recorder.clone(),
                             child_token.clone(),
+                            self.stats.clone(),
                         );
                     }
                 }
@@ -370,7 +382,12 @@ impl MediaSession {
                     i,
                     receiver.track().id()
                 );
-                spawn_track_recorder(receiver.track(), recorder.clone(), child_token.clone());
+                spawn_track_recorder(
+                    receiver.track(),
+                    recorder.clone(),
+                    child_token.clone(),
+                    self.stats.clone(),
+                );
             } else {
                 info!("[{}] Transceiver {} has NO receiver", username, i);
             }
@@ -384,6 +401,7 @@ impl MediaSession {
                             receiver.track(),
                             recorder.clone(),
                             child_token.clone(),
+                            self.stats.clone(),
                         );
                     }
                 }
@@ -444,6 +462,7 @@ impl MediaSession {
             }
 
             let encoded = encoder.encode(chunk);
+            self.stats.inc_tx(1, encoded.len() as u64);
 
             if !encoded.is_empty() {
                 let all_ff = encoded.iter().all(|&b| b == 0xFF);
@@ -502,23 +521,45 @@ impl MediaSession {
                 let audio_source = audio_source.clone();
                 let username_clone = username.clone();
                 let recorder = recorder.clone();
+                let stats = self.stats.clone();
                 tokio::spawn(async move {
                     let mut decoder = PcmuDecoder::new();
+                    let mut last_seq: Option<u16> = None;
                     loop {
                         match track.recv().await {
                             Ok(sample) => {
                                 // Record RX
                                 {
-                                    let rec = recorder.lock().await;
-                                    if let Some(r) = rec.as_ref() {
-                                        if let MediaSample::Audio(frame) = &sample {
+                                    if let MediaSample::Audio(frame) = &sample {
+                                        if let Some(seq) = frame.sequence_number {
+                                            if let Some(last) = last_seq {
+                                                let expected = last.wrapping_add(1);
+                                                if seq != expected {
+                                                    let lost = if seq > expected {
+                                                        (seq - expected) as u64
+                                                    } else {
+                                                        (u16::MAX - expected + seq + 1) as u64
+                                                    };
+                                                    if lost < 1000 {
+                                                        stats.inc_rx_lost(lost);
+                                                    }
+                                                }
+                                            }
+                                            last_seq = Some(seq);
+                                        }
+
+                                        stats.inc_rx(1, frame.data.len() as u64);
+                                        // Also record TX since we are echoing
+                                        stats.inc_tx(1, frame.data.len() as u64);
+
+                                        let rec = recorder.lock().await;
+                                        if let Some(r) = rec.as_ref() {
                                             let decoded = decoder.decode(&frame.data);
                                             r.record_rx(&decoded);
-                                            // Also record TX since we are echoing
                                             r.record_tx(&decoded);
-                                        } else {
-                                            error!("RX SAMPLE: NOT AUDIO");
                                         }
+                                    } else {
+                                        error!("RX SAMPLE: NOT AUDIO");
                                     }
                                 }
 
@@ -557,23 +598,46 @@ impl MediaSession {
                         let audio_source = audio_source.clone();
                         let username_clone = username.clone();
                         let recorder = recorder.clone();
+                        let stats = self.stats.clone();
                         tokio::spawn(async move {
                             let mut decoder = PcmuDecoder::new();
+                            let mut last_seq: Option<u16> = None;
                             loop {
                                 match track.recv().await {
                                     Ok(sample) => {
                                         // Record RX
                                         {
-                                            let rec = recorder.lock().await;
-                                            if let Some(r) = rec.as_ref() {
-                                                if let MediaSample::Audio(frame) = &sample {
+                                            if let MediaSample::Audio(frame) = &sample {
+                                                if let Some(seq) = frame.sequence_number {
+                                                    if let Some(last) = last_seq {
+                                                        let expected = last.wrapping_add(1);
+                                                        if seq != expected {
+                                                            let lost = if seq > expected {
+                                                                (seq - expected) as u64
+                                                            } else {
+                                                                (u16::MAX - expected + seq + 1)
+                                                                    as u64
+                                                            };
+                                                            if lost < 1000 {
+                                                                stats.inc_rx_lost(lost);
+                                                            }
+                                                        }
+                                                    }
+                                                    last_seq = Some(seq);
+                                                }
+
+                                                stats.inc_rx(1, frame.data.len() as u64);
+                                                // Also record TX since we are echoing
+                                                stats.inc_tx(1, frame.data.len() as u64);
+
+                                                let rec = recorder.lock().await;
+                                                if let Some(r) = rec.as_ref() {
                                                     let decoded = decoder.decode(&frame.data);
                                                     r.record_rx(&decoded);
-                                                    // Also record TX since we are echoing
                                                     r.record_tx(&decoded);
-                                                } else {
-                                                    error!("RX SAMPLE: NOT AUDIO");
                                                 }
+                                            } else {
+                                                error!("RX SAMPLE: NOT AUDIO");
                                             }
                                         }
 
@@ -665,9 +729,11 @@ fn spawn_track_recorder(
     track: Arc<dyn MediaStreamTrack>,
     recorder: Arc<Mutex<Option<Recorder>>>,
     token: CancellationToken,
+    stats: Arc<CallStats>,
 ) {
     tokio::spawn(async move {
         let mut decoder = PcmuDecoder::new();
+        let mut last_seq: Option<u16> = None;
         loop {
             tokio::select! {
                 _ = token.cancelled() => {
@@ -677,9 +743,28 @@ fn spawn_track_recorder(
                 res = track.recv() => {
                     match res {
                         Ok(sample) => {
-                            let rec = recorder.lock().await;
-                            if let Some(r) = rec.as_ref() {
-                                if let MediaSample::Audio(frame) = &sample {
+                            if let MediaSample::Audio(frame) = &sample {
+                                if let Some(seq) = frame.sequence_number {
+                                    if let Some(last) = last_seq {
+                                        let expected = last.wrapping_add(1);
+                                        if seq != expected {
+                                            let lost = if seq > expected {
+                                                (seq - expected) as u64
+                                            } else {
+                                                // Wrapped around
+                                                (u16::MAX - expected + seq + 1) as u64
+                                            };
+                                            if lost < 1000 { // Sanity check for large jumps
+                                                stats.inc_rx_lost(lost);
+                                            }
+                                        }
+                                    }
+                                    last_seq = Some(seq);
+                                }
+
+                                stats.inc_rx(1, frame.data.len() as u64);
+                                let rec = recorder.lock().await;
+                                if let Some(r) = rec.as_ref() {
                                     let decoded = decoder.decode(&frame.data);
                                     r.record_rx(&decoded);
                                 }
@@ -732,12 +817,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_media_session_offer() {
-        let (_session, sdp) = MediaSession::new_offer(false, None, true).await.unwrap();
+        let stats = Arc::new(CallStats::new());
+        let (_session, sdp) = MediaSession::new_offer(false, None, true, stats.clone())
+            .await
+            .unwrap();
         assert!(sdp.contains("m=audio"));
         assert!(sdp.contains("a=sendrecv")); // We set direction to SendRecv
 
         // Check if we can create an answer session
-        let (_answer_session, answer_sdp) = MediaSession::new(&sdp, false, None).await.unwrap();
+        let (_answer_session, answer_sdp) =
+            MediaSession::new(&sdp, false, None, stats).await.unwrap();
         assert!(answer_sdp.contains("m=audio"));
         assert!(answer_sdp.contains("a=sendrecv"));
     }

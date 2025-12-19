@@ -10,11 +10,30 @@ pub struct CallStats {
     pub finished_calls: AtomicU32,
     pub status_codes: Mutex<HashMap<u16, u32>>,
     pub total_duration: AtomicU64, // in milliseconds
+    pub tx_packets: AtomicU64,
+    pub rx_packets: AtomicU64,
+    pub tx_bytes: AtomicU64,
+    pub rx_bytes: AtomicU64,
+    pub rx_lost_packets: AtomicU64,
 }
 
 impl CallStats {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn inc_rx_lost(&self, count: u64) {
+        self.rx_lost_packets.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn inc_tx(&self, packets: u64, bytes: u64) {
+        self.tx_packets.fetch_add(packets, Ordering::Relaxed);
+        self.tx_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn inc_rx(&self, packets: u64, bytes: u64) {
+        self.rx_packets.fetch_add(packets, Ordering::Relaxed);
+        self.rx_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub fn inc_total(&self) {
