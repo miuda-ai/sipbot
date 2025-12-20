@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use rubato::{FftFixedIn, Resampler};
 use rustrtc::config::{
-    AudioCapability, BundlePolicy, MediaCapabilities, RtcConfiguration, TransportMode,
+    AudioCapability, MediaCapabilities, RtcConfiguration, RtcpMuxPolicy, TransportMode,
 };
 use rustrtc::media::MediaError;
 use rustrtc::media::MediaKind;
@@ -54,6 +54,7 @@ impl MediaSession {
         config.transport_mode = if srtp_enabled {
             TransportMode::Srtp
         } else {
+            config.certificates = vec![];
             TransportMode::Rtp
         };
         let mut audio_caps = AudioCapability::pcmu();
@@ -63,6 +64,7 @@ impl MediaSession {
         } else {
             audio_caps.rtcp_fbs.retain(|fb| fb != "nack");
         }
+        config.rtcp_mux_policy = RtcpMuxPolicy::Negotiate;
         config.ice_servers = vec![]; // No STUN/TURN servers
         config.media_capabilities = Some(MediaCapabilities {
             audio: vec![audio_caps],
@@ -175,6 +177,7 @@ impl MediaSession {
         config.transport_mode = if srtp_enabled {
             TransportMode::Srtp
         } else {
+            config.certificates = vec![];
             TransportMode::Rtp
         };
         let mut audio_caps = AudioCapability::pcmu();
@@ -184,7 +187,8 @@ impl MediaSession {
         } else {
             audio_caps.rtcp_fbs.retain(|fb| fb != "nack");
         }
-        config.bundle_policy = BundlePolicy::MaxBundle;
+        config.rtcp_mux_policy = RtcpMuxPolicy::Negotiate;
+        // config.bundle_policy = BundlePolicy::MaxBundle;
         config.ice_servers = vec![];
         config.media_capabilities = Some(MediaCapabilities {
             audio: vec![audio_caps],
