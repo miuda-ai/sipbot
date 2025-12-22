@@ -456,13 +456,13 @@ impl SipBot {
                     };
 
                     let status_map = monitor_stats.status_codes.lock().await;
-                    let mut status_str = String::new();
-                    // Sort keys for consistent output
-                    let mut keys: Vec<_> = status_map.keys().collect();
-                    keys.sort();
-                    for key in keys {
-                        status_str.push_str(&format!("{}:{}, ", key, status_map[key]));
-                    }
+                    let mut entries: Vec<_> = status_map.iter().collect();
+                    entries.sort_by_key(|(k, _)| *k);
+                    let status_str = entries
+                        .iter()
+                        .map(|(k, v)| format!("{}:{}", k, v))
+                        .collect::<Vec<_>>()
+                        .join(", ");
 
                     println!(
                         "Progress: {}/{} (Current: {}), Avg Duration: {:.2}s, Status: [{}], TX: {}p/{}b, RX: {}p/{}b, Loss: {:.2}%, NACK: {}s/{}r/{}rec",
