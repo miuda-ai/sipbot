@@ -122,13 +122,7 @@ impl CallRunner {
             ..Default::default()
         };
 
-        let (dialog, response) = tokio::select! {
-            res = dialog_layer.do_invite(opt, tx) => res?,
-            _ = tokio::signal::ctrl_c() => {
-                info!("[{}] Ctrl-C received during call setup.", self.account.username);
-                return Ok(());
-            }
-        };
+        let (dialog, response) = dialog_layer.do_invite(opt, tx).await?;
 
         if let Some(res) = response {
             self.stats
@@ -238,9 +232,6 @@ impl CallRunner {
                 _ = tokio::time::sleep(Duration::from_secs(secs)) => {
                     info!("[{}] {} seconds elapsed.", self.account.username, secs);
                 }
-                _ = tokio::signal::ctrl_c() => {
-                    info!("[{}] Ctrl-C received.", self.account.username);
-                }
                 _ = monitor_future => {
                     play_handle.abort();
                     return Ok(());
@@ -249,15 +240,12 @@ impl CallRunner {
             play_handle.abort();
         } else {
             info!(
-                "[{}] Call established. Waiting for playback or Ctrl-C to hang up...",
+                "[{}] Call established. Waiting for playback to hang up...",
                 self.account.username
             );
             tokio::select! {
                 _ = play_future => {
                     info!("[{}] Playback finished.", self.account.username);
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    info!("[{}] Ctrl-C received.", self.account.username);
                 }
                 _ = monitor_future => {
                     return Ok(());
@@ -273,7 +261,7 @@ impl CallRunner {
 }
 
 pub struct SipBot {
-    account: AccountConfig,
+    pub account: AccountConfig,
     global_config: Config,
     endpoint: Option<Arc<Endpoint>>,
     dialog_layer: Option<Arc<DialogLayer>>,

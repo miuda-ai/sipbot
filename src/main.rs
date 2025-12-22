@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use futures::future::join_all;
 use sipbot::config::{AccountConfig, Config};
 use sipbot::sip;
 use std::path::PathBuf;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time::ChronoLocal;
 
@@ -520,9 +521,13 @@ async fn main() -> Result<()> {
         handles.push(handle);
     }
 
-    // Wait for all bots
-    for handle in handles {
-        let _ = handle.await;
+    tokio::select! {
+        _ = join_all(handles) => {
+            info!("All bots finished.");
+        }
+        _ = tokio::signal::ctrl_c() => {
+            debug!("Cancelled");
+        }
     }
 
     Ok(())
