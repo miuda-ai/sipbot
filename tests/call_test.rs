@@ -33,6 +33,7 @@ async fn test_call_flow() -> Result<()> {
             answer: Some(AnswerConfig::Echo),
             hangup: None,
             reject_prob: None,
+            cancel_prob: 0,
         }],
     };
 
@@ -62,6 +63,7 @@ async fn test_call_flow() -> Result<()> {
                 after_secs: Some(5),
             }),
             reject_prob: None,
+            cancel_prob: 0,
         }],
     };
 
@@ -131,6 +133,7 @@ async fn test_options_flow() -> Result<()> {
             nack_enabled: None,
             jitter_buffer_enabled: None,
             reject_prob: None,
+            cancel_prob: 0,
             early_media: None,
             ring: None,
             answer: None,
@@ -157,6 +160,7 @@ async fn test_options_flow() -> Result<()> {
             nack_enabled: None,
             jitter_buffer_enabled: None,
             reject_prob: None,
+            cancel_prob: 0,
             early_media: None,
             ring: None,
             answer: None,

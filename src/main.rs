@@ -69,6 +69,9 @@ enum Commands {
         /// Max concurrent calls
         #[arg(long, default_value = "1")]
         concurrent: u32,
+        /// Cancel probability (0-99%)
+        #[arg(long, default_value = "0")]
+        cancel_prob: u8,
     },
     /// Wait for incoming calls
     Wait {
@@ -184,6 +187,7 @@ async fn main() -> Result<()> {
                         nack_enabled: None,
                         jitter_buffer_enabled: None,
                         reject_prob: None,
+                        cancel_prob: 0,
                         early_media: None,
                         ring: None,
                         answer: None,
@@ -271,6 +275,7 @@ async fn main() -> Result<()> {
                         nack_enabled: Some(*nack),
                         jitter_buffer_enabled: Some(*jitter),
                         reject_prob: *reject_prob,
+                        cancel_prob: 0,
                         early_media: None,
                         ring: ring_config,
                         answer: answer_config,
@@ -305,6 +310,7 @@ async fn main() -> Result<()> {
         concurrent_calls,
         register_override,
         proxy_override,
+        cancel_prob_override,
     ) = match &args.command {
         Commands::Call {
             target,
@@ -320,6 +326,7 @@ async fn main() -> Result<()> {
             jitter,
             total,
             concurrent,
+            cancel_prob,
         } => {
             let is_register = register.is_some() || password.is_some();
             let reg_target = if let Some(r) = register {
@@ -343,6 +350,7 @@ async fn main() -> Result<()> {
                 *concurrent,
                 is_register,
                 reg_target,
+                *cancel_prob,
             )
         }
         Commands::Wait {
@@ -375,6 +383,7 @@ async fn main() -> Result<()> {
                 1,
                 is_register,
                 reg_target,
+                0,
             )
         }
         Commands::Options { target } => (
@@ -393,6 +402,7 @@ async fn main() -> Result<()> {
             1,
             false,
             None,
+            0,
         ),
         Commands::Info { target } => (
             "info",
@@ -410,6 +420,7 @@ async fn main() -> Result<()> {
             1,
             false,
             None,
+            0,
         ),
     };
 
@@ -449,6 +460,10 @@ async fn main() -> Result<()> {
             account.answer = Some(sipbot::config::AnswerConfig::Play {
                 wav_file: play_file.clone(),
             });
+        }
+
+        if cancel_prob_override > 0 {
+            account.cancel_prob = cancel_prob_override;
         }
 
         if let Some(hangup) = hangup_override {

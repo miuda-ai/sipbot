@@ -35,6 +35,8 @@ pub struct AccountConfig {
     pub nack_enabled: Option<bool>,          // Enable NACK
     pub jitter_buffer_enabled: Option<bool>, // Enable Jitter Buffer
     pub reject_prob: Option<u8>,             // Reject probability (1-99%)
+    #[serde(default)]
+    pub cancel_prob: u8, // Cancel probability (1-99%)
 
     // Stage 1: Early Media (183)
     pub early_media: Option<EarlyMediaConfig>,
