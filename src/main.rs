@@ -153,7 +153,7 @@ async fn main() -> Result<()> {
     let config_path = if let Some(path) = args.conf {
         path
     } else {
-        let home = std::env::var("HOME").context("HOME environment variable not set")?;
+        let home = std::env::home_dir().expect("Can't get home directory");
         PathBuf::from(home).join(".sipbot.toml")
     };
 

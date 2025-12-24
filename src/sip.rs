@@ -146,14 +146,14 @@ impl CallRunner {
                 }
                 state = rx.recv(), if should_cancel => {
                     if let Some(state) = state {
-                        if cancel_before_ringring && let DialogState::Trying(dialog_id) = state {
+                        if cancel_before_ringring && let DialogState::Trying(mut dialog_id) = state {
                             tracing::info!("[{}] Canceling call before ringring", self.account.username);
+                            dialog_id.to_tag.clear();
                             let dialog = dialog_layer.get_dialog(&dialog_id).expect("dialog not found");
                             should_cancel = false;
                             let _ = dialog.hangup().await;
-                        }else if let DialogState::Early(mut dialog_id, _) = state {
+                        }else if !cancel_before_ringring && let DialogState::Early(dialog_id, _) = state{
                             tracing::info!("[{}] Canceling call after ringring", self.account.username);
-                            dialog_id.to_tag.clear();
                             let dialog = dialog_layer.get_dialog(&dialog_id).expect("dialog not found");
                             should_cancel = false;
                             let _ = dialog.hangup().await;
