@@ -574,24 +574,22 @@ impl SipBot {
             let mut handles = vec![];
 
             for i in 0..total {
-                let permit = semaphore.clone().acquire_owned().await?;
+                let permit = semaphore.clone().acquire_owned();
                 let runner = runner.clone();
                 let target = target.clone();
 
                 let handle = tokio::spawn(async move {
+                    let guard = permit.await?;
                     if let Err(e) = runner.make_call(target, i).await {
                         error!("Call {} failed: {:?}", i, e);
                     }
-                    drop(permit);
+                    drop(guard);
+                    Ok::<(), anyhow::Error>(())
                 });
                 handles.push(handle);
             }
 
-            let calls_future = async {
-                for handle in handles {
-                    let _ = handle.await;
-                }
-            };
+            let calls_future = futures::future::join_all(handles);
 
             tokio::select! {
                 _ = self.listen_loop() => {}
