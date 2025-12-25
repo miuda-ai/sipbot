@@ -143,8 +143,8 @@ impl MediaSession {
             .context("Failed to get local description")?
             .to_sdp_string();
 
-        if local_sdp.is_empty() {
-            anyhow::bail!("Failed to gather ICE candidates");
+        if local_sdp.is_empty() || !local_sdp.contains("m=audio") {
+            anyhow::bail!("Failed to generate valid audio answer SDP: {}", local_sdp);
         }
 
         Ok((
@@ -229,8 +229,8 @@ impl MediaSession {
             .context("Failed to get local description")?
             .to_sdp_string();
 
-        if local_sdp.is_empty() {
-            anyhow::bail!("Failed to gather ICE candidates");
+        if local_sdp.is_empty() || !local_sdp.contains("m=audio") {
+            anyhow::bail!("Failed to generate valid audio offer SDP: {}", local_sdp);
         }
 
         Ok((

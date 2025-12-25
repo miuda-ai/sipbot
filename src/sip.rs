@@ -64,12 +64,22 @@ impl CallRunner {
             start_time: std::time::Instant::now(),
         };
 
+        debug!(
+            "[{}] Account config: username={}, domain={}, target={:?}",
+            self.account.username, self.account.username, self.account.domain, self.account.target
+        );
+
         let dialog_layer = &self.dialog_layer;
         let from: rsip::Uri =
             format!("sip:{}@{}", self.account.username, self.account.domain).try_into()?;
         let to: rsip::Uri = target_uri.as_str().try_into()?;
         let contact =
             dialog_layer.build_local_contact(Some(self.account.username.clone()), None)?;
+
+        info!(
+            "[{}] Calling {} from {} (contact: {})",
+            self.account.username, to, from, contact
+        );
         // Create MediaSession and Offer
         let srtp_enabled = self.account.srtp_enabled.unwrap_or(false);
         let nack_enabled = self.account.nack_enabled.unwrap_or(false);
@@ -83,6 +93,11 @@ impl CallRunner {
             self.stats.clone(),
         )
         .await?;
+
+        if local_sdp.is_empty() {
+            anyhow::bail!("[{}] Generated empty Offer SDP", self.account.username);
+        }
+
         debug!(
             "[{}] Generated Offer SDP:\n{}",
             self.account.username, local_sdp
@@ -306,10 +321,12 @@ pub struct SipBot {
     dialog_layer: Option<Arc<DialogLayer>>,
     registration: Option<Registration>,
     stats: Arc<CallStats>,
+    pub verbose: bool,
+    pub is_wait: bool,
 }
 
 impl SipBot {
-    pub fn new(account: AccountConfig, global_config: Config) -> Self {
+    pub fn new(account: AccountConfig, global_config: Config, verbose: bool) -> Self {
         Self {
             account,
             global_config,
@@ -317,6 +334,8 @@ impl SipBot {
             dialog_layer: None,
             registration: None,
             stats: Arc::new(CallStats::new()),
+            verbose,
+            is_wait: false,
         }
     }
 
@@ -372,7 +391,11 @@ impl SipBot {
 
         let credential = if let Some(password) = &self.account.password {
             Some(Credential {
-                username: self.account.username.clone(),
+                username: self
+                    .account
+                    .auth_username
+                    .clone()
+                    .unwrap_or(self.account.username.clone()),
                 password: password.clone(),
                 realm: Some(self.account.domain.clone()),
             })
@@ -402,12 +425,34 @@ impl SipBot {
     }
 
     pub async fn run_wait(&mut self) -> Result<()> {
+        self.is_wait = true;
         self.init_endpoint().await?;
 
         // Register
         if self.account.register.unwrap_or(true) {
             self.start_registration_loop().await?;
         }
+
+        let monitor_stats = self.stats.clone();
+        let username = self.account.username.clone();
+        let verbose = self.verbose;
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(3));
+            loop {
+                interval.tick().await;
+                let current = monitor_stats
+                    .current_calls
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if current > 0 {
+                    if !verbose {
+                        println!("[{}] Active calls: {}", username, current);
+                    } else {
+                        info!("[{}] Active calls: {}", username, current);
+                    }
+                }
+            }
+        });
 
         // Listen for incoming calls
         self.listen_loop().await?;
@@ -680,6 +725,8 @@ impl SipBot {
         let username = self.account.username.clone();
         let domain = self.account.domain.clone();
         let proxy = self.account.proxy.clone();
+        let verbose = self.verbose;
+        let is_wait = self.is_wait;
 
         tokio::spawn(async move {
             info!("[{}] Starting registration loop", username);
@@ -694,16 +741,27 @@ impl SipBot {
             };
 
             loop {
-                info!("[{}] Registering...", username);
+                if is_wait && !verbose {
+                    println!("[{}] Registering...", username);
+                } else {
+                    info!("[{}] Registering...", username);
+                }
                 // Default expire 30s
                 match registration.register(server_uri.clone(), Some(30)).await {
                     Ok(response) => {
                         if *response.status_code() == StatusCode::OK {
                             let expires = registration.expires();
-                            info!(
-                                "[{}] Registered successfully, expires in {}s",
-                                username, expires
-                            );
+                            if is_wait && !verbose {
+                                println!(
+                                    "[{}] Registered successfully, expires in {}s",
+                                    username, expires
+                                );
+                            } else {
+                                info!(
+                                    "[{}] Registered successfully, expires in {}s",
+                                    username, expires
+                                );
+                            }
                             // Refresh before expiration (e.g., 5 seconds before)
                             let sleep_time = if expires > 5 { expires - 5 } else { expires };
                             tokio::time::sleep(Duration::from_secs(sleep_time as u64)).await;
@@ -846,6 +904,7 @@ impl SipBot {
                 if let Err(e) = server_dialog_handler.handle(&mut transaction).await {
                     error!("Transaction handler error: {:?}", e);
                 }
+                let _ = _guard;
             });
 
             // Monitor loop

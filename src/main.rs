@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use futures::future::join_all;
 use sipbot::config::{AccountConfig, Config};
@@ -33,9 +33,9 @@ enum Commands {
         /// Target URI (e.g., sip:user@domain)
         #[arg(short, long)]
         target: Option<String>,
-        /// Caller (username or full URI e.g. sip:user@domain)
-        #[arg(short, long)]
-        caller: Option<String>,
+        /// Username (e.g., sipbot)
+        #[arg(short, long, alias = "caller")]
+        username: Option<String>,
         /// Auth username (optional)
         #[arg(long)]
         auth_user: Option<String>,
@@ -81,6 +81,9 @@ enum Commands {
         /// Username (e.g., sipbot)
         #[arg(short, long, default_value = "sipbot")]
         username: String,
+        /// Auth username (optional)
+        #[arg(long)]
+        auth_user: Option<String>,
         /// Domain/Realm (e.g., 127.0.0.1)
         #[arg(short, long, alias = "realm")]
         domain: Option<String>,
@@ -198,6 +201,7 @@ async fn main() -> Result<()> {
             Commands::Wait {
                 addr,
                 username,
+                auth_user,
                 domain,
                 password,
                 register,
@@ -261,7 +265,7 @@ async fn main() -> Result<()> {
                     recorders: None,
                     accounts: vec![AccountConfig {
                         username: username.clone(),
-                        auth_username: None,
+                        auth_username: auth_user.clone(),
                         domain: domain
                             .clone()
                             .or(reg_target.clone())
@@ -314,7 +318,7 @@ async fn main() -> Result<()> {
     ) = match &args.command {
         Commands::Call {
             target,
-            caller,
+            username,
             auth_user,
             password,
             register,
@@ -337,7 +341,7 @@ async fn main() -> Result<()> {
             (
                 "call",
                 target.clone(),
-                caller.clone(),
+                username.clone(),
                 auth_user.clone(),
                 password.clone(),
                 *hangup,
@@ -359,6 +363,8 @@ async fn main() -> Result<()> {
             jitter,
             password,
             register,
+            username,
+            auth_user,
             ..
         } => {
             let is_register = register.is_some() || password.is_some();
@@ -370,8 +376,8 @@ async fn main() -> Result<()> {
             (
                 "wait",
                 None,
-                None,
-                None,
+                Some(username.clone()),
+                auth_user.clone(),
                 password.clone(),
                 None,
                 None,
@@ -499,6 +505,11 @@ async fn main() -> Result<()> {
             account.password = Some(password.clone());
         }
 
+        info!(
+            "[{}] Final account config: username={}, domain={}",
+            account.username, account.username, account.domain
+        );
+
         if register_override {
             account.register = Some(true);
         }
@@ -507,8 +518,9 @@ async fn main() -> Result<()> {
             account.proxy = Some(proxy.clone());
         }
 
+        let verbose = args.verbose;
         let handle = tokio::spawn(async move {
-            let mut bot = sip::SipBot::new(account, global_config);
+            let mut bot = sip::SipBot::new(account, global_config, verbose);
             match command_name {
                 "call" => {
                     if let Err(e) = bot.run_call(total_calls, concurrent_calls).await {

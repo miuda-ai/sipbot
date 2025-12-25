@@ -69,7 +69,7 @@ async fn test_call_flow() -> Result<()> {
 
     // 3. Start Server
     let server_handle = tokio::spawn(async move {
-        let mut bot = SipBot::new(server_config.accounts[0].clone(), server_config);
+        let mut bot = SipBot::new(server_config.accounts[0].clone(), server_config, false);
         if let Err(e) = bot.run_wait().await {
             eprintln!("Server error: {:?}", e);
         }
@@ -80,7 +80,7 @@ async fn test_call_flow() -> Result<()> {
 
     // 4. Start Client
     let client_handle = tokio::spawn(async move {
-        let mut bot = SipBot::new(client_config.accounts[0].clone(), client_config);
+        let mut bot = SipBot::new(client_config.accounts[0].clone(), client_config, false);
         if let Err(e) = bot.run_call(1, 1).await {
             eprintln!("Client error: {:?}", e);
             panic!("Client failed: {:?}", e);
@@ -170,7 +170,7 @@ async fn test_options_flow() -> Result<()> {
 
     // 3. Start Server
     let server_handle = tokio::spawn(async move {
-        let mut bot = SipBot::new(server_config.accounts[0].clone(), server_config);
+        let mut bot = SipBot::new(server_config.accounts[0].clone(), server_config, false);
         if let Err(e) = bot.run_wait().await {
             eprintln!("Server error: {:?}", e);
         }
@@ -181,7 +181,7 @@ async fn test_options_flow() -> Result<()> {
 
     // 4. Start Client
     let client_handle = tokio::spawn(async move {
-        let mut bot = SipBot::new(client_config.accounts[0].clone(), client_config);
+        let mut bot = SipBot::new(client_config.accounts[0].clone(), client_config, false);
         if let Err(e) = bot.run_options(None).await {
             eprintln!("Client error: {:?}", e);
             panic!("Client failed: {:?}", e);

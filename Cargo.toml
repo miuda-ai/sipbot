@@ -1,6 +1,6 @@
 [package]
 name = "sipbot"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 repository = "https://github.com/miuda-ai/sipbot"
@@ -16,7 +16,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.9.8"
 tracing = "0.1"
 anyhow = "1.0"
-rsipstack = "0.2.99"
+rsipstack = "0.3.3"
 rsip = "0.4.0"
 tokio-util = "0.7"
 rustrtc = "0.2.21"
