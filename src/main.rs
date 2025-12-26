@@ -79,8 +79,8 @@ enum Commands {
         #[arg(short, long, default_value = "0.0.0.0:5060")]
         addr: String,
         /// Username (e.g., sipbot)
-        #[arg(short, long, default_value = "sipbot")]
-        username: String,
+        #[arg(short, long)]
+        username: Option<String>,
         /// Auth username (optional)
         #[arg(long)]
         auth_user: Option<String>,
@@ -148,6 +148,8 @@ async fn main() -> Result<()> {
     let timer = ChronoLocal::new("%Y-%m-%d %H:%M:%S%.6f%:z".to_string());
     tracing_subscriber::fmt()
         .with_timer(timer)
+        .with_line_number(true)
+        .with_file(true)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level)),
         )
@@ -264,7 +266,7 @@ async fn main() -> Result<()> {
                     external_ip: None,
                     recorders: None,
                     accounts: vec![AccountConfig {
-                        username: username.clone(),
+                        username: username.clone().unwrap_or("sipbot".to_string()),
                         auth_username: auth_user.clone(),
                         domain: domain
                             .clone()
@@ -376,7 +378,7 @@ async fn main() -> Result<()> {
             (
                 "wait",
                 None,
-                Some(username.clone()),
+                username.clone(),
                 auth_user.clone(),
                 password.clone(),
                 None,
