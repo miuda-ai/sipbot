@@ -928,9 +928,13 @@ impl SipBot {
                             "[{}] Randomly rejecting call (prob: {}%)",
                             account.username, prob
                         );
-                        if let Err(e) = server_dialog_clone
-                            .reject(Some(StatusCode::TemporarilyUnavailable), None)
-                        {
+                        let status_code = account
+                            .hangup
+                            .as_ref()
+                            .filter(|h| h.code >= 300)
+                            .map(|h| StatusCode::from(h.code))
+                            .unwrap_or(StatusCode::TemporarilyUnavailable);
+                        if let Err(e) = server_dialog_clone.reject(Some(status_code), None) {
                             error!("Reject error: {:?}", e);
                         }
                         return;

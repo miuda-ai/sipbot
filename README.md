@@ -139,6 +139,77 @@ after_secs = 10                 # Send BYE after 10 seconds
         - `code`: SIP status code (used for rejection if no answer config exists).
         - `after_secs`: (Optional) Time in seconds to wait before sending BYE.
 
+## Benchmarking and Testing
+
+`SipBot` is designed to facilitate SIP performance testing and benchmarking by simulating multiple callers and callees with customizable behaviors.
+
+### Example Scenario
+
+To run a benchmark, you typically need two instances of `SipBot`: one for caller and another for callee. they will register on sip server with alice and bob respectively.
+
+#### Callee Configuration (`callee.toml`)
+This bot listens for incoming calls, rings for a few seconds, and randomly rejects 50% of the calls to test error handling.
+
+```toml
+# Local bind address for the callee
+addr = "0.0.0.0:3333" 
+
+[[accounts]]
+register = true
+proxy = "127.0.0.1:15060" # sip server address
+username = "alice"
+domain = "127.0.0.1"
+password = "123456"
+reject_prob = 20   # 20% probability to reject incoming calls
+
+[accounts.hangup]
+code = 486         # reject with code 486
+
+[accounts.ring]
+duration_secs = 3  # Wait for 3 seconds in ringing state before answering
+```
+
+#### Caller Configuration (`caller.toml`)
+This bot initiates calls to a target, with a 30% chance of canceling the call before it is answered.
+
+```toml
+# Local bind address for the caller
+addr = "0.0.0.0:4444" 
+
+[[accounts]]
+register = true
+proxy = "127.0.0.1:15060"
+username = "bob"
+domain = "127.0.0.1"
+password = "123456"
+target = "sip:alice@127.0.0.1" # The destination to call
+
+# Probability to randomly cancel calls
+cancel_prob = 30
+
+[accounts.hangup]
+after_secs = 5     # If the call is answered, hang up (send BYE) after 5 seconds
+code = 486         # currectly not used for caller
+```
+
+> Note: if cancel_prob is set, caller will randomly deside cancel before or after ringing 50:50.
+
+### How to Run
+
+0. **Start the Sip Server**
+
+1. **Start the Callee**:
+   The callee should be running first to receive calls.
+   ```bash
+   cargo run -- wait --conf callee.toml
+   ```
+
+2. **Start the Caller**:
+   The caller initiates the calls. You can use `--total` and `--concurrent` to control the load.
+   ```bash
+   # Make 100 total calls, with a maximum of 10 calls running concurrently
+   sipbot --conf caller.toml call --total 100 --concurrent 3
+   ```
 ## License
 
 MIT
