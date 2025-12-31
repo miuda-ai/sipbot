@@ -263,6 +263,7 @@ impl MediaSession {
         tokio::spawn(async move {
             let mut decoder = PcmuDecoder::new();
             let mut last_seq: Option<u16> = None;
+            let mut last_timestamp: Option<u32> = None;
             let mut sync_interval = tokio::time::interval(Duration::from_secs(1));
 
             if jitter_buffer_enabled {
@@ -290,7 +291,7 @@ impl MediaSession {
                         }
                         _ = tokio::time::sleep(wait) => {
                             while let Some(sample) = jb.pop() {
-                                Self::process_sample(&username, sample, &audio_source, &recorder, &stats, &mut decoder, &mut last_seq).await;
+                                Self::process_sample(&username, sample, &audio_source, &recorder, &stats, &mut decoder, &mut last_seq, &mut last_timestamp).await;
                             }
                         }
                     }
@@ -312,6 +313,7 @@ impl MediaSession {
                                         &stats,
                                         &mut decoder,
                                         &mut last_seq,
+                                        &mut last_timestamp,
                                     )
                                     .await;
                                 }
@@ -331,13 +333,56 @@ impl MediaSession {
 
     async fn process_sample(
         username: &str,
-        sample: MediaSample,
+        mut sample: MediaSample,
         audio_source: &Arc<SampleStreamSource>,
         recorder: &Arc<Mutex<Option<Recorder>>>,
         stats: &Arc<CallStats>,
         decoder: &mut PcmuDecoder,
         last_seq: &mut Option<u16>,
+        last_timestamp: &mut Option<u32>,
     ) {
+        // Validate timestamp continuity and rewrite if needed to fix interleaved streams
+        if let MediaSample::Audio(ref mut frame) = sample {
+            if let Some(last_ts) = *last_timestamp {
+                // Calculate expected timestamp based on last timestamp + samples
+                let expected_ts = last_ts.wrapping_add(frame.samples);
+                let ts_diff = frame.rtp_timestamp.wrapping_sub(expected_ts);
+
+                // Allow up to 10 seconds of jump to handle legitimate gaps
+                let max_reasonable_jump: u32 = frame.sample_rate * 10;
+
+                // Rewrite packets with large forward jumps
+                if ts_diff > max_reasonable_jump && ts_diff < (u32::MAX / 2) {
+                    tracing::debug!(
+                        "[{}] Rewriting timestamp (forward jump): seq={:?} original_ts={} -> expected_ts={} diff={} (>{:.1}s)",
+                        username,
+                        frame.sequence_number,
+                        frame.rtp_timestamp,
+                        expected_ts,
+                        ts_diff,
+                        ts_diff as f32 / frame.sample_rate as f32
+                    );
+                    frame.rtp_timestamp = expected_ts;
+                }
+                // Rewrite packets with large backward jumps
+                else if ts_diff > (u32::MAX / 2) {
+                    let backward_diff = last_ts.wrapping_sub(frame.rtp_timestamp);
+                    if backward_diff > max_reasonable_jump {
+                        tracing::debug!(
+                            "[{}] Rewriting timestamp (backward jump): seq={:?} original_ts={} -> expected_ts={} diff=-{} (>{:.1}s)",
+                            username,
+                            frame.sequence_number,
+                            frame.rtp_timestamp,
+                            expected_ts,
+                            backward_diff,
+                            backward_diff as f32 / frame.sample_rate as f32
+                        );
+                        frame.rtp_timestamp = expected_ts;
+                    }
+                }
+            }
+        }
+
         // Record RX
         {
             if let MediaSample::Audio(frame) = &sample {
@@ -362,6 +407,9 @@ impl MediaSession {
                         *last_seq = Some(seq);
                     }
                 }
+
+                // Update last timestamp
+                *last_timestamp = Some(frame.rtp_timestamp);
 
                 stats.inc_rx(1, frame.data.len() as u64);
                 // Also record TX since we are echoing
@@ -761,6 +809,7 @@ fn spawn_track_recorder(
     tokio::spawn(async move {
         let mut decoder = PcmuDecoder::new();
         let mut last_seq: Option<u16> = None;
+        let mut last_timestamp: Option<u32> = None;
 
         if jitter_buffer_enabled {
             use rustrtc::media::JitterBuffer;
@@ -785,7 +834,7 @@ fn spawn_track_recorder(
                     }
                     _ = tokio::time::sleep(wait) => {
                         while let Some(sample) = jb.pop() {
-                            process_recorded_sample(sample, &recorder, &stats, &mut decoder, &mut last_seq).await;
+                            process_recorded_sample(sample, &recorder, &stats, &mut decoder, &mut last_seq, &mut last_timestamp).await;
                         }
                     }
                 }
@@ -800,7 +849,7 @@ fn spawn_track_recorder(
                     res = track.recv() => {
                         match res {
                             Ok(sample) => {
-                                process_recorded_sample(sample, &recorder, &stats, &mut decoder, &mut last_seq).await;
+                                process_recorded_sample(sample, &recorder, &stats, &mut decoder, &mut last_seq, &mut last_timestamp).await;
                             }
                             Err(_) => {
                                 break;
@@ -814,12 +863,53 @@ fn spawn_track_recorder(
 }
 
 async fn process_recorded_sample(
-    sample: MediaSample,
+    mut sample: MediaSample,
     recorder: &Arc<Mutex<Option<Recorder>>>,
     stats: &Arc<CallStats>,
     decoder: &mut PcmuDecoder,
     last_seq: &mut Option<u16>,
+    last_timestamp: &mut Option<u32>,
 ) {
+    // Validate timestamp continuity and rewrite if needed to fix interleaved streams
+    if let MediaSample::Audio(ref mut frame) = sample {
+        if let Some(last_ts) = *last_timestamp {
+            // Calculate expected timestamp based on last timestamp + samples
+            let expected_ts = last_ts.wrapping_add(frame.samples);
+            let ts_diff = frame.rtp_timestamp.wrapping_sub(expected_ts);
+
+            // Allow up to 10 seconds of jump to handle legitimate gaps
+            let max_reasonable_jump: u32 = frame.sample_rate * 10;
+
+            // Rewrite packets with large forward jumps
+            if ts_diff > max_reasonable_jump && ts_diff < (u32::MAX / 2) {
+                tracing::debug!(
+                    "Recording: Rewriting timestamp (forward jump): seq={:?} original_ts={} -> expected_ts={} diff={} (>{:.1}s)",
+                    frame.sequence_number,
+                    frame.rtp_timestamp,
+                    expected_ts,
+                    ts_diff,
+                    ts_diff as f32 / frame.sample_rate as f32
+                );
+                frame.rtp_timestamp = expected_ts;
+            }
+            // Rewrite packets with large backward jumps
+            else if ts_diff > (u32::MAX / 2) {
+                let backward_diff = last_ts.wrapping_sub(frame.rtp_timestamp);
+                if backward_diff > max_reasonable_jump {
+                    tracing::debug!(
+                        "Recording: Rewriting timestamp (backward jump): seq={:?} original_ts={} -> expected_ts={} diff=-{} (>{:.1}s)",
+                        frame.sequence_number,
+                        frame.rtp_timestamp,
+                        expected_ts,
+                        backward_diff,
+                        backward_diff as f32 / frame.sample_rate as f32
+                    );
+                    frame.rtp_timestamp = expected_ts;
+                }
+            }
+        }
+    }
+
     if let MediaSample::Audio(frame) = &sample {
         if let Some(seq) = frame.sequence_number {
             if let Some(last) = *last_seq {
@@ -840,6 +930,9 @@ async fn process_recorded_sample(
                 *last_seq = Some(seq);
             }
         }
+
+        // Update last timestamp
+        *last_timestamp = Some(frame.rtp_timestamp);
 
         stats.inc_rx(1, frame.data.len() as u64);
         let rec = recorder.lock().await;
