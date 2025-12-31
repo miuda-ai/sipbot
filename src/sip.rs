@@ -33,7 +33,6 @@ use tracing::{debug, error, info, warn};
 
 const ANSWER_WAV: &[u8] = include_bytes!("../wavs/answer.wav");
 const PLAY_WAV: &[u8] = include_bytes!("../wavs/play.wav");
-// use voice_engine::net_tool::extract_rtp_addresses_from_sdp;
 
 #[derive(Clone)]
 struct CallRunner {

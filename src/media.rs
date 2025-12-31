@@ -1,14 +1,15 @@
 use crate::recorder::Recorder;
 use crate::stats::CallStats;
 use anyhow::{Context, Result};
+use audio_codec::pcmu::{PcmuDecoder, PcmuEncoder};
+use audio_codec::{Decoder, Encoder, resample};
 use bytes::Bytes;
-use rubato::{FftFixedIn, Resampler};
 use rustrtc::config::{
     AudioCapability, MediaCapabilities, RtcConfiguration, RtcpMuxPolicy, TransportMode,
 };
 use rustrtc::media::MediaError;
 use rustrtc::media::MediaKind;
-use rustrtc::media::frame::{AudioFrame, AudioSampleFormat, MediaSample};
+use rustrtc::media::frame::{AudioFrame, MediaSample};
 use rustrtc::media::track::{MediaStreamTrack, SampleStreamSource, sample_track};
 use rustrtc::peer_connection::{
     PeerConnection, PeerConnectionEvent, RtpCodecParameters, RtpSenderBuilder, TransceiverDirection,
@@ -23,8 +24,6 @@ use tokio::sync::Mutex;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
-use voice_engine::media::codecs::pcmu::{PcmuDecoder, PcmuEncoder};
-use voice_engine::media::codecs::{Decoder, Encoder};
 
 #[derive(Clone)]
 pub struct MediaSession {
@@ -619,7 +618,6 @@ impl MediaSession {
                 channels: 1,
                 samples: chunk.len() as u32,
                 rtp_timestamp,
-                format: AudioSampleFormat::Unspecified,
                 payload_type: Some(0),
                 sequence_number: None,
             };
@@ -744,32 +742,12 @@ fn resample_audio(samples: Vec<i16>, source_rate: u32, channels: u16) -> Result<
             mono_samples.push(sum / channels as f32);
         }
     }
-
+    let samples = mono_samples.into_iter().map(|s| s as i16).collect();
     if source_rate == 8000 {
-        return Ok(mono_samples.into_iter().map(|s| s as i16).collect());
+        return Ok(samples);
     }
-
-    // Resample
-    let chunk_size_in = 1024;
-    let mut resampler = FftFixedIn::<f32>::new(source_rate as usize, 8000, chunk_size_in, 1, 1)?;
-
-    let num_chunks = (mono_samples.len() + chunk_size_in - 1) / chunk_size_in;
-    // Pad with zeros
-    mono_samples.resize(num_chunks * chunk_size_in, 0.0);
-
-    let mut result = Vec::new();
-    let mut input_buffer = vec![vec![0.0; chunk_size_in]];
-
-    for i in 0..num_chunks {
-        let start = i * chunk_size_in;
-        let end = start + chunk_size_in;
-        input_buffer[0].copy_from_slice(&mono_samples[start..end]);
-
-        let out = resampler.process(&input_buffer, None)?;
-        result.extend_from_slice(&out[0]);
-    }
-
-    Ok(result.into_iter().map(|s| s as i16).collect())
+    let buf = resample(&samples, source_rate, 8000);
+    Ok(buf)
 }
 
 fn spawn_track_recorder(
