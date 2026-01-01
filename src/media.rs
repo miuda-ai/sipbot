@@ -1,9 +1,10 @@
 use crate::recorder::Recorder;
 use crate::stats::CallStats;
 use anyhow::{Context, Result};
-use audio_codec::pcmu::{PcmuDecoder, PcmuEncoder};
-use audio_codec::{Decoder, Encoder, resample};
+use audio_codec::{CodecType, Decoder, Resampler, resample};
 use bytes::Bytes;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use ringbuf::{HeapRb, traits::*};
 use rustrtc::config::{
     AudioCapability, MediaCapabilities, RtcConfiguration, RtcpMuxPolicy, TransportMode,
 };
@@ -23,7 +24,90 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{error, info};
+
+fn codec_from_name(name: &str) -> Option<CodecType> {
+    match name.to_lowercase().as_str() {
+        "pcmu" => Some(CodecType::PCMU),
+        "pcma" => Some(CodecType::PCMA),
+        "g722" => Some(CodecType::G722),
+        "g729" => Some(CodecType::G729),
+        #[cfg(feature = "opus")]
+        "opus" => Some(CodecType::Opus),
+        _ => None,
+    }
+}
+
+fn get_codec_type(pt: Option<u8>, caps: &Option<MediaCapabilities>) -> CodecType {
+    pt.and_then(|p| {
+        caps.as_ref()
+            .and_then(|c| c.audio.iter().find(|a| a.payload_type == p))
+            .and_then(|a| codec_from_name(&a.codec_name))
+    })
+    .unwrap_or_else(|| match pt {
+        Some(0) => CodecType::PCMU,
+        Some(8) => CodecType::PCMA,
+        Some(9) => CodecType::G722,
+        Some(18) => CodecType::G729,
+        Some(111) => CodecType::Opus,
+        _ => CodecType::PCMU,
+    })
+}
+
+fn get_audio_caps(codecs: &Option<Vec<String>>, nack_enabled: bool) -> Vec<AudioCapability> {
+    let mut caps = Vec::new();
+    let codec_list = if let Some(list) = codecs {
+        list.clone()
+    } else {
+        vec![
+            "pcmu".to_string(),
+            "pcma".to_string(),
+            "g722".to_string(),
+            "g729".to_string(),
+            #[cfg(feature = "opus")]
+            "opus".to_string(),
+        ]
+    };
+
+    for codec in codec_list {
+        let mut cap = match codec.to_lowercase().as_str() {
+            "pcmu" => AudioCapability::pcmu(),
+            "pcma" => AudioCapability::pcma(),
+            #[cfg(feature = "opus")]
+            "opus" => AudioCapability::opus(),
+            _ => {
+                if let Some(ct) = codec_from_name(&codec) {
+                    AudioCapability {
+                        payload_type: match ct {
+                            CodecType::PCMU => 0,
+                            CodecType::PCMA => 8,
+                            CodecType::G722 => 9,
+                            CodecType::G729 => 18,
+                            CodecType::Opus => 111,
+                            _ => 0,
+                        },
+                        codec_name: format!("{:?}", ct).to_uppercase(),
+                        clock_rate: ct.samplerate(),
+                        channels: ct.channels() as u8,
+                        rtcp_fbs: vec!["nack".to_string()],
+                        ..Default::default()
+                    }
+                } else {
+                    continue;
+                }
+            }
+        };
+        if !nack_enabled {
+            cap.rtcp_fbs.retain(|fb| fb != "nack");
+        }
+        caps.push(cap);
+    }
+
+    if caps.is_empty() {
+        caps.push(AudioCapability::pcmu());
+    }
+    caps
+}
 
 #[derive(Clone)]
 pub struct MediaSession {
@@ -35,6 +119,9 @@ pub struct MediaSession {
     last_nack_sent: Arc<std::sync::atomic::AtomicU64>,
     last_nack_recv: Arc<std::sync::atomic::AtomicU64>,
     last_nack_recovered: Arc<std::sync::atomic::AtomicU64>,
+    local_playback_tx: Arc<Mutex<Option<ringbuf::HeapProd<i16>>>>,
+    output_sample_rate: Arc<std::sync::atomic::AtomicU32>,
+    output_resampler: Arc<Mutex<Option<audio_codec::Resampler>>>,
 }
 
 impl MediaSession {
@@ -44,6 +131,7 @@ impl MediaSession {
         nack_enabled: bool,
         jitter_buffer_enabled: bool,
         external_ip: Option<String>,
+        codecs: Option<Vec<String>>,
         stats: Arc<CallStats>,
     ) -> Result<(Self, String)> {
         let mut config = RtcConfiguration::default();
@@ -56,17 +144,35 @@ impl MediaSession {
             config.certificates = vec![];
             TransportMode::Rtp
         };
-        let mut audio_caps = AudioCapability::pcmu();
-        if nack_enabled {
-            info!("NACK enabled for media session (incoming)");
-            config.nack_buffer_size = 200;
-        } else {
-            audio_caps.rtcp_fbs.retain(|fb| fb != "nack");
+        let mut audio_caps = get_audio_caps(&codecs, nack_enabled);
+        let remote_sdp_upper = remote_sdp.to_uppercase();
+        audio_caps.retain(|cap| {
+            let pt = cap.payload_type;
+            let name = cap.codec_name.to_uppercase();
+            let pt_str = pt.to_string();
+
+            // Check if PT is in m=audio line
+            let pt_in_mline = if let Some(mline) = remote_sdp_upper.lines().find(|l| l.starts_with("M=AUDIO")) {
+                mline.split_whitespace().skip(3).any(|s| s == pt_str)
+            } else {
+                false
+            };
+
+            // Check if name is in rtpmap
+            let name_in_rtpmap = remote_sdp_upper.contains(&format!(" {}/", name));
+
+            pt_in_mline || name_in_rtpmap
+        });
+
+        if audio_caps.is_empty() {
+            info!("No matching codecs found in offer, falling back to PCMU");
+            audio_caps = vec![AudioCapability::pcmu()];
         }
+
         config.rtcp_mux_policy = RtcpMuxPolicy::Negotiate;
         config.ice_servers = vec![]; // No STUN/TURN servers
         config.media_capabilities = Some(MediaCapabilities {
-            audio: vec![audio_caps],
+            audio: audio_caps,
             video: vec![],
             application: None,
         });
@@ -84,46 +190,86 @@ impl MediaSession {
         // Attach track to the active transceiver
         let transceivers = pc.get_transceivers();
         if let Some(t) = transceivers.first() {
-            // Try to use sender() as Option
-            if let Some(_sender) = t.sender() {
-                let params = RtpCodecParameters {
+            let params = t
+                .sender()
+                .as_ref()
+                .map(|s| s.params())
+                .unwrap_or(RtpCodecParameters {
                     payload_type: 0,
                     clock_rate: 8000,
                     channels: 1,
-                };
-                let mut builder = RtpSenderBuilder::new(track.clone(), ssrc_id)
-                    .stream_id("audio".to_string())
-                    .params(params);
-                if nack_enabled {
-                    builder = builder
-                        .nack(pc.config().nack_buffer_size)
-                        .bitrate_controller();
-                }
-                let sender = builder.build();
-                t.set_sender(Some(sender));
-            } else {
-                debug!("Transceiver has no sender, setting one");
-                let params = RtpCodecParameters {
-                    payload_type: 0,
-                    clock_rate: 8000,
-                    channels: 1,
-                };
-                let mut builder = RtpSenderBuilder::new(track.clone(), ssrc_id)
-                    .stream_id("audio".to_string())
-                    .params(params);
-                if nack_enabled {
-                    builder = builder
-                        .nack(pc.config().nack_buffer_size)
-                        .bitrate_controller();
-                }
-                let sender = builder.build();
-                t.set_sender(Some(sender));
+                });
+
+            let mut builder = RtpSenderBuilder::new(track.clone(), ssrc_id)
+                .stream_id("audio".to_string())
+                .params(params);
+            if nack_enabled {
+                builder = builder
+                    .nack(pc.config().nack_buffer_size)
+                    .bitrate_controller();
             }
+            let sender = builder.build();
+            t.set_sender(Some(sender));
             t.set_direction(TransceiverDirection::SendRecv);
         } else {
+            // This shouldn't happen if we set remote description with audio
             let params = RtpCodecParameters {
                 payload_type: 0,
                 clock_rate: 8000,
+                channels: 1,
+            };
+            pc.add_track(track.clone(), params)?;
+        }
+
+        // Decide sender params based on offer's first audio payload if available,
+        // so our sender uses a payload type/clock that the offerer expects.
+        let mut chosen_params = RtpCodecParameters {
+            payload_type: 0,
+            clock_rate: 8000,
+            channels: 1,
+        };
+        if let Some(mline) = remote_sdp.lines().find(|l| l.starts_with("m=audio")) {
+            // m=audio <port> <proto> <pt> <pt>...
+            for pt_str in mline.split_whitespace().skip(3) {
+                if let Ok(pt) = pt_str.parse::<u8>() {
+                    // look for rtpmap for this payload type
+                    if let Some(rtpmap) = remote_sdp
+                        .lines()
+                        .find(|l| l.starts_with(&format!("a=rtpmap:{} ", pt)))
+                    {
+                        if let Some(spec) = rtpmap.split_whitespace().nth(1) {
+                            let codec = spec.split('/').next().unwrap_or("");
+                            let cr = codec_from_name(codec).map(|ct| ct.clock_rate()).unwrap_or(8000);
+                            chosen_params = RtpCodecParameters {
+                                payload_type: pt,
+                                clock_rate: cr,
+                                channels: 1,
+                            };
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Attach sender so that the PeerConnection has a listener mapping for incoming packets
+        let transceivers = pc.get_transceivers();
+        if let Some(t) = transceivers.first() {
+            let mut builder = RtpSenderBuilder::new(track.clone(), ssrc_id)
+                .stream_id("audio".to_string())
+                .params(chosen_params);
+            if nack_enabled {
+                builder = builder
+                    .nack(pc.config().nack_buffer_size)
+                    .bitrate_controller();
+            }
+            let sender = builder.build();
+            t.set_sender(Some(sender));
+            t.set_direction(TransceiverDirection::SendRecv);
+        } else {
+            let params = RtpCodecParameters {
+                payload_type: chosen_params.payload_type,
+                clock_rate: chosen_params.clock_rate,
                 channels: 1,
             };
             pc.add_track(track.clone(), params)?;
@@ -146,19 +292,46 @@ impl MediaSession {
             anyhow::bail!("Failed to generate valid audio answer SDP: {}", local_sdp);
         }
 
-        Ok((
-            Self {
-                pc,
-                audio_source,
-                recorder,
-                stats,
-                jitter_buffer_enabled,
-                last_nack_sent: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                last_nack_recv: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                last_nack_recovered: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            },
-            local_sdp,
-        ))
+        let session = Self {
+            pc: pc.clone(),
+            audio_source: audio_source.clone(),
+            recorder: recorder.clone(),
+            stats: stats.clone(),
+            jitter_buffer_enabled,
+            last_nack_sent: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_nack_recv: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_nack_recovered: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            local_playback_tx: Arc::new(Mutex::new(None)),
+            output_sample_rate: Arc::new(std::sync::atomic::AtomicU32::new(8000)),
+            output_resampler: Arc::new(Mutex::new(None)),
+        };
+
+        // Spawn a background task to listen for incoming track events so there is
+        // always a listener for incoming RTP packets (prevents "No listener found")
+        let bg_session = session.clone();
+        tokio::spawn(async move {
+            let pc = bg_session.pc.clone();
+            while let Some(event) = pc.recv().await {
+                if let PeerConnectionEvent::Track(transceiver) = event {
+                    if let Some(receiver) = transceiver.receiver().as_ref() {
+                        spawn_track_recorder(
+                            bg_session.clone(),
+                            receiver.track(),
+                            CancellationToken::new(),
+                        );
+                    }
+                }
+            }
+        });
+
+        // Also attach recorders for any already-present receivers
+        for transceiver in pc.get_transceivers() {
+            if let Some(receiver) = transceiver.receiver().as_ref() {
+                spawn_track_recorder(session.clone(), receiver.track(), CancellationToken::new());
+            }
+        }
+
+        Ok((session, local_sdp))
     }
 
     pub async fn new_offer(
@@ -166,6 +339,7 @@ impl MediaSession {
         nack_enabled: bool,
         jitter_buffer_enabled: bool,
         external_ip: Option<String>,
+        codecs: Option<Vec<String>>,
         send_audio: bool,
         stats: Arc<CallStats>,
     ) -> Result<(Self, String)> {
@@ -179,18 +353,12 @@ impl MediaSession {
             config.certificates = vec![];
             TransportMode::Rtp
         };
-        let mut audio_caps = AudioCapability::pcmu();
-        if nack_enabled {
-            info!("NACK enabled for media session (outgoing)");
-            config.nack_buffer_size = 200;
-        } else {
-            audio_caps.rtcp_fbs.retain(|fb| fb != "nack");
-        }
+        let audio_caps = get_audio_caps(&codecs, nack_enabled);
         config.rtcp_mux_policy = RtcpMuxPolicy::Negotiate;
         // config.bundle_policy = BundlePolicy::MaxBundle;
         config.ice_servers = vec![];
         config.media_capabilities = Some(MediaCapabilities {
-            audio: vec![audio_caps],
+            audio: audio_caps,
             video: vec![],
             application: None,
         });
@@ -200,11 +368,21 @@ impl MediaSession {
         let audio_source = Arc::new(source);
 
         if send_audio {
-            let params = RtpCodecParameters {
-                payload_type: 0,
-                clock_rate: 8000,
-                channels: 1,
-            };
+            let params = pc
+                .config()
+                .media_capabilities
+                .as_ref()
+                .and_then(|c| c.audio.first())
+                .map(|a| RtpCodecParameters {
+                    payload_type: a.payload_type,
+                    clock_rate: a.clock_rate,
+                    channels: a.channels,
+                })
+                .unwrap_or(RtpCodecParameters {
+                    payload_type: 0,
+                    clock_rate: 8000,
+                    channels: 1,
+                });
             pc.add_track(track.clone(), params)?;
             for t in pc.get_transceivers() {
                 t.set_direction(TransceiverDirection::SendRecv);
@@ -242,6 +420,9 @@ impl MediaSession {
                 last_nack_sent: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 last_nack_recv: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 last_nack_recovered: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                local_playback_tx: Arc::new(Mutex::new(None)),
+                output_sample_rate: Arc::new(std::sync::atomic::AtomicU32::new(8000)),
+                output_resampler: Arc::new(Mutex::new(None)),
             },
             local_sdp,
         ))
@@ -261,7 +442,10 @@ impl MediaSession {
         let session = self.clone();
 
         tokio::spawn(async move {
-            let mut decoder = PcmuDecoder::new();
+            let mut decoder: Option<Box<dyn Decoder + Send>> = None;
+            let mut current_pt: Option<u8> = None;
+            let mut recorder_resampler: Option<Resampler> = None;
+
             let mut last_seq: Option<u16> = None;
             let mut last_timestamp: Option<u32> = None;
             let mut sync_interval = tokio::time::interval(Duration::from_secs(1));
@@ -290,8 +474,49 @@ impl MediaSession {
                             }
                         }
                         _ = tokio::time::sleep(wait) => {
-                            while let Some(sample) = jb.pop() {
-                                Self::process_sample(&username, sample, &audio_source, &recorder, &stats, &mut decoder, &mut last_seq, &mut last_timestamp).await;
+                            while let Some(mut sample) = jb.pop() {
+                                if let MediaSample::Audio(ref frame) = sample {
+                                    if current_pt != frame.payload_type {
+                                        current_pt = frame.payload_type;
+                                        if let Some(pt) = current_pt {
+                                            let ct = get_codec_type(Some(pt), &session.pc.config().media_capabilities);
+                                            let d = audio_codec::create_decoder(ct);
+                                            decoder = Some(d);
+                                            let rate = ct.samplerate();
+                                            if rate != 16000 {
+                                                recorder_resampler = Some(Resampler::new(rate as usize, 16000));
+                                            } else {
+                                                recorder_resampler = None;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if let Some(ref mut dec) = decoder {
+                                    let ct = if let MediaSample::Audio(ref mut frame) = sample {
+                                        let ct = get_codec_type(frame.payload_type, &session.pc.config().media_capabilities);
+                                        frame.sample_rate = ct.samplerate();
+                                        ct
+                                    } else {
+                                        CodecType::PCMU
+                                    };
+                                    
+                                    let rtp_clock_rate = ct.clock_rate();
+
+                                    Self::process_sample(
+                                        &username,
+                                        sample,
+                                        &audio_source,
+                                        &recorder,
+                                        &stats,
+                                        dec,
+                                        &mut recorder_resampler,
+                                        &mut last_seq,
+                                        &mut last_timestamp,
+                                        rtp_clock_rate,
+                                    )
+                                    .await;
+                                }
                             }
                         }
                     }
@@ -304,18 +529,49 @@ impl MediaSession {
                         }
                         res = track.recv() => {
                             match res {
-                                Ok(sample) => {
-                                    Self::process_sample(
-                                        &username,
-                                        sample,
-                                        &audio_source,
-                                        &recorder,
-                                        &stats,
-                                        &mut decoder,
-                                        &mut last_seq,
-                                        &mut last_timestamp,
-                                    )
-                                    .await;
+                                Ok(mut sample) => {
+                                    if let MediaSample::Audio(ref frame) = sample {
+                                        if current_pt != frame.payload_type {
+                                            current_pt = frame.payload_type;
+                                            if let Some(pt) = current_pt {
+                                                let ct = get_codec_type(Some(pt), &session.pc.config().media_capabilities);
+                                                let d = audio_codec::create_decoder(ct);
+                                                decoder = Some(d);
+                                                let rate = ct.samplerate();
+                                                if rate != 16000 {
+                                                    recorder_resampler = Some(Resampler::new(rate as usize, 16000));
+                                                } else {
+                                                    recorder_resampler = None;
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if let Some(ref mut dec) = decoder {
+                                        let ct = if let MediaSample::Audio(ref mut frame) = sample {
+                                            let ct = get_codec_type(frame.payload_type, &session.pc.config().media_capabilities);
+                                            frame.sample_rate = ct.samplerate();
+                                            ct
+                                        } else {
+                                            CodecType::PCMU
+                                        };
+                                        
+                                        let rtp_clock_rate = ct.clock_rate();
+
+                                        Self::process_sample(
+                                            &username,
+                                            sample,
+                                            &audio_source,
+                                            &recorder,
+                                            &stats,
+                                            dec,
+                                            &mut recorder_resampler,
+                                            &mut last_seq,
+                                            &mut last_timestamp,
+                                            rtp_clock_rate,
+                                        )
+                                        .await;
+                                    }
                                 }
                                 Err(e) => {
                                     if !matches!(e, MediaError::EndOfStream) {
@@ -334,22 +590,25 @@ impl MediaSession {
     async fn process_sample(
         username: &str,
         mut sample: MediaSample,
-        audio_source: &Arc<SampleStreamSource>,
-        recorder: &Arc<Mutex<Option<Recorder>>>,
-        stats: &Arc<CallStats>,
-        decoder: &mut PcmuDecoder,
+        audio_source: &SampleStreamSource,
+        recorder: &Mutex<Option<Recorder>>,
+        stats: &CallStats,
+        decoder: &mut Box<dyn Decoder + Send>,
+        recorder_resampler: &mut Option<Resampler>,
         last_seq: &mut Option<u16>,
         last_timestamp: &mut Option<u32>,
+        rtp_clock_rate: u32,
     ) {
         // Validate timestamp continuity and rewrite if needed to fix interleaved streams
         if let MediaSample::Audio(ref mut frame) = sample {
             if let Some(last_ts) = *last_timestamp {
                 // Calculate expected timestamp based on last timestamp + samples
-                let expected_ts = last_ts.wrapping_add(frame.samples);
+                let ticks = (frame.samples as u64 * rtp_clock_rate as u64 / frame.sample_rate as u64) as u32;
+                let expected_ts = last_ts.wrapping_add(ticks);
                 let ts_diff = frame.rtp_timestamp.wrapping_sub(expected_ts);
 
                 // Allow up to 10 seconds of jump to handle legitimate gaps
-                let max_reasonable_jump: u32 = frame.sample_rate * 10;
+                let max_reasonable_jump: u32 = rtp_clock_rate * 10;
 
                 // Rewrite packets with large forward jumps
                 if ts_diff > max_reasonable_jump && ts_diff < (u32::MAX / 2) {
@@ -360,7 +619,7 @@ impl MediaSession {
                         frame.rtp_timestamp,
                         expected_ts,
                         ts_diff,
-                        ts_diff as f32 / frame.sample_rate as f32
+                        ts_diff as f32 / rtp_clock_rate as f32
                     );
                     frame.rtp_timestamp = expected_ts;
                 }
@@ -375,7 +634,7 @@ impl MediaSession {
                             frame.rtp_timestamp,
                             expected_ts,
                             backward_diff,
-                            backward_diff as f32 / frame.sample_rate as f32
+                            backward_diff as f32 / rtp_clock_rate as f32
                         );
                         frame.rtp_timestamp = expected_ts;
                     }
@@ -418,8 +677,13 @@ impl MediaSession {
                 let rec = recorder.lock().await;
                 if let Some(r) = rec.as_ref() {
                     let decoded = decoder.decode(&frame.data);
-                    r.record_rx(&decoded);
-                    r.record_tx(&decoded);
+                    let resampled = if let Some(resampler) = recorder_resampler {
+                        resampler.resample(&decoded)
+                    } else {
+                        decoded
+                    };
+                    r.record_rx(&resampled);
+                    r.record_tx(&resampled);
                 }
             } else {
                 error!("RX SAMPLE: NOT AUDIO");
@@ -430,6 +694,237 @@ impl MediaSession {
         if let Err(e) = audio_source.send(sample).await {
             error!("[{}] Failed to send echo sample: {:?}", username, e);
         }
+    }
+
+    pub async fn play_local_device(
+        &self,
+        username: String,
+        recording_path: Option<&Path>,
+        _keep_alive: bool,
+    ) -> Result<()> {
+        info!(
+            "[{}] Using local audio device for playback and capture",
+            username
+        );
+
+        if let Some(path) = recording_path {
+            let mut rec = self.recorder.lock().await;
+            *rec = Some(Recorder::new(username.clone(), path.to_path_buf()));
+        }
+
+        let host = cpal::default_host();
+        let input_device = host
+            .default_input_device()
+            .context("No input device found")?;
+        let output_device = host
+            .default_output_device()
+            .context("No output device found")?;
+
+        let input_config: cpal::StreamConfig = input_device.default_input_config()?.into();
+        let output_config: cpal::StreamConfig = output_device.default_output_config()?.into();
+
+        self.output_sample_rate.store(
+            output_config.sample_rate.0,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        let output_channels = output_config.channels as usize;
+
+        // Setup output buffer (RTP -> Speaker)
+        let rb = HeapRb::<i16>::new(output_config.sample_rate.0 as usize * 2);
+        let (prod, mut cons) = rb.split();
+
+        {
+            let mut tx = self.local_playback_tx.lock().await;
+            *tx = Some(prod);
+        }
+
+        // Setup input (Mic -> RTP)
+        let audio_source = self.audio_source.clone();
+        let stats = self.stats.clone();
+        let input_sample_rate = input_config.sample_rate.0;
+        let input_channels = input_config.channels;
+
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<Vec<f32>>(100);
+
+        // Move stream creation to a separate thread to avoid Send issues with cpal::Stream on some platforms
+        let (stream_stop_tx, stream_stop_rx) = std::sync::mpsc::channel();
+        let (init_tx, init_rx) = tokio::sync::oneshot::channel::<Result<()>>();
+
+        std::thread::spawn(move || {
+            let output_stream_res = output_device.build_output_stream(
+                &output_config,
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    for frame in data.chunks_mut(output_channels) {
+                        let sample = cons.try_pop().unwrap_or(0);
+                        let f_sample = sample as f32 / 32768.0;
+                        for s in frame.iter_mut() {
+                            *s = f_sample;
+                        }
+                    }
+                },
+                |err| error!("Output stream error: {:?}", err),
+                None,
+            );
+
+            let output_stream = match output_stream_res {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = init_tx.send(Err(anyhow::anyhow!(
+                        "Failed to build output stream: {:?}",
+                        e
+                    )));
+                    return;
+                }
+            };
+
+            let input_stream_res = input_device.build_input_stream(
+                &input_config,
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    let _ = input_tx.try_send(data.to_vec());
+                },
+                |err| error!("Input stream error: {:?}", err),
+                None,
+            );
+
+            let input_stream = match input_stream_res {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = init_tx.send(Err(anyhow::anyhow!(
+                        "Failed to build input stream: {:?}",
+                        e
+                    )));
+                    return;
+                }
+            };
+
+            if let Err(e) = output_stream.play() {
+                let _ = init_tx.send(Err(anyhow::anyhow!(
+                    "Failed to play output stream: {:?}",
+                    e
+                )));
+                return;
+            }
+            if let Err(e) = input_stream.play() {
+                let _ = init_tx.send(Err(anyhow::anyhow!("Failed to play input stream: {:?}", e)));
+                return;
+            }
+
+            let _ = init_tx.send(Ok(()));
+            let _ = stream_stop_rx.recv();
+        });
+
+        init_rx
+            .await
+            .context("Audio initialization thread panicked or dropped")??;
+
+        let pc = self.pc.clone();
+        let cancel_token = CancellationToken::new();
+        let child_token = cancel_token.clone();
+
+        // Handle existing transceivers
+        let transceivers = pc.get_transceivers();
+        for transceiver in transceivers {
+            if let Some(receiver) = transceiver.receiver().as_ref() {
+                spawn_track_recorder(self.clone(), receiver.track(), child_token.clone());
+            }
+        }
+
+        let session_rx = self.clone();
+        let session_input_clone = self.clone();
+        let rx_task = async move {
+            while let Some(event) = pc.recv().await {
+                if let PeerConnectionEvent::Track(transceiver) = event {
+                    if let Some(receiver) = transceiver.receiver().as_ref() {
+                        spawn_track_recorder(
+                            session_rx.clone(),
+                            receiver.track(),
+                            child_token.clone(),
+                        );
+                    }
+                }
+            }
+        };
+
+        let username_input = username.clone();
+        let input_task = async move {
+            let pt = session_input_clone.pc.get_transceivers().first()
+                .and_then(|t| t.sender().as_ref().map(|s| s.params().payload_type));
+            let ct = get_codec_type(pt, &session_input_clone.pc.config().media_capabilities);
+
+            let target_sample_rate = ct.samplerate();
+
+            let mut encoder = audio_codec::create_encoder(ct);
+
+            let mut resampler = if input_sample_rate != target_sample_rate || input_channels != 1 {
+                Some(audio_codec::Resampler::new(
+                    input_sample_rate as usize,
+                    target_sample_rate as usize,
+                ))
+            } else {
+                None
+            };
+
+            while let Some(data) = input_rx.recv().await {
+                // Convert f32 to i16 and mix down to mono if needed
+                let mut i16_samples: Vec<i16> =
+                    Vec::with_capacity(data.len() / input_channels as usize);
+                if input_channels == 1 {
+                    for &s in &data {
+                        i16_samples.push((s * 32767.0) as i16);
+                    }
+                } else {
+                    for chunk in data.chunks(input_channels as usize) {
+                        let sum: f32 = chunk.iter().sum();
+                        i16_samples.push(((sum / input_channels as f32) * 32767.0) as i16);
+                    }
+                }
+
+                let resampled = if let Some(r) = resampler.as_mut() {
+                    r.resample(&i16_samples)
+                } else {
+                    i16_samples
+                };
+
+                let encoded = encoder.encode(&resampled);
+                stats.inc_tx(1, encoded.len() as u64);
+                let sample = MediaSample::Audio(AudioFrame {
+                    samples: resampled.len() as u32,
+                    sample_rate: target_sample_rate,
+                    data: encoded.into(),
+                    ..Default::default()
+                });
+                if let Err(e) = audio_source.send(sample).await {
+                    error!("[{}] Failed to send mic sample: {:?}", username_input, e);
+                    break;
+                }
+            }
+        };
+
+        tokio::pin!(rx_task);
+        tokio::pin!(input_task);
+
+        let mut sync_interval = tokio::time::interval(Duration::from_secs(1));
+
+        loop {
+            tokio::select! {
+                _ = sync_interval.tick() => {
+                    self.sync_nack_stats();
+                }
+                _ = &mut rx_task => {
+                    break;
+                }
+                _ = &mut input_task => {
+                    break;
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    break;
+                }
+            }
+        }
+
+        let _ = stream_stop_tx.send(());
+        Ok(())
     }
 
     pub async fn play_file(
@@ -450,12 +945,21 @@ impl MediaSession {
         let spec = reader.spec();
         let raw_samples: Vec<i16> = reader.samples::<i16>().map(|s| s.unwrap_or(0)).collect();
 
-        let samples = if spec.sample_rate != 8000 || spec.channels != 1 {
+        let pt = self.pc.get_transceivers().first()
+            .and_then(|t| t.sender().as_ref().map(|s| s.params().payload_type));
+        let target_sample_rate = get_codec_type(pt, &self.pc.config().media_capabilities).samplerate();
+
+        let samples = if spec.sample_rate != target_sample_rate || spec.channels != 1 {
             info!(
-                "[{}] Resampling audio from {}Hz {}ch to 8000Hz 1ch",
-                username, spec.sample_rate, spec.channels
+                "[{}] Resampling audio from {}Hz {}ch to {}Hz 1ch",
+                username, spec.sample_rate, spec.channels, target_sample_rate
             );
-            resample_audio(raw_samples, spec.sample_rate, spec.channels)?
+            resample_audio(
+                raw_samples,
+                spec.sample_rate,
+                target_sample_rate,
+                spec.channels,
+            )?
         } else {
             raw_samples
         };
@@ -464,22 +968,19 @@ impl MediaSession {
         let cancel_token = CancellationToken::new();
         let child_token = cancel_token.clone();
 
-        let recording = recording_path.is_some();
         // Handle existing transceivers
         let transceivers = pc.get_transceivers();
         info!("[{}] Found {} transceivers", username, transceivers.len());
-        if recording {
-            for transceiver in transceivers {
-                if let Some(receiver) = transceiver.receiver().as_ref() {
-                    info!(
-                        "[{}] Transceiver has receiver, track id={}",
-                        username,
-                        receiver.track().id()
-                    );
-                    spawn_track_recorder(self.clone(), receiver.track(), child_token.clone());
-                } else {
-                    info!("[{}] Transceiver has NO receiver", username);
-                }
+        for transceiver in transceivers {
+            if let Some(receiver) = transceiver.receiver().as_ref() {
+                info!(
+                    "[{}] Transceiver has receiver, track id={}",
+                    username,
+                    receiver.track().id()
+                );
+                spawn_track_recorder(self.clone(), receiver.track(), child_token.clone());
+            } else {
+                info!("[{}] Transceiver has NO receiver", username);
             }
         }
 
@@ -548,12 +1049,21 @@ impl MediaSession {
         let spec = reader.spec();
         let raw_samples: Vec<i16> = reader.samples::<i16>().map(|s| s.unwrap_or(0)).collect();
 
-        let samples = if spec.sample_rate != 8000 || spec.channels != 1 {
+        let pt = self.pc.get_transceivers().first()
+            .and_then(|t| t.sender().as_ref().map(|s| s.params().payload_type));
+        let target_sample_rate = get_codec_type(pt, &self.pc.config().media_capabilities).samplerate();
+
+        let samples = if spec.sample_rate != target_sample_rate || spec.channels != 1 {
             info!(
-                "[{}] Resampling audio from {}Hz {}ch to 8000Hz 1ch",
-                username, spec.sample_rate, spec.channels
+                "[{}] Resampling audio from {}Hz {}ch to {}Hz 1ch",
+                username, spec.sample_rate, spec.channels, target_sample_rate
             );
-            resample_audio(raw_samples, spec.sample_rate, spec.channels)?
+            resample_audio(
+                raw_samples,
+                spec.sample_rate,
+                target_sample_rate,
+                spec.channels,
+            )?
         } else {
             raw_samples
         };
@@ -632,18 +1142,40 @@ impl MediaSession {
     }
 
     async fn play_samples(&self, username: String, samples: Vec<i16>) -> Result<()> {
-        let mut encoder = PcmuEncoder::new();
+        let pt = self.pc.get_transceivers().first()
+            .and_then(|t| t.sender().as_ref().map(|s| s.params().payload_type));
+        let ct = get_codec_type(pt, &self.pc.config().media_capabilities);
+
+        let sample_rate = ct.samplerate();
+        let mut encoder = audio_codec::create_encoder(ct);
+        let payload_type = match ct {
+            CodecType::PCMU => 0,
+            CodecType::PCMA => 8,
+            CodecType::G722 => 9,
+            CodecType::G729 => 18,
+            CodecType::Opus => 111,
+            _ => 0,
+        };
+
         let mut ticker = interval(Duration::from_millis(20));
-        let chunk_size = 160; // 20ms at 8000Hz
+        let chunk_size = (sample_rate / 50) as usize; // 20ms
         let mut rtp_timestamp = 0;
         let total_chunks = samples.chunks(chunk_size).count();
         let mut sent_chunks = 0;
 
+        let mut recorder_resampler = if sample_rate != 16000 {
+            Some(Resampler::new(sample_rate as usize, 16000))
+        } else {
+            None
+        };
+
         info!(
-            "[{}] Playback started: {} samples ({} chunks)",
+            "[{}] Playback started: {} samples ({} chunks) using {:?} at {}Hz",
             username,
             samples.len(),
-            total_chunks
+            total_chunks,
+            ct,
+            sample_rate
         );
 
         for chunk in samples.chunks(chunk_size) {
@@ -653,7 +1185,12 @@ impl MediaSession {
             {
                 let rec = self.recorder.lock().await;
                 if let Some(r) = rec.as_ref() {
-                    r.record_tx(chunk);
+                    let resampled = if let Some(resampler) = recorder_resampler.as_mut() {
+                        resampler.resample(chunk)
+                    } else {
+                        chunk.to_vec()
+                    };
+                    r.record_tx(&resampled);
                 }
             }
 
@@ -662,11 +1199,11 @@ impl MediaSession {
 
             let frame = AudioFrame {
                 data: Bytes::from(encoded),
-                sample_rate: 8000,
+                sample_rate,
                 channels: 1,
                 samples: chunk.len() as u32,
                 rtp_timestamp,
-                payload_type: Some(0),
+                payload_type: Some(payload_type),
                 sequence_number: None,
             };
             rtp_timestamp += chunk.len() as u32;
@@ -773,8 +1310,13 @@ impl MediaSession {
     }
 }
 
-fn resample_audio(samples: Vec<i16>, source_rate: u32, channels: u16) -> Result<Vec<i16>> {
-    if source_rate == 8000 && channels == 1 {
+fn resample_audio(
+    samples: Vec<i16>,
+    source_rate: u32,
+    target_rate: u32,
+    channels: u16,
+) -> Result<Vec<i16>> {
+    if source_rate == target_rate && channels == 1 {
         return Ok(samples);
     }
 
@@ -790,11 +1332,11 @@ fn resample_audio(samples: Vec<i16>, source_rate: u32, channels: u16) -> Result<
             mono_samples.push(sum / channels as f32);
         }
     }
-    let samples = mono_samples.into_iter().map(|s| s as i16).collect();
-    if source_rate == 8000 {
-        return Ok(samples);
+    let samples_i16: Vec<i16> = mono_samples.into_iter().map(|s| s as i16).collect();
+    if source_rate == target_rate {
+        return Ok(samples_i16);
     }
-    let buf = resample(&samples, source_rate, 8000);
+    let buf = resample(&samples_i16, source_rate, target_rate);
     Ok(buf)
 }
 
@@ -806,8 +1348,14 @@ fn spawn_track_recorder(
     let recorder = session.recorder.clone();
     let stats = session.stats.clone();
     let jitter_buffer_enabled = session.jitter_buffer_enabled;
+    let local_playback_tx = session.local_playback_tx.clone();
+    let output_sample_rate = session.output_sample_rate.clone();
+    let output_resampler = session.output_resampler.clone();
     tokio::spawn(async move {
-        let mut decoder = PcmuDecoder::new();
+        let mut decoder: Option<Box<dyn Decoder + Send>> = None;
+        let mut current_pt: Option<u8> = None;
+        let mut recorder_resampler: Option<Resampler> = None;
+
         let mut last_seq: Option<u16> = None;
         let mut last_timestamp: Option<u32> = None;
 
@@ -833,8 +1381,51 @@ fn spawn_track_recorder(
                         }
                     }
                     _ = tokio::time::sleep(wait) => {
-                        while let Some(sample) = jb.pop() {
-                            process_recorded_sample(sample, &recorder, &stats, &mut decoder, &mut last_seq, &mut last_timestamp).await;
+                        while let Some(mut sample) = jb.pop() {
+                            if let MediaSample::Audio(ref frame) = sample {
+                                if current_pt != frame.payload_type {
+                                    current_pt = frame.payload_type;
+                                    if let Some(pt) = current_pt {
+                                            let ct = get_codec_type(Some(pt), &session.pc.config().media_capabilities);
+                                            let d = audio_codec::create_decoder(ct);
+                                            decoder = Some(d);
+                                            let rate = ct.samplerate();
+                                            if rate != 16000 {
+                                                recorder_resampler = Some(Resampler::new(rate as usize, 16000));
+                                            } else {
+                                                recorder_resampler = None;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if let Some(ref mut dec) = decoder {
+                                    let ct = if let MediaSample::Audio(ref mut frame) = sample {
+                                        let ct = get_codec_type(frame.payload_type, &session.pc.config().media_capabilities);
+                                        frame.sample_rate = ct.samplerate();
+                                        ct
+                                    } else {
+                                        CodecType::PCMU
+                                    };
+                                    
+                                    let rtp_clock_rate = ct.clock_rate();
+
+                                    let mut resampler_lock = output_resampler.lock().await;
+                                    process_recorded_sample(
+                                        sample,
+                                        &recorder,
+                                        &stats,
+                                        dec,
+                                        &mut recorder_resampler,
+                                        &mut last_seq,
+                                        &mut last_timestamp,
+                                        &local_playback_tx,
+                                        &output_sample_rate,
+                                        &mut *resampler_lock,
+                                        rtp_clock_rate,
+                                    )
+                                    .await;
+                                }
                         }
                     }
                 }
@@ -848,8 +1439,51 @@ fn spawn_track_recorder(
                     },
                     res = track.recv() => {
                         match res {
-                            Ok(sample) => {
-                                process_recorded_sample(sample, &recorder, &stats, &mut decoder, &mut last_seq, &mut last_timestamp).await;
+                            Ok(mut sample) => {
+                                if let MediaSample::Audio(ref frame) = sample {
+                                    if current_pt != frame.payload_type {
+                                        current_pt = frame.payload_type;
+                                        if let Some(pt) = current_pt {
+                                            let ct = get_codec_type(Some(pt), &session.pc.config().media_capabilities);
+                                            let d = audio_codec::create_decoder(ct);
+                                            decoder = Some(d);
+                                            let rate = ct.samplerate();
+                                            if rate != 16000 {
+                                                recorder_resampler = Some(Resampler::new(rate as usize, 16000));
+                                            } else {
+                                                recorder_resampler = None;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if let Some(ref mut dec) = decoder {
+                                    let ct = if let MediaSample::Audio(ref mut frame) = sample {
+                                        let ct = get_codec_type(frame.payload_type, &session.pc.config().media_capabilities);
+                                        frame.sample_rate = ct.samplerate();
+                                        ct
+                                    } else {
+                                        CodecType::PCMU
+                                    };
+                                    
+                                    let rtp_clock_rate = ct.clock_rate();
+
+                                    let mut resampler_lock = output_resampler.lock().await;
+                                    process_recorded_sample(
+                                        sample,
+                                        &recorder,
+                                        &stats,
+                                        dec,
+                                        &mut recorder_resampler,
+                                        &mut last_seq,
+                                        &mut last_timestamp,
+                                        &local_playback_tx,
+                                        &output_sample_rate,
+                                        &mut *resampler_lock,
+                                        rtp_clock_rate,
+                                    )
+                                    .await;
+                                }
                             }
                             Err(_) => {
                                 break;
@@ -864,21 +1498,27 @@ fn spawn_track_recorder(
 
 async fn process_recorded_sample(
     mut sample: MediaSample,
-    recorder: &Arc<Mutex<Option<Recorder>>>,
-    stats: &Arc<CallStats>,
-    decoder: &mut PcmuDecoder,
+    recorder: &Mutex<Option<Recorder>>,
+    stats: &CallStats,
+    decoder: &mut Box<dyn Decoder + Send>,
+    recorder_resampler: &mut Option<Resampler>,
     last_seq: &mut Option<u16>,
     last_timestamp: &mut Option<u32>,
+    local_playback_tx: &Mutex<Option<ringbuf::HeapProd<i16>>>,
+    output_sample_rate: &std::sync::atomic::AtomicU32,
+    output_resampler: &mut Option<audio_codec::Resampler>,
+    rtp_clock_rate: u32,
 ) {
     // Validate timestamp continuity and rewrite if needed to fix interleaved streams
     if let MediaSample::Audio(ref mut frame) = sample {
         if let Some(last_ts) = *last_timestamp {
             // Calculate expected timestamp based on last timestamp + samples
-            let expected_ts = last_ts.wrapping_add(frame.samples);
+            let ticks = (frame.samples as u64 * rtp_clock_rate as u64 / frame.sample_rate as u64) as u32;
+            let expected_ts = last_ts.wrapping_add(ticks);
             let ts_diff = frame.rtp_timestamp.wrapping_sub(expected_ts);
 
             // Allow up to 10 seconds of jump to handle legitimate gaps
-            let max_reasonable_jump: u32 = frame.sample_rate * 10;
+            let max_reasonable_jump: u32 = rtp_clock_rate * 10;
 
             // Rewrite packets with large forward jumps
             if ts_diff > max_reasonable_jump && ts_diff < (u32::MAX / 2) {
@@ -888,7 +1528,7 @@ async fn process_recorded_sample(
                     frame.rtp_timestamp,
                     expected_ts,
                     ts_diff,
-                    ts_diff as f32 / frame.sample_rate as f32
+                    ts_diff as f32 / rtp_clock_rate as f32
                 );
                 frame.rtp_timestamp = expected_ts;
             }
@@ -902,7 +1542,7 @@ async fn process_recorded_sample(
                         frame.rtp_timestamp,
                         expected_ts,
                         backward_diff,
-                        backward_diff as f32 / frame.sample_rate as f32
+                        backward_diff as f32 / rtp_clock_rate as f32
                     );
                     frame.rtp_timestamp = expected_ts;
                 }
@@ -935,10 +1575,35 @@ async fn process_recorded_sample(
         *last_timestamp = Some(frame.rtp_timestamp);
 
         stats.inc_rx(1, frame.data.len() as u64);
+        let decoded = decoder.decode(&frame.data);
+
         let rec = recorder.lock().await;
         if let Some(r) = rec.as_ref() {
-            let decoded = decoder.decode(&frame.data);
-            r.record_rx(&decoded);
+            let resampled = if let Some(resampler) = recorder_resampler {
+                resampler.resample(&decoded)
+            } else {
+                decoded.clone()
+            };
+            r.record_rx(&resampled);
+        }
+
+        let mut tx = local_playback_tx.lock().await;
+        if let Some(prod) = tx.as_mut() {
+            let target_rate = output_sample_rate.load(std::sync::atomic::Ordering::Relaxed);
+            if target_rate != frame.sample_rate {
+                if output_resampler.is_none() {
+                    *output_resampler = Some(audio_codec::Resampler::new(
+                        frame.sample_rate as usize,
+                        target_rate as usize,
+                    ));
+                }
+                if let Some(resampler) = output_resampler.as_mut() {
+                    let resampled = resampler.resample(&decoded);
+                    let _ = prod.push_slice(&resampled);
+                }
+            } else {
+                let _ = prod.push_slice(&decoded);
+            }
         }
     }
 }
@@ -950,7 +1615,7 @@ mod tests {
     #[test]
     fn test_resample_audio_identity() {
         let samples = vec![100, 200, 300, 400];
-        let result = resample_audio(samples.clone(), 8000, 1).unwrap();
+        let result = resample_audio(samples.clone(), 8000, 8000, 1).unwrap();
         assert_eq!(result, samples);
     }
 
@@ -959,7 +1624,7 @@ mod tests {
         // 8000Hz stereo -> 8000Hz mono
         // Left: 100, Right: 200 -> Avg: 150
         let samples = vec![100, 200, 300, 500];
-        let result = resample_audio(samples, 8000, 2).unwrap();
+        let result = resample_audio(samples, 8000, 8000, 2).unwrap();
         assert_eq!(result, vec![150, 400]);
     }
 
@@ -968,7 +1633,7 @@ mod tests {
         // 16000Hz mono -> 8000Hz mono
         // Just checking it produces output of roughly half size
         let samples: Vec<i16> = (0..1600).map(|i| (i % 1000) as i16).collect();
-        let result = resample_audio(samples.clone(), 16000, 1).unwrap();
+        let result = resample_audio(samples.clone(), 16000, 8000, 1).unwrap();
 
         // 1600 samples at 16k is 0.1s
         // 0.1s at 8k is 800 samples
@@ -978,22 +1643,102 @@ mod tests {
         assert!(result.len() < 1200); // Allow some padding overhead
     }
 
+    #[test]
+    fn test_get_audio_caps_default() {
+        let caps = get_audio_caps(&None, false);
+        // Now defaults to all supported codecs
+        assert!(caps.len() >= 4);
+        assert_eq!(caps[0].codec_name, "PCMU");
+    }
+
+    #[test]
+    fn test_get_audio_caps_multiple() {
+        let codecs = Some(vec![
+            #[cfg(feature = "opus")]
+            "opus".to_string(),
+            "g722".to_string(),
+            "pcmu".to_string(),
+        ]);
+        let caps = get_audio_caps(&codecs, false);
+        #[cfg(feature = "opus")]
+        {
+            assert_eq!(caps.len(), 3);
+            assert_eq!(caps[0].codec_name, "opus");
+            assert_eq!(caps[1].codec_name, "G722");
+            assert_eq!(caps[2].codec_name, "PCMU");
+        }
+        #[cfg(not(feature = "opus"))]
+        {
+            assert_eq!(caps.len(), 2);
+            assert_eq!(caps[0].codec_name, "G722");
+            assert_eq!(caps[1].codec_name, "PCMU");
+        }
+    }
+
     #[tokio::test]
     async fn test_media_session_offer() {
         let stats = Arc::new(CallStats::new());
-        let (_session, sdp) =
-            MediaSession::new_offer(false, false, false, None, true, stats.clone())
-                .await
-                .unwrap();
+        let codecs = Some(vec![
+            #[cfg(feature = "opus")]
+            "opus".to_string(),
+            "pcmu".to_string(),
+        ]);
+        let (_session, sdp) = MediaSession::new_offer(
+            false,
+            false,
+            false,
+            None,
+            codecs.clone(),
+            true,
+            stats.clone(),
+        )
+        .await
+        .unwrap();
         assert!(sdp.contains("m=audio"));
         assert!(sdp.contains("a=sendrecv")); // We set direction to SendRecv
+        #[cfg(feature = "opus")]
+        assert!(sdp.to_lowercase().contains("opus"));
+        assert!(sdp.to_lowercase().contains("pcmu"));
 
         // Check if we can create an answer session
         let (_answer_session, answer_sdp) =
-            MediaSession::new(&sdp, false, false, false, None, stats)
+            MediaSession::new(&sdp, false, false, false, None, codecs, stats)
                 .await
                 .unwrap();
         assert!(answer_sdp.contains("m=audio"));
         assert!(answer_sdp.contains("a=sendrecv"));
+    }
+
+    #[tokio::test]
+    async fn test_media_session_negotiation_g729() {
+        let stats = Arc::new(CallStats::new());
+
+        // Create an offer with G.729
+        let offer_codecs = Some(vec!["g729".to_string()]);
+        let (_offerer, offer_sdp) =
+            MediaSession::new_offer(false, false, false, None, offer_codecs, true, stats.clone())
+                .await
+                .unwrap();
+
+        assert!(offer_sdp.contains("G729"));
+
+        // Answer without specifying codecs (should support all by default now)
+        let (_answerer, answer_sdp) =
+            MediaSession::new(&offer_sdp, false, false, false, None, None, stats.clone())
+                .await
+                .unwrap();
+
+        // The answer should contain G729 because it was in the offer and we support it by default
+        assert!(
+            answer_sdp.contains("G729"),
+            "Answer SDP should contain G729. SDP: {}",
+            answer_sdp
+        );
+        // The answer should NOT contain PCMU because it was not in the offer
+        assert!(
+            !answer_sdp.contains("PCMU"),
+            "Answer SDP should NOT contain PCMU if not offered. SDP: {}",
+            answer_sdp
+        );
     }
 }

@@ -51,6 +51,9 @@ enum Commands {
         /// Play file (wav)
         #[arg(long)]
         play: Option<String>,
+        /// Use local audio device for playback and capture
+        #[arg(long)]
+        local: bool,
         /// Record to file (wav)
         #[arg(long)]
         record: Option<String>,
@@ -72,6 +75,9 @@ enum Commands {
         /// Cancel probability (0-99%)
         #[arg(long, default_value = "0")]
         cancel_prob: u8,
+        /// Codecs to use (e.g., opus,g722,pcmu)
+        #[arg(long, value_delimiter = ',')]
+        codecs: Option<Vec<String>>,
     },
     /// Wait for incoming calls
     Wait {
@@ -105,6 +111,9 @@ enum Commands {
         /// Answer and echo
         #[arg(long)]
         echo: bool,
+        /// Answer and use local audio device
+        #[arg(long)]
+        local: bool,
         /// Hangup after seconds
         #[arg(long)]
         hangup: Option<u64>,
@@ -123,6 +132,9 @@ enum Commands {
         /// Enable Jitter Buffer
         #[arg(long)]
         jitter: bool,
+        /// Codecs to use (e.g., opus,g722,pcmu)
+        #[arg(long, value_delimiter = ',')]
+        codecs: Option<Vec<String>>,
     },
     /// Send OPTIONS request
     Options {
@@ -167,10 +179,40 @@ async fn main() -> Result<()> {
         Config::load(&config_path).await?
     } else {
         match &args.command {
-            Commands::Options { .. }
-            | Commands::Info { .. }
-            | Commands::Call {
-                target: Some(_), ..
+            Commands::Options { .. } | Commands::Info { .. } => {
+                info!(
+                    "Configuration file not found, using default configuration for standalone command"
+                );
+                Config {
+                    addr: Some("0.0.0.0:0".to_string()),
+                    external_ip: None,
+                    recorders: None,
+                    accounts: vec![AccountConfig {
+                        username: "sipbot".to_string(),
+                        auth_username: None,
+                        domain: "127.0.0.1".to_string(),
+                        password: None,
+                        proxy: None,
+                        register: Some(false),
+                        target: None,
+                        record: None,
+                        srtp_enabled: None,
+                        nack_enabled: None,
+                        jitter_buffer_enabled: None,
+                        reject_prob: None,
+                        cancel_prob: 0,
+                        early_media: None,
+                        ring: None,
+                        answer: None,
+                        hangup: None,
+                        codecs: None,
+                    }],
+                }
+            }
+            Commands::Call {
+                target: Some(_),
+                codecs,
+                ..
             } => {
                 info!(
                     "Configuration file not found, using default configuration for standalone command"
@@ -197,6 +239,7 @@ async fn main() -> Result<()> {
                         ring: None,
                         answer: None,
                         hangup: None,
+                        codecs: codecs.clone(),
                     }],
                 }
             }
@@ -211,12 +254,14 @@ async fn main() -> Result<()> {
                 ring_duration,
                 answer,
                 echo,
+                local,
                 hangup,
                 reject,
                 reject_prob,
                 srtp,
                 nack,
                 jitter,
+                codecs,
             } => {
                 info!("Configuration file not found, using default configuration for wait command");
 
@@ -231,6 +276,8 @@ async fn main() -> Result<()> {
 
                 let answer_config = if *echo {
                     Some(sipbot::config::AnswerConfig::Echo)
+                } else if *local {
+                    Some(sipbot::config::AnswerConfig::Local)
                 } else if let Some(file) = answer {
                     Some(sipbot::config::AnswerConfig::Play {
                         wav_file: file.clone(),
@@ -286,6 +333,7 @@ async fn main() -> Result<()> {
                         ring: ring_config,
                         answer: answer_config,
                         hangup: hangup_config,
+                        codecs: codecs.clone(),
                     }],
                 }
             }
@@ -312,11 +360,13 @@ async fn main() -> Result<()> {
         srtp_override,
         nack_override,
         jitter_buffer_override,
+        local_override,
         total_calls,
         concurrent_calls,
         register_override,
         proxy_override,
         cancel_prob_override,
+        codecs_override,
     ) = match &args.command {
         Commands::Call {
             target,
@@ -326,6 +376,7 @@ async fn main() -> Result<()> {
             register,
             hangup,
             play,
+            local,
             record,
             srtp,
             nack,
@@ -333,6 +384,7 @@ async fn main() -> Result<()> {
             total,
             concurrent,
             cancel_prob,
+            codecs,
         } => {
             let is_register = register.is_some() || password.is_some();
             let reg_target = if let Some(r) = register {
@@ -352,11 +404,13 @@ async fn main() -> Result<()> {
                 *srtp,
                 Some(*nack),
                 Some(*jitter),
+                *local,
                 *total,
                 *concurrent,
                 is_register,
                 reg_target,
                 *cancel_prob,
+                codecs.clone(),
             )
         }
         Commands::Wait {
@@ -367,6 +421,8 @@ async fn main() -> Result<()> {
             register,
             username,
             auth_user,
+            local,
+            codecs,
             ..
         } => {
             let is_register = register.is_some() || password.is_some();
@@ -387,11 +443,13 @@ async fn main() -> Result<()> {
                 *srtp,
                 Some(*nack),
                 Some(*jitter),
+                *local,
                 1,
                 1,
                 is_register,
                 reg_target,
                 0,
+                codecs.clone(),
             )
         }
         Commands::Options { target } => (
@@ -406,11 +464,13 @@ async fn main() -> Result<()> {
             false,
             None,
             None,
+            false,
             1,
             1,
             false,
             None,
             0,
+            None,
         ),
         Commands::Info { target } => (
             "info",
@@ -424,11 +484,13 @@ async fn main() -> Result<()> {
             false,
             None,
             None,
+            false,
             1,
             1,
             false,
             None,
             0,
+            None,
         ),
     };
 
@@ -464,10 +526,18 @@ async fn main() -> Result<()> {
             account.jitter_buffer_enabled = Some(jb);
         }
 
+        if let Some(codecs) = &codecs_override {
+            account.codecs = Some(codecs.clone());
+        }
+
         if let Some(play_file) = &play_file_override {
             account.answer = Some(sipbot::config::AnswerConfig::Play {
                 wav_file: play_file.clone(),
             });
+        } else if local_override {
+            account.answer = Some(sipbot::config::AnswerConfig::Local);
+        } else if concurrent_calls == 1 && command_name == "call" {
+            account.answer = Some(sipbot::config::AnswerConfig::Local);
         }
 
         if cancel_prob_override > 0 {

@@ -27,7 +27,7 @@ impl Recorder {
             info!("[{}] Recorder started: {:?}", username, path);
             let spec = hound::WavSpec {
                 channels: 2,
-                sample_rate: 8000,
+                sample_rate: 16000,
                 bits_per_sample: 16,
                 sample_format: hound::SampleFormat::Int,
             };
@@ -42,8 +42,8 @@ impl Recorder {
             let mut rx_buffer: Vec<i16> = Vec::new();
             let mut tx_buffer: Vec<i16> = Vec::new();
 
-            // 20ms at 8000Hz = 160 samples
-            let chunk_size = 160;
+            // 20ms at 16000Hz = 320 samples
+            let chunk_size = 320;
             let mut ticker = interval(Duration::from_millis(20));
 
             loop {
@@ -139,15 +139,15 @@ mod tests {
         let mut reader = hound::WavReader::open(&path).unwrap();
         let spec = reader.spec();
         assert_eq!(spec.channels, 2);
-        assert_eq!(spec.sample_rate, 8000);
+        assert_eq!(spec.sample_rate, 16000);
 
         let read_samples: Vec<i16> = reader.samples().map(|s| s.unwrap()).collect();
 
-        // We expect at least 160 * 2 samples.
-        // Since we waited 100ms, we might have recorded 5 chunks (5 * 160 * 2 = 1600 samples).
+        // We expect at least 320 * 2 samples.
+        // Since we waited 100ms, we might have recorded 5 chunks (5 * 320 * 2 = 3200 samples).
         // The first chunk should have our data. Subsequent chunks should be 0.
 
-        assert!(read_samples.len() >= 320);
+        assert!(read_samples.len() >= 640);
 
         // Check first chunk (Left=RX, Right=TX)
         // RX=1000, TX=1000

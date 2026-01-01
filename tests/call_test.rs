@@ -34,6 +34,7 @@ async fn test_call_flow() -> Result<()> {
             hangup: None,
             reject_prob: None,
             cancel_prob: 0,
+            codecs: None,
         }],
     };
 
@@ -64,6 +65,7 @@ async fn test_call_flow() -> Result<()> {
             }),
             reject_prob: None,
             cancel_prob: 0,
+            codecs: None,
         }],
     };
 
@@ -138,6 +140,7 @@ async fn test_options_flow() -> Result<()> {
             ring: None,
             answer: None,
             hangup: None,
+            codecs: None,
         }],
     };
 
@@ -165,6 +168,7 @@ async fn test_options_flow() -> Result<()> {
             ring: None,
             answer: None,
             hangup: None,
+            codecs: None,
         }],
     };
 

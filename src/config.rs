@@ -35,6 +35,7 @@ pub struct AccountConfig {
     pub nack_enabled: Option<bool>,          // Enable NACK
     pub jitter_buffer_enabled: Option<bool>, // Enable Jitter Buffer
     pub reject_prob: Option<u8>,             // Reject probability (1-99%)
+    pub codecs: Option<Vec<String>>,         // Preferred codecs (opus, g722, g729, pcmu, pcma)
     #[serde(default)]
     pub cancel_prob: u8, // Cancel probability (1-99%)
 
@@ -67,6 +68,7 @@ pub struct RingConfig {
 pub enum AnswerConfig {
     Play { wav_file: String },
     Echo,
+    Local,
 }
 
 #[derive(Debug, Deserialize, Clone)]

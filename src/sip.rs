@@ -88,6 +88,7 @@ impl CallRunner {
             nack_enabled,
             jitter_buffer_enabled,
             self.global_config.external_ip.clone(),
+            self.account.codecs.clone(),
             true,
             self.stats.clone(),
         )
@@ -248,6 +249,20 @@ impl CallRunner {
                             .await
                         {
                             error!("Failed to play file: {:?}", e);
+                        }
+                    }
+                    AnswerConfig::Local => {
+                        if let Err(e) = media_session_clone
+                            .play_local_device(username.clone(), record_path_ref, keep_alive)
+                            .await
+                        {
+                            error!("Failed to play local device: {:?}, falling back to file", e);
+                            if let Err(e) = media_session_clone
+                                .play_wav_bytes(username, PLAY_WAV, record_path_ref, keep_alive)
+                                .await
+                            {
+                                error!("Fallback failed: {:?}", e);
+                            }
                         }
                     }
                     _ => {}
@@ -438,18 +453,29 @@ impl SipBot {
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(3));
+            let mut prev_calls = 0;
             loop {
                 interval.tick().await;
                 let current = monitor_stats
                     .current_calls
                     .load(std::sync::atomic::Ordering::Relaxed);
-                if current > 0 {
+                let show_calls = if current > 0 {
+                    true
+                } else {
+                    if prev_calls != 0 && current == 0 {
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if show_calls {
                     if !verbose {
                         println!("[{}] Active calls: {}", username, current);
                     } else {
                         info!("[{}] Active calls: {}", username, current);
                     }
                 }
+                prev_calls = current;
             }
         });
 
@@ -955,6 +981,7 @@ impl SipBot {
                             nack_enabled,
                             jitter_buffer_enabled,
                             global_config.external_ip.clone(),
+                            account.codecs.clone(),
                             stats_clone.clone(),
                         )
                         .await
@@ -1079,6 +1106,32 @@ impl SipBot {
                                                 keep_alive,
                                             )
                                             .await
+                                    }
+                                    AnswerConfig::Local => {
+                                        info!("[{}] Stage 2: Starting Local Audio", username_media);
+                                        if let Err(e) = media
+                                            .play_local_device(
+                                                username_media.clone(),
+                                                recording_path.as_deref(),
+                                                keep_alive,
+                                            )
+                                            .await
+                                        {
+                                            warn!(
+                                                "[{}] Failed to start local audio: {:?}, falling back to default answer",
+                                                username_media, e
+                                            );
+                                            media
+                                                .play_wav_bytes(
+                                                    username_media,
+                                                    ANSWER_WAV,
+                                                    recording_path.as_deref(),
+                                                    keep_alive,
+                                                )
+                                                .await
+                                        } else {
+                                            Ok(())
+                                        }
                                     }
                                 }
                             } else {

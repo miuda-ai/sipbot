@@ -14,6 +14,7 @@ The media transport uses [rustrtc](https://github.com/restsend/rustrtc).
     - **Media Handling**:
         - **Play**: Play a specified `.wav` file.
         - **Echo**: Echo received RTP packets back to the sender (Latency testing).
+        - **Local**: Use local audio device for playback and capture (Mic/Speaker).
     - **Hangup (Stage 3)**: Automatically hang up after a configurable duration or reject calls with specific SIP codes.
 - **Outbound Calls**: Ability to initiate calls to a target URI.
 - **Call Recording**: (Experimental) Record call audio to WAV files. (Requires configuration)
@@ -45,6 +46,7 @@ cargo run -- call -t sip:user@domain --caller sip:me@mydomain --play audio.wav -
 - `--password <PASS>`: Auth password.
 - `--hangup <SECONDS>`: Hangup after seconds.
 - `--play <FILE>`: Play file (wav).
+- `--local`: Use local audio device for playback and capture.
 - `--record <FILE>`: Record to file (wav). If multiple calls are made, the filename will be suffixed with the call index (e.g., `record_1.wav`).
 - `--srtp`: Enable SRTP/SDES.
 - `--total <COUNT>`: Total number of calls to make (default: 1).
@@ -61,6 +63,7 @@ cargo run -- wait --addr 0.0.0.0:5060 --username sipbot --answer welcome.wav
 - `--ring-duration <SECONDS>`: Ring duration in seconds.
 - `--answer <FILE>`: Answer and play file (wav).
 - `--echo`: Answer and echo.
+- `--local`: Answer and use local audio device.
 - `--hangup <SECONDS>`: Hangup after seconds.
 - `--reject <CODE>`: Reject with code (e.g. 486, 603).
 - `--reject-prob <PROB>`: Randomly reject call with probability 1-99% (default code 480).
@@ -71,6 +74,48 @@ cargo run -- wait --addr 0.0.0.0:5060 --username sipbot --answer welcome.wav
 #### Other Commands
 - `options`: Send OPTIONS request.
 - `info`: Send INFO request.
+
+## Typical Usage Examples
+
+### 1. Echo Test (Latency & Connectivity)
+Answer incoming calls and echo the audio back to the caller. This is perfect for testing network latency and packet loss.
+```bash
+sipbot wait --username echo-bot --echo
+```
+
+### 2. Intercom Mode (Local Audio)
+Use your computer's microphone and speakers to talk to a SIP caller.
+```bash
+sipbot wait --username intercom --local
+```
+
+### 3. Automated Announcement
+Answer calls, play a welcome message, and hang up after 10 seconds.
+```bash
+sipbot wait --username announcer --answer welcome.wav --hangup 10
+```
+
+### 4. Load Testing (Outbound)
+Make 100 calls to a target, with 5 calls running concurrently, playing an audio file for 30 seconds each.
+```bash
+sipbot call -t sip:100@192.168.1.10 --play music.wav --total 100 --concurrent 5 --hangup 30
+```
+
+### 5. High-Quality Audio (G.722)
+SipBot supports G.722 (16kHz) for high-definition audio. It automatically negotiates the best codec.
+```bash
+# Make a call using G.722 if supported by the remote end
+sipbot call -t sip:hd-user@domain --play high_res.wav
+```
+
+### 6. Call Recording
+Record all incoming calls to a specific directory. (Requires `recorders` path in `config.toml`)
+```bash
+# In config.toml:
+# recorders = "./wavs"
+
+sipbot wait --username recorder-bot
+```
 
 ## Configuration
 
@@ -104,11 +149,14 @@ duration_secs = 5
 # Stage 2: Answer
 # Answer the call (200 OK) and perform an action.
 [accounts.answer]
-action = "play"                 # Options: "play", "echo"
+action = "play"                 # Options: "play", "echo", "local"
 wav_file = "sounds/welcome.wav" # Required if action is "play"
 
 # [accounts.answer]
 # action = "echo"               # Alternative: Echo test
+
+# [accounts.answer]
+# action = "local"              # Alternative: Use local audio device (Mic/Speaker)
 
 # Stage 3: Hangup
 # Automatically hang up after the media finishes or a timeout.
@@ -133,7 +181,7 @@ after_secs = 10                 # Send BYE after 10 seconds
         - `duration_secs`: How long to stay in ringing state.
         - `ringback`: (Optional) Path to WAV file for early media (183).
     - **`answer`**: Configuration for the answered phase.
-        - `action`: `play` or `echo`.
+        - `action`: `play`, `echo` or `local`.
         - `wav_file`: Path to WAV file (if action is `play`).
     - **`hangup`**: Configuration for ending the call.
         - `code`: SIP status code (used for rejection if no answer config exists).
