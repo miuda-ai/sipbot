@@ -252,11 +252,22 @@ impl CallRunner {
                         }
                     }
                     AnswerConfig::Local => {
+                        #[cfg(feature = "local-device")]
                         if let Err(e) = media_session_clone
                             .play_local_device(username.clone(), record_path_ref, keep_alive)
                             .await
                         {
                             error!("Failed to play local device: {:?}, falling back to file", e);
+                            if let Err(e) = media_session_clone
+                                .play_wav_bytes(username, PLAY_WAV, record_path_ref, keep_alive)
+                                .await
+                            {
+                                error!("Fallback failed: {:?}", e);
+                            }
+                        }
+                        #[cfg(not(feature = "local-device"))]
+                        {
+                            error!("Local device support is disabled in this build");
                             if let Err(e) = media_session_clone
                                 .play_wav_bytes(username, PLAY_WAV, record_path_ref, keep_alive)
                                 .await
@@ -1109,18 +1120,35 @@ impl SipBot {
                                     }
                                     AnswerConfig::Local => {
                                         info!("[{}] Stage 2: Starting Local Audio", username_media);
-                                        if let Err(e) = media
-                                            .play_local_device(
-                                                username_media.clone(),
-                                                recording_path.as_deref(),
-                                                keep_alive,
-                                            )
-                                            .await
+                                        #[cfg(feature = "local-device")]
                                         {
-                                            warn!(
-                                                "[{}] Failed to start local audio: {:?}, falling back to default answer",
-                                                username_media, e
-                                            );
+                                            if let Err(e) = media
+                                                .play_local_device(
+                                                    username_media.clone(),
+                                                    recording_path.as_deref(),
+                                                    keep_alive,
+                                                )
+                                                .await
+                                            {
+                                                warn!(
+                                                    "[{}] Failed to start local audio: {:?}, falling back to default answer",
+                                                    username_media, e
+                                                );
+                                                media
+                                                    .play_wav_bytes(
+                                                        username_media,
+                                                        ANSWER_WAV,
+                                                        recording_path.as_deref(),
+                                                        keep_alive,
+                                                    )
+                                                    .await
+                                            } else {
+                                                Ok(())
+                                            }
+                                        }
+                                        #[cfg(not(feature = "local-device"))]
+                                        {
+                                            warn!("[{}] Local device support is disabled in this build, falling back to default answer", username_media);
                                             media
                                                 .play_wav_bytes(
                                                     username_media,
@@ -1129,8 +1157,6 @@ impl SipBot {
                                                     keep_alive,
                                                 )
                                                 .await
-                                        } else {
-                                            Ok(())
                                         }
                                     }
                                 }

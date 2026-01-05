@@ -3,7 +3,9 @@ use crate::stats::CallStats;
 use anyhow::{Context, Result};
 use audio_codec::{CodecType, Decoder, Resampler, resample};
 use bytes::Bytes;
+#[cfg(feature = "local-device")]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+#[cfg(feature = "local-device")]
 use ringbuf::{HeapRb, traits::*};
 use rustrtc::config::{
     AudioCapability, MediaCapabilities, RtcConfiguration, RtcpMuxPolicy, TransportMode,
@@ -49,6 +51,7 @@ fn get_codec_type(pt: Option<u8>, caps: &Option<MediaCapabilities>) -> CodecType
         Some(8) => CodecType::PCMA,
         Some(9) => CodecType::G722,
         Some(18) => CodecType::G729,
+        #[cfg(feature = "opus")]
         Some(111) => CodecType::Opus,
         _ => CodecType::PCMU,
     })
@@ -83,6 +86,7 @@ fn get_audio_caps(codecs: &Option<Vec<String>>, nack_enabled: bool) -> Vec<Audio
                             CodecType::PCMA => 8,
                             CodecType::G722 => 9,
                             CodecType::G729 => 18,
+                            #[cfg(feature = "opus")]
                             CodecType::Opus => 111,
                             _ => 0,
                         },
@@ -119,8 +123,11 @@ pub struct MediaSession {
     last_nack_sent: Arc<std::sync::atomic::AtomicU64>,
     last_nack_recv: Arc<std::sync::atomic::AtomicU64>,
     last_nack_recovered: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(feature = "local-device")]
     local_playback_tx: Arc<Mutex<Option<ringbuf::HeapProd<i16>>>>,
+    #[cfg(feature = "local-device")]
     output_sample_rate: Arc<std::sync::atomic::AtomicU32>,
+    #[cfg(feature = "local-device")]
     output_resampler: Arc<Mutex<Option<audio_codec::Resampler>>>,
 }
 
@@ -304,8 +311,11 @@ impl MediaSession {
             last_nack_sent: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_nack_recv: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_nack_recovered: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(feature = "local-device")]
             local_playback_tx: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "local-device")]
             output_sample_rate: Arc::new(std::sync::atomic::AtomicU32::new(8000)),
+            #[cfg(feature = "local-device")]
             output_resampler: Arc::new(Mutex::new(None)),
         };
 
@@ -423,8 +433,11 @@ impl MediaSession {
                 last_nack_sent: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 last_nack_recv: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 last_nack_recovered: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                #[cfg(feature = "local-device")]
                 local_playback_tx: Arc::new(Mutex::new(None)),
+                #[cfg(feature = "local-device")]
                 output_sample_rate: Arc::new(std::sync::atomic::AtomicU32::new(8000)),
+                #[cfg(feature = "local-device")]
                 output_resampler: Arc::new(Mutex::new(None)),
             },
             local_sdp,
@@ -700,6 +713,7 @@ impl MediaSession {
         }
     }
 
+    #[cfg(feature = "local-device")]
     pub async fn play_local_device(
         &self,
         username: String,
@@ -1171,6 +1185,7 @@ impl MediaSession {
             CodecType::PCMA => 8,
             CodecType::G722 => 9,
             CodecType::G729 => 18,
+            #[cfg(feature = "opus")]
             CodecType::Opus => 111,
             _ => 0,
         };
@@ -1366,8 +1381,11 @@ fn spawn_track_recorder(
     let recorder = session.recorder.clone();
     let stats = session.stats.clone();
     let jitter_buffer_enabled = session.jitter_buffer_enabled;
+    #[cfg(feature = "local-device")]
     let local_playback_tx = session.local_playback_tx.clone();
+    #[cfg(feature = "local-device")]
     let output_sample_rate = session.output_sample_rate.clone();
+    #[cfg(feature = "local-device")]
     let output_resampler = session.output_resampler.clone();
     tokio::spawn(async move {
         let mut decoder: Option<Box<dyn Decoder + Send>> = None;
@@ -1428,6 +1446,7 @@ fn spawn_track_recorder(
 
                                     let rtp_clock_rate = ct.clock_rate();
 
+                                    #[cfg(feature = "local-device")]
                                     let mut resampler_lock = output_resampler.lock().await;
                                     process_recorded_sample(
                                         sample,
@@ -1437,8 +1456,11 @@ fn spawn_track_recorder(
                                         &mut recorder_resampler,
                                         &mut last_seq,
                                         &mut last_timestamp,
+                                        #[cfg(feature = "local-device")]
                                         &local_playback_tx,
+                                        #[cfg(feature = "local-device")]
                                         &output_sample_rate,
+                                        #[cfg(feature = "local-device")]
                                         &mut *resampler_lock,
                                         rtp_clock_rate,
                                     )
@@ -1486,6 +1508,7 @@ fn spawn_track_recorder(
 
                                     let rtp_clock_rate = ct.clock_rate();
 
+                                    #[cfg(feature = "local-device")]
                                     let mut resampler_lock = output_resampler.lock().await;
                                     process_recorded_sample(
                                         sample,
@@ -1495,8 +1518,11 @@ fn spawn_track_recorder(
                                         &mut recorder_resampler,
                                         &mut last_seq,
                                         &mut last_timestamp,
+                                        #[cfg(feature = "local-device")]
                                         &local_playback_tx,
+                                        #[cfg(feature = "local-device")]
                                         &output_sample_rate,
+                                        #[cfg(feature = "local-device")]
                                         &mut *resampler_lock,
                                         rtp_clock_rate,
                                     )
@@ -1522,8 +1548,11 @@ async fn process_recorded_sample(
     recorder_resampler: &mut Option<Resampler>,
     last_seq: &mut Option<u16>,
     last_timestamp: &mut Option<u32>,
+    #[cfg(feature = "local-device")]
     local_playback_tx: &Mutex<Option<ringbuf::HeapProd<i16>>>,
+    #[cfg(feature = "local-device")]
     output_sample_rate: &std::sync::atomic::AtomicU32,
+    #[cfg(feature = "local-device")]
     output_resampler: &mut Option<audio_codec::Resampler>,
     rtp_clock_rate: u32,
 ) {
@@ -1606,22 +1635,25 @@ async fn process_recorded_sample(
             r.record_rx(&resampled);
         }
 
-        let mut tx = local_playback_tx.lock().await;
-        if let Some(prod) = tx.as_mut() {
-            let target_rate = output_sample_rate.load(std::sync::atomic::Ordering::Relaxed);
-            if target_rate != frame.sample_rate {
-                if output_resampler.is_none() {
-                    *output_resampler = Some(audio_codec::Resampler::new(
-                        frame.sample_rate as usize,
-                        target_rate as usize,
-                    ));
+        #[cfg(feature = "local-device")]
+        {
+            let mut tx = local_playback_tx.lock().await;
+            if let Some(prod) = tx.as_mut() {
+                let target_rate = output_sample_rate.load(std::sync::atomic::Ordering::Relaxed);
+                if target_rate != frame.sample_rate {
+                    if output_resampler.is_none() {
+                        *output_resampler = Some(audio_codec::Resampler::new(
+                            frame.sample_rate as usize,
+                            target_rate as usize,
+                        ));
+                    }
+                    if let Some(resampler) = output_resampler.as_mut() {
+                        let resampled = resampler.resample(&decoded);
+                        let _ = prod.push_slice(&resampled);
+                    }
+                } else {
+                    let _ = prod.push_slice(&decoded);
                 }
-                if let Some(resampler) = output_resampler.as_mut() {
-                    let resampled = resampler.resample(&decoded);
-                    let _ = prod.push_slice(&resampled);
-                }
-            } else {
-                let _ = prod.push_slice(&decoded);
             }
         }
     }
