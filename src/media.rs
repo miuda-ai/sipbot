@@ -1548,12 +1548,9 @@ async fn process_recorded_sample(
     recorder_resampler: &mut Option<Resampler>,
     last_seq: &mut Option<u16>,
     last_timestamp: &mut Option<u32>,
-    #[cfg(feature = "local-device")]
-    local_playback_tx: &Mutex<Option<ringbuf::HeapProd<i16>>>,
-    #[cfg(feature = "local-device")]
-    output_sample_rate: &std::sync::atomic::AtomicU32,
-    #[cfg(feature = "local-device")]
-    output_resampler: &mut Option<audio_codec::Resampler>,
+    #[cfg(feature = "local-device")] local_playback_tx: &Mutex<Option<ringbuf::HeapProd<i16>>>,
+    #[cfg(feature = "local-device")] output_sample_rate: &std::sync::atomic::AtomicU32,
+    #[cfg(feature = "local-device")] output_resampler: &mut Option<audio_codec::Resampler>,
     rtp_clock_rate: u32,
 ) {
     // Validate timestamp continuity and rewrite if needed to fix interleaved streams

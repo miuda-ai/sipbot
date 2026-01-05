@@ -1148,7 +1148,10 @@ impl SipBot {
                                         }
                                         #[cfg(not(feature = "local-device"))]
                                         {
-                                            warn!("[{}] Local device support is disabled in this build, falling back to default answer", username_media);
+                                            warn!(
+                                                "[{}] Local device support is disabled in this build, falling back to default answer",
+                                                username_media
+                                            );
                                             media
                                                 .play_wav_bytes(
                                                     username_media,
