@@ -140,7 +140,7 @@ impl MediaSession {
         external_ip: Option<String>,
         codecs: Option<Vec<String>>,
         stats: Arc<CallStats>,
-    ) -> Result<(Self, String)> {
+    ) -> Result<(Self, String, String)> {
         let mut config = RtcConfiguration::default();
         if let Some(ip) = external_ip {
             config.external_ip = Some(ip);
@@ -176,6 +176,17 @@ impl MediaSession {
             info!("No matching codecs found in offer, falling back to PCMU");
             audio_caps = vec![AudioCapability::pcmu()];
         }
+
+        // Decide sender params based on the best common capability.
+        // We use the first capability because they are ordered by local preference
+        // and we have already filtered them to intersect with the remote offer.
+        let chosen_cap = audio_caps.first().unwrap();
+        let chosen_codec_name = chosen_cap.codec_name.clone();
+        let chosen_params = RtpCodecParameters {
+            payload_type: chosen_cap.payload_type,
+            clock_rate: chosen_cap.clock_rate,
+            channels: chosen_cap.channels,
+        };
 
         config.rtcp_mux_policy = RtcpMuxPolicy::Negotiate;
         config.ice_servers = vec![]; // No STUN/TURN servers
@@ -227,39 +238,6 @@ impl MediaSession {
                 channels: 1,
             };
             pc.add_track(track.clone(), params)?;
-        }
-
-        // Decide sender params based on offer's first audio payload if available,
-        // so our sender uses a payload type/clock that the offerer expects.
-        let mut chosen_params = RtpCodecParameters {
-            payload_type: 0,
-            clock_rate: 8000,
-            channels: 1,
-        };
-        if let Some(mline) = remote_sdp.lines().find(|l| l.starts_with("m=audio")) {
-            // m=audio <port> <proto> <pt> <pt>...
-            for pt_str in mline.split_whitespace().skip(3) {
-                if let Ok(pt) = pt_str.parse::<u8>() {
-                    // look for rtpmap for this payload type
-                    if let Some(rtpmap) = remote_sdp
-                        .lines()
-                        .find(|l| l.starts_with(&format!("a=rtpmap:{} ", pt)))
-                    {
-                        if let Some(spec) = rtpmap.split_whitespace().nth(1) {
-                            let codec = spec.split('/').next().unwrap_or("");
-                            let cr = codec_from_name(codec)
-                                .map(|ct| ct.clock_rate())
-                                .unwrap_or(8000);
-                            chosen_params = RtpCodecParameters {
-                                payload_type: pt,
-                                clock_rate: cr,
-                                channels: 1,
-                            };
-                            break;
-                        }
-                    }
-                }
-            }
         }
 
         // Attach sender so that the PeerConnection has a listener mapping for incoming packets
@@ -344,7 +322,7 @@ impl MediaSession {
             }
         }
 
-        Ok((session, local_sdp))
+        Ok((session, local_sdp, chosen_codec_name))
     }
 
     pub async fn new_offer(
@@ -444,10 +422,44 @@ impl MediaSession {
         ))
     }
 
-    pub async fn set_remote_answer(&self, remote_sdp: &str) -> Result<()> {
+    pub async fn set_remote_answer(&self, remote_sdp: &str) -> Result<String> {
         let remote_desc = SessionDescription::parse(SdpType::Answer, remote_sdp)?;
         self.pc.set_remote_description(remote_desc).await?;
-        Ok(())
+
+        let mut codec_name = "Unknown".to_string();
+        if let Some(mline) = remote_sdp
+            .lines()
+            .find(|l| l.to_lowercase().starts_with("m=audio"))
+        {
+            if let Some(pt_str) = mline.split_whitespace().nth(3) {
+                if let Ok(pt) = pt_str.parse::<u8>() {
+                    let rtpmap_prefix = format!("a=rtpmap:{} ", pt);
+                    if let Some(rtpmap) = remote_sdp.lines().find(|l| l.starts_with(&rtpmap_prefix))
+                    {
+                        if let Some(spec) = rtpmap.split_whitespace().nth(1) {
+                            codec_name = spec.split('/').next().unwrap_or("Unknown").to_uppercase();
+                        }
+                    } else {
+                        codec_name = match pt {
+                            0 => "PCMU",
+                            8 => "PCMA",
+                            9 => "G722",
+                            18 => "G729",
+                            _ => "Unknown",
+                        }
+                        .to_string();
+                    }
+
+                    // Special case for Opus if it wasn't found in rtpmap via simple string match or handled by static map
+                    // (Though Opus should always have rtpmap 111 or similar)
+                    #[cfg(feature = "opus")]
+                    if codec_name == "Unknown" && pt == 111 {
+                        codec_name = "OPUS".to_string();
+                    }
+                }
+            }
+        }
+        Ok(codec_name)
     }
 
     fn spawn_audio_loop(&self, username: String, track: Arc<dyn MediaStreamTrack>) {
@@ -1749,7 +1761,7 @@ mod tests {
         assert!(sdp.to_lowercase().contains("pcmu"));
 
         // Check if we can create an answer session
-        let (_answer_session, answer_sdp) =
+        let (_answer_session, answer_sdp, _) =
             MediaSession::new(&sdp, false, false, false, None, codecs, stats)
                 .await
                 .unwrap();
@@ -1771,7 +1783,7 @@ mod tests {
         assert!(offer_sdp.contains("G729"));
 
         // Answer without specifying codecs (should support all by default now)
-        let (_answerer, answer_sdp) =
+        let (_answerer, answer_sdp, _) =
             MediaSession::new(&offer_sdp, false, false, false, None, None, stats.clone())
                 .await
                 .unwrap();

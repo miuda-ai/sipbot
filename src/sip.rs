@@ -196,8 +196,16 @@ impl CallRunner {
                     "[{}] Received Answer SDP:\n{}",
                     self.account.username, answer_sdp
                 );
-                media_session.set_remote_answer(&answer_sdp).await?;
+                let codec_name = media_session.set_remote_answer(&answer_sdp).await?;
                 info!("[{}] Set remote answer", self.account.username);
+                info!(
+                    "[{}] Call established: From={}, To={}, Preferred Codec={}",
+                    self.account.username, from, to, codec_name
+                );
+                println!(
+                    "[{}] Call established: From={}, To={}, Preferred Codec={}",
+                    self.account.username, from, to, codec_name
+                );
             } else {
                 warn!(
                     "[{}] Call failed with status: {}",
@@ -997,9 +1005,17 @@ impl SipBot {
                         )
                         .await
                         {
-                            Ok((session, sdp)) => {
+                            Ok((session, sdp, codec_name)) => {
                                 media_session = Some(session);
                                 local_sdp = Some(sdp);
+                                info!(
+                                    "[{}] Call established: From={}, To={}, Preferred Codec={}",
+                                    account.username, caller, callee, codec_name
+                                );
+                                println!(
+                                    "[{}] Call established: From={}, To={}, Preferred Codec={}",
+                                    account.username, caller, callee, codec_name
+                                );
                             }
                             Err(e) => {
                                 error!(
