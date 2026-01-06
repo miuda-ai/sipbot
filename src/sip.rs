@@ -167,8 +167,9 @@ impl CallRunner {
                             let dialog = dialog_layer.get_dialog(&dialog_id).expect("dialog not found");
                             should_cancel = false;
                             let _ = dialog.hangup().await;
-                        }else if !cancel_before_ringring && let DialogState::Early(dialog_id, _) = state{
+                        }else if !cancel_before_ringring && let DialogState::Early(mut dialog_id, _) = state{
                             tracing::info!("[{}] Canceling call after ringring", self.account.username);
+                            dialog_id.to_tag.clear();
                             let dialog = dialog_layer.get_dialog(&dialog_id).expect("dialog not found");
                             should_cancel = false;
                             let _ = dialog.hangup().await;
