@@ -954,9 +954,28 @@ impl SipBot {
             let monitor_future = async move {
                 while let Some(state) = rx.recv().await {
                     info!(%state, "[{}] Dialog state changed", username_monitor);
-                    if matches!(state, DialogState::Terminated(..)) {
-                        info!("[{}] Call terminated remotely", username_monitor);
-                        return;
+                    match state {
+                        DialogState::Early(_, _) => {
+                            info!("[{}] Call is ringing", username_monitor);
+                        }
+                        DialogState::Confirmed(_, _) => {
+                            info!("[{}] Call is confirmed", username_monitor);
+                        }
+                        DialogState::Updated(_, _, tx_handle) => {
+                            info!("[{}] Call is updated", username_monitor);
+                            tx_handle.reply(rsip::StatusCode::OK).await.ok();
+                        }
+                        DialogState::Options(_, _, tx_handle) => {
+                            info!("[{}] Call is options", username_monitor);
+                            tx_handle.reply(rsip::StatusCode::OK).await.ok();
+                        }
+                        DialogState::Terminated(..) => {
+                            info!("[{}] Call terminated remotely", username_monitor);
+                            return;
+                        }
+                        _ => {
+                            info!("[{}] Dialog state changed: {}", username_monitor, state);
+                        }
                     }
                 }
             };
