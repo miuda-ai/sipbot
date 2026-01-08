@@ -898,6 +898,8 @@ impl MediaSession {
                 None
             };
 
+            let mut rtp_timestamp: u32 = random_u32();
+
             while let Some(data) = input_rx.recv().await {
                 // Convert f32 to i16 and mix down to mono if needed
                 let mut i16_samples: Vec<i16> =
@@ -924,6 +926,7 @@ impl MediaSession {
                 let sample = MediaSample::Audio(AudioFrame {
                     samples: resampled.len() as u32,
                     sample_rate: target_sample_rate,
+                    rtp_timestamp,
                     data: encoded.into(),
                     ..Default::default()
                 });
@@ -931,6 +934,10 @@ impl MediaSession {
                     error!("[{}] Failed to send mic sample: {:?}", username_input, e);
                     break;
                 }
+
+                let ticks = (resampled.len() as u64 * ct.clock_rate() as u64
+                    / target_sample_rate as u64) as u32;
+                rtp_timestamp = rtp_timestamp.wrapping_add(ticks);
             }
         };
 
