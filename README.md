@@ -1,21 +1,23 @@
 # SipBot
 
+[![Crates.io](https://img.shields.io/crates/v/sipbot.svg)](https://crates.io/crates/sipbot)
+[![Documentation](https://docs.rs/sipbot/badge.svg)](https://docs.rs/sipbot)
+
 A flexible, high-performance SIP bot implementation in Rust, designed for testing and simulating SIP call flows. It uses [rsipstack](https://github.com/restsend/rsipstack) for signaling and supports customizable call handling stages including ringing, answering, media playback, echo, and automatic hangup.
 
 The media transport uses [rustrtc](https://github.com/restsend/rustrtc).
-
 
 ## Features
 
 - **Multi-Account Support**: Configure multiple SIP accounts in a single instance.
 - **Flexible Call Flow Stages**:
-    - **Ringing (Stage 1)**: Send `180 Ringing` or `183 Session Progress` with custom ringback tone (WAV).
-    - **Answer (Stage 2)**: Auto-answer calls with `200 OK`.
-    - **Media Handling**:
-        - **Play**: Play a specified `.wav` file.
-        - **Echo**: Echo received RTP packets back to the sender (Latency testing).
-        - **Local**: Use local audio device for playback and capture (Mic/Speaker).
-    - **Hangup (Stage 3)**: Automatically hang up after a configurable duration or reject calls with specific SIP codes.
+  - **Ringing (Stage 1)**: Send `180 Ringing` or `183 Session Progress` with custom ringback tone (WAV).
+  - **Answer (Stage 2)**: Auto-answer calls with `200 OK`.
+  - **Media Handling**:
+    - **Play**: Play a specified `.wav` file.
+    - **Echo**: Echo received RTP packets back to the sender (Latency testing).
+    - **Local**: Use local audio device for playback and capture (Mic/Speaker).
+  - **Hangup (Stage 3)**: Automatically hang up after a configurable duration or reject calls with specific SIP codes.
 - **Outbound Calls**: Ability to initiate calls to a target URI.
 - **Call Recording**: (Experimental) Record call audio to WAV files. (Requires configuration)
 - **Registration**: Supports SIP registration with authentication (WIP).
@@ -33,13 +35,16 @@ cargo install sipbot
 You can also run `sipbot` with CLI arguments for quick testing.
 
 #### Global Options
+
 - `-C, --conf <FILE>`: Path to the configuration file.
 - `-E, --external <IP>`: External IP address for SDP (NAT traversal).
 
 #### Initiate a Call
+
 ```bash
 cargo run -- call -t sip:user@domain --caller sip:me@mydomain --play audio.wav --hangup 10 --total 10 --concurrent 2
 ```
+
 - `-t, --target <TARGET>`: Target URI (e.g., sip:user@domain).
 - `-c, --caller <URI>`: Caller (username or full URI).
 - `--auth-user <USER>`: Auth username (optional).
@@ -53,9 +58,11 @@ cargo run -- call -t sip:user@domain --caller sip:me@mydomain --play audio.wav -
 - `--concurrent <COUNT>`: Max concurrent calls (default: 1).
 
 #### Wait for Calls
+
 ```bash
 cargo run -- wait --addr 0.0.0.0:5060 --username sipbot --answer welcome.wav
 ```
+
 - `-a, --addr <ADDR>`: Bind address (e.g., 0.0.0.0:5060).
 - `-u, --username <USER>`: Username (e.g., sipbot).
 - `-d, --domain <DOMAIN>`: Domain (e.g., 127.0.0.1).
@@ -72,44 +79,57 @@ cargo run -- wait --addr 0.0.0.0:5060 --username sipbot --answer welcome.wav
 > **Note**: By default, `wait` mode does not record calls. To enable recording, you must use a configuration file and specify the `recorders` directory.
 
 #### Other Commands
+
 - `options`: Send OPTIONS request.
 - `info`: Send INFO request.
 
 ## Typical Usage Examples
 
 ### 1. Echo Test (Latency & Connectivity)
+
 Answer incoming calls and echo the audio back to the caller. This is perfect for testing network latency and packet loss.
+
 ```bash
 sipbot wait --username echo-bot --echo
 ```
 
 ### 2. Intercom Mode (Local Audio)
+
 Use your computer's microphone and speakers to talk to a SIP caller.
+
 ```bash
 sipbot wait --username intercom --local
 ```
 
 ### 3. Automated Announcement
+
 Answer calls, play a welcome message, and hang up after 10 seconds.
+
 ```bash
 sipbot wait --username announcer --answer welcome.wav --hangup 10
 ```
 
 ### 4. Load Testing (Outbound)
+
 Make 100 calls to a target, with 5 calls running concurrently, playing an audio file for 30 seconds each.
+
 ```bash
 sipbot call -t sip:100@192.168.1.10 --play music.wav --total 100 --concurrent 5 --hangup 30
 ```
 
 ### 5. High-Quality Audio (G.722)
+
 SipBot supports G.722 (16kHz) for high-definition audio. It automatically negotiates the best codec.
+
 ```bash
 # Make a call using G.722 if supported by the remote end
 sipbot call -t sip:hd-user@domain --play high_res.wav
 ```
 
 ### 6. Call Recording
+
 Record all incoming calls to a specific directory. (Requires `recorders` path in `config.toml`)
+
 ```bash
 # In config.toml:
 # recorders = "./wavs"
@@ -171,21 +191,21 @@ after_secs = 10                 # Send BYE after 10 seconds
 - **`external_ip`**: (Optional) The external IP address to use in SDP offers/answers (useful for NAT).
 - **`recorders`**: (Optional) Path to save call recordings.
 - **`accounts`**: List of account configurations.
-    - `username`: SIP username.
-    - `domain`: SIP domain/registrar.
-    - `password`: SIP password.
-    - `register`: (Bool) Whether to register with the domain.
-    - `reject_prob`: (Optional) Probability (1-99) to randomly reject incoming calls with 480.
-    - `target`: (Optional) URI to call on startup (for outbound bot).
-    - **`ring`**: Configuration for the ringing phase.
-        - `duration_secs`: How long to stay in ringing state.
-        - `ringback`: (Optional) Path to WAV file for early media (183).
-    - **`answer`**: Configuration for the answered phase.
-        - `action`: `play`, `echo` or `local`.
-        - `wav_file`: Path to WAV file (if action is `play`).
-    - **`hangup`**: Configuration for ending the call.
-        - `code`: SIP status code (used for rejection if no answer config exists).
-        - `after_secs`: (Optional) Time in seconds to wait before sending BYE.
+  - `username`: SIP username.
+  - `domain`: SIP domain/registrar.
+  - `password`: SIP password.
+  - `register`: (Bool) Whether to register with the domain.
+  - `reject_prob`: (Optional) Probability (1-99) to randomly reject incoming calls with 480.
+  - `target`: (Optional) URI to call on startup (for outbound bot).
+  - **`ring`**: Configuration for the ringing phase.
+    - `duration_secs`: How long to stay in ringing state.
+    - `ringback`: (Optional) Path to WAV file for early media (183).
+  - **`answer`**: Configuration for the answered phase.
+    - `action`: `play`, `echo` or `local`.
+    - `wav_file`: Path to WAV file (if action is `play`).
+  - **`hangup`**: Configuration for ending the call.
+    - `code`: SIP status code (used for rejection if no answer config exists).
+    - `after_secs`: (Optional) Time in seconds to wait before sending BYE.
 
 ## Benchmarking and Testing
 
@@ -196,6 +216,7 @@ after_secs = 10                 # Send BYE after 10 seconds
 To run a benchmark, you typically need two instances of `SipBot`: one for caller and another for callee. they will register on sip server with alice and bob respectively.
 
 #### Callee Configuration (`callee.toml`)
+
 This bot listens for incoming calls, rings for a few seconds, and randomly rejects 50% of the calls to test error handling.
 
 ```toml
@@ -218,6 +239,7 @@ duration_secs = 3  # Wait for 3 seconds in ringing state before answering
 ```
 
 #### Caller Configuration (`caller.toml`)
+
 This bot initiates calls to a target, with a 30% chance of canceling the call before it is answered.
 
 ```toml
@@ -248,16 +270,19 @@ code = 486         # currectly not used for caller
 
 1. **Start the Callee**:
    The callee should be running first to receive calls.
+
    ```bash
    cargo run -- wait --conf callee.toml
    ```
 
 2. **Start the Caller**:
    The caller initiates the calls. You can use `--total` and `--concurrent` to control the load.
+
    ```bash
    # Make 100 total calls, with a maximum of 10 calls running concurrently
    sipbot --conf caller.toml call --total 100 --concurrent 3
    ```
+
 ## License
 
 MIT
