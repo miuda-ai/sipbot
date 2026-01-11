@@ -91,7 +91,11 @@ fn get_audio_caps(codecs: &Option<Vec<String>>, nack_enabled: bool) -> Vec<Audio
                             _ => 0,
                         },
                         codec_name: format!("{:?}", ct).to_uppercase(),
-                        clock_rate: ct.samplerate(),
+                        clock_rate: if ct == CodecType::G722 {
+                            16000
+                        } else {
+                            ct.clock_rate()
+                        },
                         channels: ct.channels() as u8,
                         rtcp_fbs: vec!["nack".to_string()],
                         ..Default::default()
@@ -129,6 +133,7 @@ pub struct MediaSession {
     output_sample_rate: Arc<std::sync::atomic::AtomicU32>,
     #[cfg(feature = "local-device")]
     output_resampler: Arc<Mutex<Option<audio_codec::Resampler>>>,
+    tracked_mids: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl MediaSession {
@@ -292,9 +297,10 @@ impl MediaSession {
             #[cfg(feature = "local-device")]
             local_playback_tx: Arc::new(Mutex::new(None)),
             #[cfg(feature = "local-device")]
-            output_sample_rate: Arc::new(std::sync::atomic::AtomicU32::new(8000)),
+            output_sample_rate: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             #[cfg(feature = "local-device")]
             output_resampler: Arc::new(Mutex::new(None)),
+            tracked_mids: Arc::new(Mutex::new(std::collections::HashSet::new())),
         };
 
         // Spawn a background task to listen for incoming track events so there is
@@ -304,6 +310,18 @@ impl MediaSession {
             let pc = bg_session.pc.clone();
             while let Some(event) = pc.recv().await {
                 if let PeerConnectionEvent::Track(transceiver) = event {
+                    let mid = transceiver
+                        .mid()
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    {
+                        let mut mids = bg_session.tracked_mids.lock().await;
+                        if mids.contains(&mid) {
+                            continue;
+                        }
+                        mids.insert(mid);
+                    }
+
                     if let Some(receiver) = transceiver.receiver().as_ref() {
                         spawn_track_recorder(
                             bg_session.clone(),
@@ -318,6 +336,17 @@ impl MediaSession {
         // Also attach recorders for any already-present receivers
         for transceiver in pc.get_transceivers() {
             if let Some(receiver) = transceiver.receiver().as_ref() {
+                let mid = transceiver
+                    .mid()
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
+                {
+                    let mut mids = session.tracked_mids.lock().await;
+                    if mids.contains(&mid) {
+                        continue;
+                    }
+                    mids.insert(mid);
+                }
                 spawn_track_recorder(session.clone(), receiver.track(), CancellationToken::new());
             }
         }
@@ -417,6 +446,7 @@ impl MediaSession {
                 output_sample_rate: Arc::new(std::sync::atomic::AtomicU32::new(8000)),
                 #[cfg(feature = "local-device")]
                 output_resampler: Arc::new(Mutex::new(None)),
+                tracked_mids: Arc::new(Mutex::new(std::collections::HashSet::new())),
             },
             local_sdp,
         ))
@@ -750,8 +780,36 @@ impl MediaSession {
             .default_output_device()
             .context("No output device found")?;
 
-        let input_config: cpal::StreamConfig = input_device.default_input_config()?.into();
-        let output_config: cpal::StreamConfig = output_device.default_output_config()?.into();
+        let input_config = input_device.default_input_config()?;
+        let output_config = output_device.default_output_config()?;
+
+        // Try to find a 48000Hz config if possible for both input and output
+        #[cfg(target_os = "macos")]
+        let requested_rate = 48000;
+        #[cfg(not(target_os = "macos"))]
+        let requested_rate = 48000;
+
+        let input_config: cpal::StreamConfig = match input_device.supported_input_configs() {
+            Ok(configs) => configs
+                .filter(|c| c.channels() <= 2) // Prefer mono or stereo
+                .find(|c| {
+                    c.max_sample_rate() >= requested_rate && c.min_sample_rate() <= requested_rate
+                })
+                .map(|c| c.with_sample_rate(requested_rate).into())
+                .unwrap_or_else(|| input_config.into()),
+            Err(_) => input_config.into(),
+        };
+
+        let output_config: cpal::StreamConfig = match output_device.supported_output_configs() {
+            Ok(configs) => configs
+                .filter(|c| c.channels() <= 2)
+                .find(|c| {
+                    c.max_sample_rate() >= requested_rate && c.min_sample_rate() <= requested_rate
+                })
+                .map(|c| c.with_sample_rate(requested_rate).into())
+                .unwrap_or_else(|| output_config.into()),
+            Err(_) => output_config.into(),
+        };
 
         self.output_sample_rate.store(
             output_config.sample_rate,
@@ -761,7 +819,8 @@ impl MediaSession {
         let output_channels = output_config.channels as usize;
 
         // Setup output buffer (RTP -> Speaker)
-        let rb = HeapRb::<i16>::new(output_config.sample_rate as usize * 2);
+        // Buffer size: 500ms for extra safety against jitter
+        let rb = HeapRb::<i16>::new(output_config.sample_rate as usize / 2);
         let (prod, mut cons) = rb.split();
 
         {
@@ -775,21 +834,53 @@ impl MediaSession {
         let input_sample_rate = input_config.sample_rate;
         let input_channels = input_config.channels;
 
-        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<Vec<f32>>(100);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<Vec<f32>>(500);
 
         // Move stream creation to a separate thread to avoid Send issues with cpal::Stream on some platforms
         let (stream_stop_tx, stream_stop_rx) = std::sync::mpsc::channel();
         let (init_tx, init_rx) = tokio::sync::oneshot::channel::<Result<()>>();
 
         std::thread::spawn(move || {
+            let mut is_playing = false;
+            let pre_roll_samples = (output_config.sample_rate as usize / 10).max(480); // 100ms or at least 10ms frame
+
             let output_stream_res = output_device.build_output_stream(
                 &output_config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    if !is_playing {
+                        if cons.occupied_len() >= pre_roll_samples {
+                            is_playing = true;
+                            tracing::debug!(
+                                "Local playback started (buffer: {} samples)",
+                                cons.occupied_len()
+                            );
+                        } else {
+                            data.fill(0.0);
+                            return;
+                        }
+                    }
+
+                    if cons.occupied_len() == 0 {
+                        is_playing = false;
+                        tracing::warn!("Local playback underrun! Buffer empty.");
+                        data.fill(0.0);
+                        return;
+                    }
+
                     for frame in data.chunks_mut(output_channels) {
-                        let sample = cons.try_pop().unwrap_or(0);
-                        let f_sample = sample as f32 / 32768.0;
-                        for s in frame.iter_mut() {
-                            *s = f_sample;
+                        match cons.try_pop() {
+                            Some(sample) => {
+                                let f_sample = sample as f32 / 32768.0;
+                                for s in frame.iter_mut() {
+                                    *s = f_sample;
+                                }
+                            }
+                            None => {
+                                // This shouldn't happen during chunk processing if occupied_len was > 0
+                                for s in frame.iter_mut() {
+                                    *s = 0.0;
+                                }
+                            }
                         }
                     }
                 },
@@ -856,15 +947,44 @@ impl MediaSession {
         let transceivers = pc.get_transceivers();
         for transceiver in transceivers {
             if let Some(receiver) = transceiver.receiver().as_ref() {
+                let mid = transceiver
+                    .mid()
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
+                {
+                    let mut mids = self.tracked_mids.lock().await;
+                    if mids.contains(&mid) {
+                        continue;
+                    }
+                    mids.insert(mid);
+                }
                 spawn_track_recorder(self.clone(), receiver.track(), child_token.clone());
             }
         }
 
+        let username_rx = username.clone();
         let session_rx = self.clone();
         let session_input_clone = self.clone();
         let rx_task = async move {
             while let Some(event) = pc.recv().await {
                 if let PeerConnectionEvent::Track(transceiver) = event {
+                    let mid = transceiver
+                        .mid()
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    {
+                        let mut mids = session_rx.tracked_mids.lock().await;
+                        if mids.contains(&mid) {
+                            tracing::debug!(
+                                "[{}] Track {} already being recorded, skipping",
+                                username_rx,
+                                mid
+                            );
+                            continue;
+                        }
+                        mids.insert(mid);
+                    }
+
                     if let Some(receiver) = transceiver.receiver().as_ref() {
                         spawn_track_recorder(
                             session_rx.clone(),
@@ -886,6 +1006,7 @@ impl MediaSession {
             let ct = get_codec_type(pt, &session_input_clone.pc.config().media_capabilities);
 
             let target_sample_rate = ct.samplerate();
+            let target_channels = ct.channels();
 
             let mut encoder = audio_codec::create_encoder(ct);
 
@@ -899,45 +1020,71 @@ impl MediaSession {
             };
 
             let mut rtp_timestamp: u32 = random_u32();
+            let samples_per_frame = (target_sample_rate / 50) as usize; // 20ms
+            let mut input_buffer: Vec<i16> =
+                Vec::with_capacity(samples_per_frame * target_channels as usize);
 
             while let Some(data) = input_rx.recv().await {
-                // Convert f32 to i16 and mix down to mono if needed
-                let mut i16_samples: Vec<i16> =
+                // Convert f32 to i16 and mix down to mono if multiple mic channels
+                // (Most mic inputs are mono or handled as mono here)
+                let mut mono_samples: Vec<i16> =
                     Vec::with_capacity(data.len() / input_channels as usize);
                 if input_channels == 1 {
                     for &s in &data {
-                        i16_samples.push((s * 32767.0) as i16);
+                        // Clamp to avoid overflow noise
+                        let sample = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                        mono_samples.push(sample);
                     }
                 } else {
                     for chunk in data.chunks(input_channels as usize) {
-                        let sum: f32 = chunk.iter().sum();
-                        i16_samples.push(((sum / input_channels as f32) * 32767.0) as i16);
+                        let avg: f32 = chunk.iter().sum::<f32>() / input_channels as f32;
+                        let sample = (avg * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                        mono_samples.push(sample);
                     }
                 }
 
                 let resampled = if let Some(r) = resampler.as_mut() {
-                    r.resample(&i16_samples)
+                    r.resample(&mono_samples)
                 } else {
-                    i16_samples
+                    mono_samples
                 };
 
-                let encoded = encoder.encode(&resampled);
-                stats.inc_tx(1, encoded.len() as u64);
-                let sample = MediaSample::Audio(AudioFrame {
-                    samples: resampled.len() as u32,
-                    sample_rate: target_sample_rate,
-                    rtp_timestamp,
-                    data: encoded.into(),
-                    ..Default::default()
-                });
-                if let Err(e) = audio_source.send(sample).await {
-                    error!("[{}] Failed to send mic sample: {:?}", username_input, e);
-                    break;
+                // Expand to negotiated channels if needed (Mono to Stereo)
+                if target_channels == 2 {
+                    for &s in &resampled {
+                        input_buffer.push(s);
+                        input_buffer.push(s);
+                    }
+                } else {
+                    input_buffer.extend(resampled);
                 }
 
-                let ticks = (resampled.len() as u64 * ct.clock_rate() as u64
-                    / target_sample_rate as u64) as u32;
-                rtp_timestamp = rtp_timestamp.wrapping_add(ticks);
+                while input_buffer.len() >= samples_per_frame * target_channels as usize {
+                    let frame: Vec<i16> = input_buffer
+                        .drain(0..samples_per_frame * target_channels as usize)
+                        .collect();
+                    let encoded = encoder.encode(&frame);
+                    if encoded.is_empty() {
+                        continue;
+                    }
+
+                    stats.inc_tx(1, encoded.len() as u64);
+                    let sample = MediaSample::Audio(AudioFrame {
+                        samples: samples_per_frame as u32,
+                        sample_rate: target_sample_rate,
+                        rtp_timestamp,
+                        data: encoded.into(),
+                        ..Default::default()
+                    });
+                    if let Err(e) = audio_source.send(sample).await {
+                        error!("[{}] Failed to send mic sample: {:?}", username_input, e);
+                        return;
+                    }
+
+                    let ticks = (samples_per_frame as u64 * ct.clock_rate() as u64
+                        / target_sample_rate as u64) as u32;
+                    rtp_timestamp = rtp_timestamp.wrapping_add(ticks);
+                }
             }
         };
 
@@ -1022,6 +1169,17 @@ impl MediaSession {
                     username,
                     receiver.track().id()
                 );
+                let mid = transceiver
+                    .mid()
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
+                {
+                    let mut mids = self.tracked_mids.lock().await;
+                    if mids.contains(&mid) {
+                        continue;
+                    }
+                    mids.insert(mid);
+                }
                 spawn_track_recorder(self.clone(), receiver.track(), child_token.clone());
             } else {
                 info!("[{}] Transceiver has NO receiver", username);
@@ -1034,6 +1192,22 @@ impl MediaSession {
             while let Some(event) = pc.recv().await {
                 if let PeerConnectionEvent::Track(transceiver) = event {
                     info!("[{}] Received PC event: Track", username_rx);
+                    let mid = transceiver
+                        .mid()
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    {
+                        let mut mids = session_rx.tracked_mids.lock().await;
+                        if mids.contains(&mid) {
+                            tracing::debug!(
+                                "[{}] Track {} already being recorded, skipping",
+                                username_rx,
+                                mid
+                            );
+                            continue;
+                        }
+                        mids.insert(mid);
+                    }
                     if let Some(receiver) = transceiver.receiver().as_ref() {
                         spawn_track_recorder(
                             session_rx.clone(),
@@ -1139,6 +1313,17 @@ impl MediaSession {
                     i,
                     receiver.track().id()
                 );
+                let mid = transceiver
+                    .mid()
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
+                {
+                    let mut mids = self.tracked_mids.lock().await;
+                    if mids.contains(&mid) {
+                        continue;
+                    }
+                    mids.insert(mid);
+                }
                 spawn_track_recorder(self.clone(), receiver.track(), child_token.clone());
             } else {
                 info!("[{}] Transceiver {} has NO receiver", username, i);
@@ -1146,9 +1331,27 @@ impl MediaSession {
         }
 
         let session_rx = self.clone();
+        let username_rx = username.clone();
         let rx_task = async move {
             while let Some(event) = pc.recv().await {
                 if let PeerConnectionEvent::Track(transceiver) = event {
+                    let mid = transceiver
+                        .mid()
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    {
+                        let mut mids = session_rx.tracked_mids.lock().await;
+                        if mids.contains(&mid) {
+                            tracing::debug!(
+                                "[{}] Track {} already being recorded, skipping",
+                                username_rx,
+                                mid
+                            );
+                            continue;
+                        }
+                        mids.insert(mid);
+                    }
+
                     if let Some(receiver) = transceiver.receiver().as_ref() {
                         spawn_track_recorder(
                             session_rx.clone(),
@@ -1198,8 +1401,10 @@ impl MediaSession {
         let ct = get_codec_type(pt, &self.pc.config().media_capabilities);
 
         let sample_rate = ct.samplerate();
+        let clock_rate = ct.clock_rate();
+        let channels = ct.channels();
         let mut encoder = audio_codec::create_encoder(ct);
-        let payload_type = match ct {
+        let payload_type = pt.unwrap_or(match ct {
             CodecType::PCMU => 0,
             CodecType::PCMA => 8,
             CodecType::G722 => 9,
@@ -1207,12 +1412,13 @@ impl MediaSession {
             #[cfg(feature = "opus")]
             CodecType::Opus => 111,
             _ => 0,
-        };
+        });
 
         let mut ticker = interval(Duration::from_millis(20));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         let chunk_size = (sample_rate / 50) as usize; // 20ms
-        let mut rtp_timestamp = 0;
-        let total_chunks = samples.chunks(chunk_size).count();
+        let mut rtp_timestamp: u32 = random_u32();
         let mut sent_chunks = 0;
 
         let mut recorder_resampler = if sample_rate != 16000 {
@@ -1221,46 +1427,86 @@ impl MediaSession {
             None
         };
 
+        let total_chunks = (samples.len() + chunk_size - 1) / chunk_size;
+
         info!(
-            "[{}] Playback started: {} samples ({} chunks) using {:?} at {}Hz",
+            "[{}] Playback started: {} samples ({} chunks) using {:?} at {}Hz (clock {}Hz, pt={})",
             username,
             samples.len(),
             total_chunks,
             ct,
-            sample_rate
+            sample_rate,
+            clock_rate,
+            payload_type
         );
+
+        // Recording background task to avoid blocking the main loop
+        let recorder_clone = self.recorder.clone();
+        let (rec_tx, mut rec_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<i16>>();
+        let rec_handle = tokio::spawn(async move {
+            while let Some(data) = rec_rx.recv().await {
+                let rec = recorder_clone.lock().await;
+                if let Some(r) = rec.as_ref() {
+                    r.record_tx(&data);
+                }
+            }
+        });
 
         for chunk in samples.chunks(chunk_size) {
             ticker.tick().await;
 
-            // Record TX
-            {
-                let rec = self.recorder.lock().await;
-                if let Some(r) = rec.as_ref() {
-                    let resampled = if let Some(resampler) = recorder_resampler.as_mut() {
-                        resampler.resample(chunk)
-                    } else {
-                        chunk.to_vec()
-                    };
-                    r.record_tx(&resampled);
+            let final_chunk = if chunk.len() == chunk_size {
+                chunk.to_vec()
+            } else {
+                let mut v = chunk.to_vec();
+                v.resize(chunk_size, 0);
+                v
+            };
+
+            // Send to recorder (non-blocking)
+            let recorder_samples = if let Some(resampler) = recorder_resampler.as_mut() {
+                resampler.resample(&final_chunk)
+            } else {
+                final_chunk.clone()
+            };
+            let _ = rec_tx.send(recorder_samples);
+
+            let audio_to_encode = if channels == 2 {
+                let mut stereo = Vec::with_capacity(final_chunk.len() * 2);
+                for &s in &final_chunk {
+                    stereo.push(s);
+                    stereo.push(s);
                 }
+                stereo
+            } else {
+                final_chunk
+            };
+
+            let encoded = encoder.encode(&audio_to_encode);
+            if encoded.is_empty() {
+                continue;
             }
 
-            let encoded = encoder.encode(chunk);
             self.stats.inc_tx(1, encoded.len() as u64);
 
             let frame = AudioFrame {
                 data: Bytes::from(encoded),
-                sample_rate,
-                channels: 1,
-                samples: chunk.len() as u32,
+                sample_rate: clock_rate,
+                channels: channels as u8,
+                samples: (chunk_size as u64 * clock_rate as u64 / sample_rate as u64) as u32,
                 rtp_timestamp,
                 payload_type: Some(payload_type),
                 sequence_number: None,
             };
-            rtp_timestamp += chunk.len() as u32;
 
-            self.audio_source.send_audio(frame).await?;
+            let ticks = (chunk_size as u64 * clock_rate as u64 / sample_rate as u64) as u32;
+            rtp_timestamp = rtp_timestamp.wrapping_add(ticks);
+
+            if let Err(e) = self.audio_source.send_audio(frame).await {
+                error!("[{}] Failed to send audio: {:?}", username, e);
+                break;
+            }
+
             sent_chunks += 1;
             if sent_chunks % 100 == 0 {
                 info!(
@@ -1269,6 +1515,10 @@ impl MediaSession {
                 );
             }
         }
+
+        drop(rec_tx);
+        let _ = rec_handle.await;
+
         info!("[{}] Playback finished successfully", username);
         Ok(())
     }
@@ -1285,21 +1535,48 @@ impl MediaSession {
         );
         for transceiver in transceivers {
             if let Some(receiver) = transceiver.receiver().as_ref() {
+                let mid = transceiver
+                    .mid()
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
+                {
+                    let mut mids = self.tracked_mids.lock().await;
+                    if mids.contains(&mid) {
+                        continue;
+                    }
+                    mids.insert(mid);
+                }
                 self.spawn_audio_loop(username.clone(), receiver.track());
             }
         }
 
+        let session_rx = self.clone();
+        let username_rx = username.clone();
         while let Some(event) = self.pc.recv().await {
             match event {
                 PeerConnectionEvent::Track(transceiver) => {
-                    let mid = transceiver.mid();
-                    info!("[{}] Received PC event: Track (mid: {:?})", username, mid);
+                    let mid = transceiver
+                        .mid()
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    {
+                        let mut mids = session_rx.tracked_mids.lock().await;
+                        if mids.contains(&mid) {
+                            tracing::debug!(
+                                "[{}] Track {} already being recorded, skipping",
+                                username_rx,
+                                mid
+                            );
+                            continue;
+                        }
+                        mids.insert(mid);
+                    }
                     if let Some(receiver) = transceiver.receiver().as_ref() {
-                        self.spawn_audio_loop(username.clone(), receiver.track());
+                        self.spawn_audio_loop(username_rx.clone(), receiver.track());
                     }
                 }
                 _ => {
-                    info!("[{}] Received PC event: Other", username);
+                    info!("[{}] Received PC event: Other", username_rx);
                 }
             }
         }
@@ -1372,7 +1649,7 @@ fn resample_audio(
         return Ok(samples);
     }
 
-    // Convert to f32 and mix down to mono
+    // Convert to f32 and mix down to mono with safe clamping
     let mut mono_samples: Vec<f32> = Vec::with_capacity(samples.len() / channels as usize);
     if channels == 1 {
         for s in samples {
@@ -1384,7 +1661,20 @@ fn resample_audio(
             mono_samples.push(sum / channels as f32);
         }
     }
-    let samples_i16: Vec<i16> = mono_samples.into_iter().map(|s| s as i16).collect();
+
+    let samples_i16: Vec<i16> = mono_samples
+        .into_iter()
+        .map(|s| {
+            if s > 32767.0 {
+                32767
+            } else if s < -32768.0 {
+                -32768
+            } else {
+                s as i16
+            }
+        })
+        .collect();
+
     if source_rate == target_rate {
         return Ok(samples_i16);
     }
@@ -1441,18 +1731,23 @@ fn spawn_track_recorder(
                                 if current_pt != frame.payload_type {
                                     current_pt = frame.payload_type;
                                     if let Some(pt) = current_pt {
-                                            let ct = get_codec_type(Some(pt), &session.pc.config().media_capabilities);
-                                            let d = audio_codec::create_decoder(ct);
-                                            decoder = Some(d);
-                                            let rate = ct.samplerate();
-                                            if rate != 16000 {
-                                                recorder_resampler = Some(Resampler::new(rate as usize, 16000));
-                                            } else {
-                                                recorder_resampler = None;
-                                            }
+                                        #[cfg(feature = "local-device")]
+                                        {
+                                            let mut res_lock = output_resampler.lock().await;
+                                            *res_lock = None;
+                                        }
+                                        let ct = get_codec_type(Some(pt), &session.pc.config().media_capabilities);
+                                        let d = audio_codec::create_decoder(ct);
+                                        decoder = Some(d);
+                                        let rate = ct.samplerate();
+                                        if rate != 16000 {
+                                            recorder_resampler = Some(Resampler::new(rate as usize, 16000));
+                                        } else {
+                                            recorder_resampler = None;
                                         }
                                     }
                                 }
+                            }
 
                                 if let Some(ref mut dec) = decoder {
                                     let ct = if let MediaSample::Audio(ref mut frame) = sample {
@@ -1464,6 +1759,7 @@ fn spawn_track_recorder(
                                     };
 
                                     let rtp_clock_rate = ct.clock_rate();
+                                    let channels = ct.channels();
 
                                     #[cfg(feature = "local-device")]
                                     let mut resampler_lock = output_resampler.lock().await;
@@ -1482,6 +1778,7 @@ fn spawn_track_recorder(
                                         #[cfg(feature = "local-device")]
                                         &mut *resampler_lock,
                                         rtp_clock_rate,
+                                        channels,
                                     )
                                     .await;
                                 }
@@ -1503,6 +1800,11 @@ fn spawn_track_recorder(
                                     if current_pt != frame.payload_type {
                                         current_pt = frame.payload_type;
                                         if let Some(pt) = current_pt {
+                                            #[cfg(feature = "local-device")]
+                                            {
+                                                let mut res_lock = output_resampler.lock().await;
+                                                *res_lock = None;
+                                            }
                                             let ct = get_codec_type(Some(pt), &session.pc.config().media_capabilities);
                                             let d = audio_codec::create_decoder(ct);
                                             decoder = Some(d);
@@ -1526,6 +1828,7 @@ fn spawn_track_recorder(
                                     };
 
                                     let rtp_clock_rate = ct.clock_rate();
+                                    let channels = ct.channels();
 
                                     #[cfg(feature = "local-device")]
                                     let mut resampler_lock = output_resampler.lock().await;
@@ -1544,6 +1847,7 @@ fn spawn_track_recorder(
                                         #[cfg(feature = "local-device")]
                                         &mut *resampler_lock,
                                         rtp_clock_rate,
+                                        channels,
                                     )
                                     .await;
                                 }
@@ -1571,6 +1875,7 @@ async fn process_recorded_sample(
     #[cfg(feature = "local-device")] output_sample_rate: &std::sync::atomic::AtomicU32,
     #[cfg(feature = "local-device")] output_resampler: &mut Option<audio_codec::Resampler>,
     rtp_clock_rate: u32,
+    channels: u16,
 ) {
     // Validate timestamp continuity and rewrite if needed to fix interleaved streams
     if let MediaSample::Audio(ref mut frame) = sample {
@@ -1622,10 +1927,16 @@ async fn process_recorded_sample(
                     let diff = seq.wrapping_sub(last) as i16;
 
                     if diff > 1 {
+                        tracing::warn!(
+                            "Sequence gap detected: last={} current={} gap={}",
+                            last,
+                            seq,
+                            diff - 1
+                        );
                         stats.inc_rx_lost((diff - 1) as u64);
                         *last_seq = Some(seq);
                     } else if diff < 0 {
-                        // Out of order packet
+                        tracing::debug!("Out of order packet: last={} current={}", last, seq);
                     }
                 } else {
                     *last_seq = Some(seq);
@@ -1640,6 +1951,18 @@ async fn process_recorded_sample(
 
         stats.inc_rx(1, frame.data.len() as u64);
         let decoded = decoder.decode(&frame.data);
+
+        if frame.sequence_number.unwrap_or(0) % 100 == 0 {
+            tracing::debug!(
+                "RX Audio: seq={:?} pt={} rate={} rtp_samples={} decoded_len={} data_len={}",
+                frame.sequence_number,
+                frame.payload_type.unwrap_or(0),
+                frame.sample_rate,
+                frame.samples,
+                decoded.len(),
+                frame.data.len()
+            );
+        }
 
         let rec = recorder.lock().await;
         if let Some(r) = rec.as_ref() {
@@ -1656,19 +1979,97 @@ async fn process_recorded_sample(
             let mut tx = local_playback_tx.lock().await;
             if let Some(prod) = tx.as_mut() {
                 let target_rate = output_sample_rate.load(std::sync::atomic::Ordering::Relaxed);
-                if target_rate != frame.sample_rate {
-                    if output_resampler.is_none() {
-                        *output_resampler = Some(audio_codec::Resampler::new(
-                            frame.sample_rate as usize,
-                            target_rate as usize,
-                        ));
+                if target_rate > 0 {
+                    // Mix to mono if stereo
+                    // Note: 'channels' refers to the negotiated codec channels.
+                    // For Opus, it is often 2 in SDP but the decoder might return mono (1 channel).
+                    // We check if the decoded length is twice the expected mono samples for 20ms (standard frame).
+                    // If it's just one-channel's worth of samples, we don't mix.
+                    let mono_decoded = if channels == 2
+                        && decoded.len() % 2 == 0
+                        && decoded.len() > (frame.sample_rate as usize / 50)
+                    {
+                        let mut mono = Vec::with_capacity(decoded.len() / 2);
+                        for chunk in decoded.chunks(2) {
+                            let sum: i32 = chunk.iter().map(|&s| s as i32).sum();
+                            mono.push((sum / 2) as i16);
+                        }
+                        mono
+                    } else {
+                        decoded
+                    };
+
+                    if target_rate != frame.sample_rate {
+                        // Check if we need to recreate the resampler
+                        let need_new = match output_resampler.as_ref() {
+                            Some(_) => {
+                                // For now, we don't have a way to check existing resampler rates.
+                                // But if it's already there, we check if the PT (and thus input rate) changed
+                                // Actually, it's safer to just check if source/target rate changed if we can.
+                                // Since we don't have access to resampler internals, we rely on the caller reset.
+                                false
+                            }
+                            None => true,
+                        };
+
+                        // We reset the resampler if it's None or if the source rate doesn't match
+                        // Wait, we need to store the current source rate to detect change.
+                        // Let's use a simpler approach: recreate it if it's the first time
+                        // or if we detect a change in pt (handled in spawn_track_recorder).
+
+                        if need_new {
+                            *output_resampler = Some(audio_codec::Resampler::new(
+                                frame.sample_rate as usize,
+                                target_rate as usize,
+                            ));
+                        }
+
+                        if let Some(resampler) = output_resampler.as_mut() {
+                            let resampled = resampler.resample(&mono_decoded);
+                            // Push the slice. If it's full, we just drop to avoid blocking the RX task.
+                            let capacity = prod.capacity();
+                            let occupied = prod.occupied_len();
+                            let pushed = prod.push_slice(&resampled);
+
+                            if pushed < resampled.len() {
+                                tracing::warn!(
+                                    "Local playback buffer full! ({} / {}), dropped {} output samples",
+                                    occupied,
+                                    capacity,
+                                    resampled.len() - pushed
+                                );
+                            } else if occupied > capacity.get() * 8 / 10 {
+                                tracing::debug!(
+                                    "Local playback buffer high: {} / {}",
+                                    occupied,
+                                    capacity
+                                );
+                            }
+                        }
+                    } else {
+                        // If no resampling needed, clear the old resampler if any
+                        if output_resampler.is_some() {
+                            *output_resampler = None;
+                        }
+                        let capacity = prod.capacity();
+                        let occupied = prod.occupied_len();
+                        let pushed = prod.push_slice(&mono_decoded);
+
+                        if pushed < mono_decoded.len() {
+                            tracing::warn!(
+                                "Local playback buffer full! ({} / {}), dropped {} output samples",
+                                occupied,
+                                capacity,
+                                mono_decoded.len() - pushed
+                            );
+                        } else if occupied > capacity.get() * 8 / 10 {
+                            tracing::debug!(
+                                "Local playback buffer high: {} / {}",
+                                occupied,
+                                capacity
+                            );
+                        }
                     }
-                    if let Some(resampler) = output_resampler.as_mut() {
-                        let resampled = resampler.resample(&decoded);
-                        let _ = prod.push_slice(&resampled);
-                    }
-                } else {
-                    let _ = prod.push_slice(&decoded);
                 }
             }
         }
