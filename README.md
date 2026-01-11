@@ -191,21 +191,25 @@ after_secs = 10                 # Send BYE after 10 seconds
 - **`external_ip`**: (Optional) The external IP address to use in SDP offers/answers (useful for NAT).
 - **`recorders`**: (Optional) Path to save call recordings.
 - **`accounts`**: List of account configurations.
-  - `username`: SIP username.
-  - `domain`: SIP domain/registrar.
-  - `password`: SIP password.
-  - `register`: (Bool) Whether to register with the domain.
-  - `reject_prob`: (Optional) Probability (1-99) to randomly reject incoming calls with 480.
-  - `target`: (Optional) URI to call on startup (for outbound bot).
-  - **`ring`**: Configuration for the ringing phase.
-    - `duration_secs`: How long to stay in ringing state.
-    - `ringback`: (Optional) Path to WAV file for early media (183).
-  - **`answer`**: Configuration for the answered phase.
-    - `action`: `play`, `echo` or `local`.
-    - `wav_file`: Path to WAV file (if action is `play`).
-  - **`hangup`**: Configuration for ending the call.
-    - `code`: SIP status code (used for rejection if no answer config exists).
-    - `after_secs`: (Optional) Time in seconds to wait before sending BYE.
+    - `username`: SIP username.
+    - `domain`: SIP domain/registrar.
+    - `password`: SIP password.
+    - `register`: (Bool) Whether to register with the domain.
+    - `reject_prob`: (Optional) Probability (1-99) to randomly reject incoming calls with 480.
+    - `target`: (Optional) URI to call on startup (for outbound bot).
+    - **`early_media`**: Configuration for the early media phase (183).
+        - `wav_file`: (Optional) Path to WAV file.
+        - `local`: (Optional) `true` to use local audio device for capture and playback.
+    - **`ring`**: Configuration for the ringing phase.
+        - `duration_secs`: How long to stay in ringing state.
+        - `ringback`: (Optional) Path to WAV file for early media (183).
+        - `local`: (Optional) `true` to use local audio device for capture and playback.
+    - **`answer`**: Configuration for the answered phase.
+        - `action`: `play`, `echo` or `local`.
+        - `wav_file`: Path to WAV file (if action is `play`).
+    - **`hangup`**: Configuration for ending the call.
+        - `code`: SIP status code (used for rejection if no answer config exists).
+        - `after_secs`: (Optional) Time in seconds to wait before sending BYE.
 
 ## Benchmarking and Testing
 

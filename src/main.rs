@@ -269,6 +269,7 @@ async fn main() -> Result<()> {
                     Some(sipbot::config::RingConfig {
                         duration_secs: ring_duration.unwrap_or(5),
                         ringback: ringback.clone(),
+                        local: Some(*local),
                     })
                 } else {
                     None

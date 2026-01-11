@@ -54,13 +54,15 @@ pub struct AccountConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct EarlyMediaConfig {
-    pub wav_file: String,
+    pub wav_file: Option<String>,
+    pub local: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct RingConfig {
     pub duration_secs: u64,
     pub ringback: Option<String>, // Optional wav file for 183, otherwise 180
+    pub local: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

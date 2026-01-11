@@ -1053,11 +1053,79 @@ impl SipBot {
                     }
                 }
 
-                if let Some(ref cfg) = account.ring {
-                    if let Some(ref wav) = cfg.ringback {
+                // Stage 0: Early Media (183)
+                if let Some(ref early) = account.early_media {
+                    let play_local = early.local.unwrap_or(false);
+                    let wav_file = early.wav_file.as_deref();
+
+                    if play_local || wav_file.is_some() {
                         info!(
-                            "[{}] Stage 1: Ringing with media (183) - Playing {}",
-                            account.username, wav
+                            "[{}] Stage 0: Early Media (183) - {}",
+                            account.username,
+                            if play_local {
+                                "Local Device".to_string()
+                            } else {
+                                format!("Playing {}", wav_file.unwrap_or(""))
+                            }
+                        );
+
+                        // Send 183 with SDP if we have local SDP
+                        if let Some(sdp) = local_sdp.as_ref() {
+                            let headers = vec![Header::ContentType("application/sdp".into())];
+                            if let Err(e) = server_dialog_clone
+                                .ringing(Some(headers), Some(sdp.clone().into_bytes()))
+                            {
+                                error!("Early ring error: {:?}", e);
+                            }
+                        }
+
+                        if let Some(media) = &mut media_session {
+                            if play_local {
+                                #[cfg(feature = "local-device")]
+                                {
+                                    if let Err(e) = media
+                                        .play_local_device(account.username.clone(), None, false)
+                                        .await
+                                    {
+                                        error!(
+                                            "Failed to play local device in early media: {:?}",
+                                            e
+                                        );
+                                    }
+                                }
+                                #[cfg(not(feature = "local-device"))]
+                                {
+                                    error!("Local device support is disabled in this build");
+                                }
+                            } else if let Some(wav) = wav_file {
+                                if let Err(e) = media
+                                    .play_file(
+                                        account.username.clone(),
+                                        std::path::Path::new(wav),
+                                        None,
+                                        false,
+                                    )
+                                    .await
+                                {
+                                    error!("Failed to play early media file: {:?}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Stage 1: Ringing (Wait with optional Ringing/Ringback)
+                if let Some(ref cfg) = account.ring {
+                    let play_local = cfg.local.unwrap_or(false);
+                    if play_local || cfg.ringback.is_some() {
+                        info!(
+                            "[{}] Stage 1: Ringing with media (183) - {}",
+                            account.username,
+                            if play_local {
+                                "Local Device".to_string()
+                            } else {
+                                format!("Playing {}", cfg.ringback.as_deref().unwrap_or(""))
+                            }
                         );
 
                         // Send 183 with SDP if we have local SDP
@@ -1077,17 +1145,38 @@ impl SipBot {
                         }
 
                         if let Some(media) = &mut media_session {
-                            // Play file with timeout
-                            let _ = tokio::time::timeout(
-                                Duration::from_secs(cfg.duration_secs),
-                                media.play_file(
-                                    account.username.clone(),
-                                    std::path::Path::new(wav),
-                                    None,
-                                    false,
-                                ),
-                            )
-                            .await;
+                            if play_local {
+                                #[cfg(feature = "local-device")]
+                                {
+                                    let _ = tokio::time::timeout(
+                                        Duration::from_secs(cfg.duration_secs),
+                                        media.play_local_device(
+                                            account.username.clone(),
+                                            None,
+                                            false,
+                                        ),
+                                    )
+                                    .await;
+                                }
+                                #[cfg(not(feature = "local-device"))]
+                                {
+                                    error!("Local device support is disabled in this build");
+                                    tokio::time::sleep(Duration::from_secs(cfg.duration_secs))
+                                        .await;
+                                }
+                            } else if let Some(wav) = cfg.ringback.as_ref() {
+                                // Play file with timeout
+                                let _ = tokio::time::timeout(
+                                    Duration::from_secs(cfg.duration_secs),
+                                    media.play_file(
+                                        account.username.clone(),
+                                        std::path::Path::new(wav),
+                                        None,
+                                        false,
+                                    ),
+                                )
+                                .await;
+                            }
                         } else {
                             tokio::time::sleep(Duration::from_secs(cfg.duration_secs)).await;
                         }
