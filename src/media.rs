@@ -270,7 +270,7 @@ impl MediaSession {
 
         pc.wait_for_gathering_complete().await;
 
-        let answer = pc.create_answer()?;
+        let answer = pc.create_answer().await?;
         let sdp_str = answer.to_sdp_string();
         let answer = SessionDescription::parse(SdpType::Answer, &sdp_str)?;
 
@@ -415,7 +415,7 @@ impl MediaSession {
 
         pc.wait_for_gathering_complete().await;
 
-        let offer = pc.create_offer()?;
+        let offer = pc.create_offer().await?;
         let sdp_str = offer.to_sdp_string();
         let offer = SessionDescription::parse(SdpType::Offer, &sdp_str)?;
 
