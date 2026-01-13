@@ -38,6 +38,11 @@ impl CallStats {
         let total = self.total_planned_calls.load(Ordering::Relaxed);
         let finished = self.finished_calls.load(Ordering::Relaxed);
         let current = self.current_calls.load(Ordering::Relaxed);
+
+        if total == 0 && finished == 0 && current == 0 {
+            return;
+        }
+
         let total_duration_ms = self.total_duration.load(Ordering::Relaxed);
         let avg_duration = if finished > 0 {
             total_duration_ms as f64 / finished as f64 / 1000.0

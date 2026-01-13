@@ -849,6 +849,7 @@ impl SipBot {
         let offer_body = transaction.original.body().clone();
         let stats_clone = self.stats.clone();
         tokio::spawn(async move {
+            stats_clone.add_total_planned(1);
             stats_clone.inc_current();
             let _guard = CallGuard {
                 stats: stats_clone.clone(),
