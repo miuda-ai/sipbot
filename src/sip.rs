@@ -760,44 +760,50 @@ impl SipBot {
         let endpoint = self.endpoint.as_ref().context("Endpoint not initialized")?;
         let mut incoming = endpoint.incoming_transactions()?;
 
-        while let Some(mut transaction) = incoming.recv().await {
-            match transaction.original.method {
-                Method::Invite => self.handle_invite(transaction).await?,
-                Method::Ack => info!("[{}] Received ACK", self.account.username),
-                Method::Bye => {
-                    info!("[{}] Received BYE", self.account.username);
-                    let id = DialogId::try_from(&transaction.original)?;
-                    let dialog = self
-                        .dialog_layer
-                        .as_ref()
-                        .map(|d| d.get_dialog(&id))
-                        .flatten();
-                    if let Some(mut dlg) = dialog {
-                        let _ = dlg.handle(&mut transaction).await?;
-                    } else {
-                        transaction
-                            .reply(rsip::StatusCode::CallTransactionDoesNotExist)
-                            .await
-                            .ok();
-                    }
-                }
-                Method::Options => {
-                    info!("[{}] Received OPTIONS", self.account.username);
-                    transaction.reply(StatusCode::OK).await?;
-                }
-                Method::Info => {
-                    info!("[{}] Received INFO", self.account.username);
-                    transaction.reply(StatusCode::OK).await?;
-                }
-                Method::Update => {
-                    info!("[{}] Received UPDATE", self.account.username);
-                    transaction.reply(StatusCode::OK).await?;
-                }
-                _ => info!(
-                    "[{}] Received other method: {:?}",
-                    self.account.username, transaction.original.method
-                ),
+        while let Some(transaction) = incoming.recv().await {
+            if let Err(e) = self.handle_incoming_transaction(transaction).await {
+                error!(
+                    "[{}] Error handling incoming transaction: {:?}",
+                    self.account.username, e
+                );
             }
+        }
+        Ok(())
+    }
+
+    async fn handle_incoming_transaction(&self, mut transaction: Transaction) -> Result<()> {
+        match transaction.original.method {
+            Method::Invite => self.handle_invite(transaction).await?,
+            Method::Ack => info!("[{}] Received ACK", self.account.username),
+            Method::Bye => {
+                info!("[{}] Received BYE", self.account.username);
+                let id = DialogId::try_from(&transaction.original)?;
+                let dialog = self.dialog_layer.as_ref().and_then(|d| d.get_dialog(&id));
+                if let Some(mut dlg) = dialog {
+                    let _ = dlg.handle(&mut transaction).await?;
+                } else {
+                    transaction
+                        .reply(rsip::StatusCode::CallTransactionDoesNotExist)
+                        .await
+                        .ok();
+                }
+            }
+            Method::Options => {
+                info!("[{}] Received OPTIONS", self.account.username);
+                transaction.reply(StatusCode::OK).await?;
+            }
+            Method::Info => {
+                info!("[{}] Received INFO", self.account.username);
+                transaction.reply(StatusCode::OK).await?;
+            }
+            Method::Update => {
+                info!("[{}] Received UPDATE", self.account.username);
+                transaction.reply(StatusCode::OK).await?;
+            }
+            _ => info!(
+                "[{}] Received other method: {:?}",
+                self.account.username, transaction.original.method
+            ),
         }
         Ok(())
     }
