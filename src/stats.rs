@@ -5,6 +5,7 @@ use tokio::sync::Mutex;
 
 #[derive(Debug, Default)]
 pub struct CallStats {
+    pub total_planned_calls: AtomicU32,
     pub total_calls: AtomicU32,
     pub current_calls: AtomicU32,
     pub finished_calls: AtomicU32,
@@ -23,6 +24,69 @@ pub struct CallStats {
 impl CallStats {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn set_total_planned(&self, total: u32) {
+        self.total_planned_calls.store(total, Ordering::Relaxed);
+    }
+
+    pub fn add_total_planned(&self, count: u32) {
+        self.total_planned_calls.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub async fn print_summary(&self) {
+        let total = self.total_planned_calls.load(Ordering::Relaxed);
+        let finished = self.finished_calls.load(Ordering::Relaxed);
+        let current = self.current_calls.load(Ordering::Relaxed);
+        let total_duration_ms = self.total_duration.load(Ordering::Relaxed);
+        let avg_duration = if finished > 0 {
+            total_duration_ms as f64 / finished as f64 / 1000.0
+        } else {
+            0.0
+        };
+
+        let status_codes = {
+            let map = self.status_codes.lock().await;
+            let mut codes: Vec<_> = map.iter().collect();
+            codes.sort_by_key(|a| a.0);
+            codes
+                .iter()
+                .map(|(k, v)| format!("{}:{}", k, v))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        let tx_p = self.tx_packets.load(Ordering::Relaxed);
+        let tx_b = self.tx_bytes.load(Ordering::Relaxed);
+        let rx_p = self.rx_packets.load(Ordering::Relaxed);
+        let rx_b = self.rx_bytes.load(Ordering::Relaxed);
+        let rx_lost = self.rx_lost_packets.load(Ordering::Relaxed);
+        let loss = if rx_p + rx_lost > 0 {
+            rx_lost as f64 * 100.0 / (rx_p + rx_lost) as f64
+        } else {
+            0.0
+        };
+
+        let nack_s = self.nack_sent.load(Ordering::Relaxed);
+        let nack_r = self.nack_recv.load(Ordering::Relaxed);
+        let nack_rec = self.nack_recovered.load(Ordering::Relaxed);
+
+        println!(
+            "Progress: {}/{} (Current: {}), Avg Duration: {:.2}s, Status: [{}], TX: {}p/{}b, RX: {}p/{}b, Loss: {:.2}%, NACK: {}s/{}r/{}rec",
+            finished,
+            total,
+            current,
+            avg_duration,
+            status_codes,
+            tx_p,
+            tx_b,
+            rx_p,
+            rx_b,
+            loss,
+            nack_s,
+            nack_r,
+            nack_rec
+        );
     }
 
     pub fn inc_rx_lost(&self, count: u64) {

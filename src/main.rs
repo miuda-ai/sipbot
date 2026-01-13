@@ -3,7 +3,9 @@ use clap::{Parser, Subcommand};
 use futures::future::join_all;
 use sipbot::config::{AccountConfig, Config};
 use sipbot::sip;
+use sipbot::stats::CallStats;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time::ChronoLocal;
@@ -497,6 +499,7 @@ async fn main() -> Result<()> {
 
     let mut handles = vec![];
     let global_config = config.clone();
+    let shared_stats = Arc::new(CallStats::new());
 
     for mut account in config.accounts {
         let global_config = global_config.clone();
@@ -506,6 +509,7 @@ async fn main() -> Result<()> {
         let password_override = password_override.clone();
         let play_file_override = play_file_override.clone();
         let record_override = record_override.clone();
+        let stats = shared_stats.clone();
 
         if let Some(target) = &target_override {
             account.target = Some(target.clone());
@@ -593,7 +597,7 @@ async fn main() -> Result<()> {
 
         let verbose = args.verbose;
         let handle = tokio::spawn(async move {
-            let mut bot = sip::SipBot::new(account, global_config, verbose);
+            let mut bot = sip::SipBot::new(account, global_config, stats, verbose);
             match command_name {
                 "call" => {
                     if let Err(e) = bot.run_call(total_calls, concurrent_calls).await {
@@ -629,6 +633,8 @@ async fn main() -> Result<()> {
             debug!("Cancelled");
         }
     }
+
+    shared_stats.print_summary().await;
 
     Ok(())
 }

@@ -360,14 +360,19 @@ pub struct SipBot {
 }
 
 impl SipBot {
-    pub fn new(account: AccountConfig, global_config: Config, verbose: bool) -> Self {
+    pub fn new(
+        account: AccountConfig,
+        global_config: Config,
+        stats: Arc<CallStats>,
+        verbose: bool,
+    ) -> Self {
         Self {
             account,
             global_config,
             endpoint: None,
             dialog_layer: None,
             registration: None,
-            stats: Arc::new(CallStats::new()),
+            stats,
             verbose,
             is_wait: false,
         }
@@ -468,34 +473,12 @@ impl SipBot {
         }
 
         let monitor_stats = self.stats.clone();
-        let username = self.account.username.clone();
-        let verbose = self.verbose;
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(3));
-            let mut prev_calls = 0;
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
             loop {
                 interval.tick().await;
-                let current = monitor_stats
-                    .current_calls
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let show_calls = if current > 0 {
-                    true
-                } else {
-                    if prev_calls != 0 && current == 0 {
-                        true
-                    } else {
-                        false
-                    }
-                };
-                if show_calls {
-                    if !verbose {
-                        println!("[{}] Active calls: {}", username, current);
-                    } else {
-                        info!("[{}] Active calls: {}", username, current);
-                    }
-                }
-                prev_calls = current;
+                monitor_stats.print_summary().await;
             }
         });
 
@@ -506,6 +489,7 @@ impl SipBot {
     }
 
     pub async fn run_call(&mut self, total: u32, concurrent: u32) -> Result<()> {
+        self.stats.add_total_planned(total);
         self.init_endpoint().await?;
 
         // Register
@@ -520,87 +504,12 @@ impl SipBot {
             );
 
             let monitor_stats = self.stats.clone();
-            let monitor_total = total;
 
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(1));
                 loop {
                     interval.tick().await;
-                    let finished = monitor_stats
-                        .finished_calls
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let current = monitor_stats
-                        .current_calls
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let total_dur = monitor_stats
-                        .total_duration
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let tx_pkts = monitor_stats
-                        .tx_packets
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let rx_pkts = monitor_stats
-                        .rx_packets
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let tx_bytes = monitor_stats
-                        .tx_bytes
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let rx_bytes = monitor_stats
-                        .rx_bytes
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let rx_lost = monitor_stats
-                        .rx_lost_packets
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let nack_sent = monitor_stats
-                        .nack_sent
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let nack_recv = monitor_stats
-                        .nack_recv
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let nack_recovered = monitor_stats
-                        .nack_recovered
-                        .load(std::sync::atomic::Ordering::Relaxed);
-
-                    let avg_dur = if finished > 0 {
-                        total_dur as f64 / finished as f64 / 1000.0
-                    } else {
-                        0.0
-                    };
-
-                    let loss_rate = if rx_pkts + rx_lost > 0 {
-                        (rx_lost as f64 / (rx_pkts + rx_lost) as f64) * 100.0
-                    } else {
-                        0.0
-                    };
-
-                    let status_map = monitor_stats.status_codes.lock().await;
-                    let mut entries: Vec<_> = status_map.iter().collect();
-                    entries.sort_by_key(|(k, _)| *k);
-                    let status_str = entries
-                        .iter()
-                        .map(|(k, v)| format!("{}:{}", k, v))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-
-                    println!(
-                        "Progress: {}/{} (Current: {}), Avg Duration: {:.2}s, Status: [{}], TX: {}p/{}b, RX: {}p/{}b, Loss: {:.2}%, NACK: {}s/{}r/{}rec",
-                        finished,
-                        monitor_total,
-                        current,
-                        avg_dur,
-                        status_str,
-                        tx_pkts,
-                        tx_bytes,
-                        rx_pkts,
-                        rx_bytes,
-                        loss_rate,
-                        nack_sent,
-                        nack_recv,
-                        nack_recovered
-                    );
-
-                    if finished >= monitor_total {
-                        break;
-                    }
+                    monitor_stats.print_summary().await;
                 }
             });
 
@@ -653,6 +562,7 @@ impl SipBot {
     }
 
     pub async fn run_options(&mut self, target_override: Option<String>) -> Result<()> {
+        self.stats.add_total_planned(1);
         self.init_endpoint().await?;
         let target = target_override.or(self.account.target.clone());
         if let Some(target) = target {
@@ -669,6 +579,7 @@ impl SipBot {
     }
 
     pub async fn run_info(&mut self, target_override: Option<String>) -> Result<()> {
+        self.stats.add_total_planned(1);
         self.init_endpoint().await?;
         let target = target_override.or(self.account.target.clone());
         if let Some(target) = target {
@@ -750,6 +661,9 @@ impl SipBot {
                     }
 
                     if res.status_code().code() >= 200 {
+                        self.stats
+                            .add_status(res.status_code().clone().into())
+                            .await;
                         break;
                     }
                 }
@@ -985,9 +899,12 @@ impl SipBot {
             let call_logic = async move {
                 // Random rejection check
                 if let Some(prob) = account.reject_prob {
-                    use rand::Rng;
-                    let mut rng = rand::rng();
-                    if rng.random_range(1..=100) <= prob {
+                    let should_reject = {
+                        use rand::Rng;
+                        let mut rng = rand::rng();
+                        rng.random_range(1..=100) <= prob
+                    };
+                    if should_reject {
                         info!(
                             "[{}] Randomly rejecting call (prob: {}%)",
                             account.username, prob
@@ -998,9 +915,12 @@ impl SipBot {
                             .filter(|h| h.code >= 300)
                             .map(|h| StatusCode::from(h.code))
                             .unwrap_or(StatusCode::TemporarilyUnavailable);
+
+                        let code: u16 = status_code.clone().into();
                         if let Err(e) = server_dialog_clone.reject(Some(status_code), None) {
                             error!("Reject error: {:?}", e);
                         }
+                        stats_clone.add_status(code).await;
                         return;
                     }
                 }
@@ -1047,6 +967,9 @@ impl SipBot {
                                 {
                                     error!("Reject error: {:?}", e);
                                 }
+                                stats_clone
+                                    .add_status(StatusCode::TemporarilyUnavailable.into())
+                                    .await;
                                 return;
                             }
                         }
@@ -1206,6 +1129,7 @@ impl SipBot {
                         error!("Accept error: {:?}", e);
                         return;
                     }
+                    stats_clone.add_status(200).await;
 
                     if media_session.is_none() {
                         warn!(
