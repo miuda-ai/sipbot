@@ -134,6 +134,7 @@ pub struct MediaSession {
     #[cfg(feature = "local-device")]
     output_resampler: Arc<Mutex<Option<audio_codec::Resampler>>>,
     tracked_mids: Arc<Mutex<std::collections::HashSet<String>>>,
+    cancel_token: CancellationToken,
 }
 
 impl MediaSession {
@@ -285,6 +286,7 @@ impl MediaSession {
             anyhow::bail!("Failed to generate valid audio answer SDP: {}", local_sdp);
         }
 
+        let cancel_token = CancellationToken::new();
         let session = Self {
             pc: pc.clone(),
             audio_source: audio_source.clone(),
@@ -301,33 +303,44 @@ impl MediaSession {
             #[cfg(feature = "local-device")]
             output_resampler: Arc::new(Mutex::new(None)),
             tracked_mids: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            cancel_token: cancel_token.clone(),
         };
 
         // Spawn a background task to listen for incoming track events so there is
         // always a listener for incoming RTP packets (prevents "No listener found")
         let bg_session = session.clone();
+        let bg_token = cancel_token.clone();
         tokio::spawn(async move {
             let pc = bg_session.pc.clone();
-            while let Some(event) = pc.recv().await {
-                if let PeerConnectionEvent::Track(transceiver) = event {
-                    let mid = transceiver
-                        .mid()
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_string());
-                    {
-                        let mut mids = bg_session.tracked_mids.lock().await;
-                        if mids.contains(&mid) {
-                            continue;
-                        }
-                        mids.insert(mid);
-                    }
+            loop {
+                tokio::select! {
+                    _ = bg_token.cancelled() => break,
+                    event = pc.recv() => {
+                        if let Some(event) = event {
+                            if let PeerConnectionEvent::Track(transceiver) = event {
+                                let mid = transceiver
+                                    .mid()
+                                    .clone()
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                {
+                                    let mut mids = bg_session.tracked_mids.lock().await;
+                                    if mids.contains(&mid) {
+                                        continue;
+                                    }
+                                    mids.insert(mid);
+                                }
 
-                    if let Some(receiver) = transceiver.receiver().as_ref() {
-                        spawn_track_recorder(
-                            bg_session.clone(),
-                            receiver.track(),
-                            CancellationToken::new(),
-                        );
+                                if let Some(receiver) = transceiver.receiver().as_ref() {
+                                    spawn_track_recorder(
+                                        bg_session.clone(),
+                                        receiver.track(),
+                                        bg_token.child_token(),
+                                    );
+                                }
+                            }
+                        } else {
+                            break;
+                        }
                     }
                 }
             }
@@ -347,7 +360,11 @@ impl MediaSession {
                     }
                     mids.insert(mid);
                 }
-                spawn_track_recorder(session.clone(), receiver.track(), CancellationToken::new());
+                spawn_track_recorder(
+                    session.clone(),
+                    receiver.track(),
+                    cancel_token.child_token(),
+                );
             }
         }
 
@@ -430,6 +447,7 @@ impl MediaSession {
             anyhow::bail!("Failed to generate valid audio offer SDP: {}", local_sdp);
         }
 
+        let cancel_token = CancellationToken::new();
         Ok((
             Self {
                 pc,
@@ -447,6 +465,7 @@ impl MediaSession {
                 #[cfg(feature = "local-device")]
                 output_resampler: Arc::new(Mutex::new(None)),
                 tracked_mids: Arc::new(Mutex::new(std::collections::HashSet::new())),
+                cancel_token,
             },
             local_sdp,
         ))
@@ -492,7 +511,12 @@ impl MediaSession {
         Ok(codec_name)
     }
 
-    fn spawn_audio_loop(&self, username: String, track: Arc<dyn MediaStreamTrack>) {
+    fn spawn_audio_loop(
+        &self,
+        username: String,
+        track: Arc<dyn MediaStreamTrack>,
+        token: CancellationToken,
+    ) {
         let audio_source = self.audio_source.clone();
         let recorder = self.recorder.clone();
         let stats = self.stats.clone();
@@ -515,6 +539,7 @@ impl MediaSession {
                 loop {
                     let wait = jb.next_pop_wait().unwrap_or(Duration::from_millis(100));
                     tokio::select! {
+                        _ = token.cancelled() => break,
                         _ = sync_interval.tick() => {
                             session.sync_nack_stats();
                         }
@@ -583,6 +608,7 @@ impl MediaSession {
             } else {
                 loop {
                     tokio::select! {
+                        _ = token.cancelled() => break,
                         _ = sync_interval.tick() => {
                             session.sync_nack_stats();
                         }
@@ -1555,37 +1581,51 @@ impl MediaSession {
                     }
                     mids.insert(mid);
                 }
-                self.spawn_audio_loop(username.clone(), receiver.track());
+                self.spawn_audio_loop(
+                    username.clone(),
+                    receiver.track(),
+                    self.cancel_token.child_token(),
+                );
             }
         }
 
         let session_rx = self.clone();
         let username_rx = username.clone();
-        while let Some(event) = self.pc.recv().await {
-            match event {
-                PeerConnectionEvent::Track(transceiver) => {
-                    let mid = transceiver
-                        .mid()
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_string());
-                    {
-                        let mut mids = session_rx.tracked_mids.lock().await;
-                        if mids.contains(&mid) {
-                            tracing::debug!(
-                                "[{}] Track {} already being recorded, skipping",
-                                username_rx,
-                                mid
-                            );
-                            continue;
+        let cancel_token = self.cancel_token.clone();
+        loop {
+            tokio::select! {
+                _ = cancel_token.cancelled() => break,
+                event = self.pc.recv() => {
+                    if let Some(event) = event {
+                        match event {
+                            PeerConnectionEvent::Track(transceiver) => {
+                                let mid = transceiver
+                                    .mid()
+                                    .clone()
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                {
+                                    let mut mids = session_rx.tracked_mids.lock().await;
+                                    if mids.contains(&mid) {
+                                        tracing::debug!(
+                                            "[{}] Track {} already being recorded, skipping",
+                                            username_rx,
+                                            mid
+                                        );
+                                        continue;
+                                    }
+                                    mids.insert(mid);
+                                }
+                                if let Some(receiver) = transceiver.receiver().as_ref() {
+                                    self.spawn_audio_loop(username_rx.clone(), receiver.track(), cancel_token.child_token());
+                                }
+                            }
+                            _ => {
+                                info!("[{}] Received PC event: Other", username_rx);
+                            }
                         }
-                        mids.insert(mid);
+                    } else {
+                        break;
                     }
-                    if let Some(receiver) = transceiver.receiver().as_ref() {
-                        self.spawn_audio_loop(username_rx.clone(), receiver.track());
-                    }
-                }
-                _ => {
-                    info!("[{}] Received PC event: Other", username_rx);
                 }
             }
         }
@@ -1594,6 +1634,7 @@ impl MediaSession {
     }
 
     pub async fn stop(&self) {
+        self.cancel_token.cancel();
         self.pc.close();
     }
 

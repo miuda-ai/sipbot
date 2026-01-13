@@ -45,6 +45,7 @@ struct CallRunner {
 struct CallGuard {
     stats: Arc<CallStats>,
     start_time: std::time::Instant,
+    media_session: Option<MediaSession>,
 }
 
 impl Drop for CallGuard {
@@ -52,15 +53,22 @@ impl Drop for CallGuard {
         self.stats.dec_current();
         self.stats.inc_finished();
         self.stats.add_duration(self.start_time.elapsed());
+        if let Some(media) = self.media_session.take() {
+            let media_clone = media.clone();
+            tokio::spawn(async move {
+                media_clone.stop().await;
+            });
+        }
     }
 }
 
 impl CallRunner {
     async fn make_call(&self, target_uri: String, call_index: u32) -> Result<()> {
         self.stats.inc_current();
-        let _guard = CallGuard {
+        let mut _guard = CallGuard {
             stats: self.stats.clone(),
             start_time: std::time::Instant::now(),
+            media_session: None,
         };
 
         debug!(
@@ -93,6 +101,7 @@ impl CallRunner {
             self.stats.clone(),
         )
         .await?;
+        _guard.media_session = Some(media_session.clone());
 
         if local_sdp.is_empty() {
             anyhow::bail!("[{}] Generated empty Offer SDP", self.account.username);
@@ -344,6 +353,7 @@ impl CallRunner {
         info!("[{}] Sending BYE...", self.account.username);
         dialog.hangup().await?;
         info!("[{}] BYE sent.", self.account.username);
+        media_session.stop().await;
         Ok(())
     }
 }
@@ -851,9 +861,10 @@ impl SipBot {
         tokio::spawn(async move {
             stats_clone.add_total_planned(1);
             stats_clone.inc_current();
-            let _guard = CallGuard {
+            let mut _guard = CallGuard {
                 stats: stats_clone.clone(),
                 start_time: std::time::Instant::now(),
+                media_session: None,
             };
 
             // Spawn transaction handler
@@ -947,7 +958,8 @@ impl SipBot {
                         .await
                         {
                             Ok((session, sdp, codec_name)) => {
-                                media_session = Some(session);
+                                media_session = Some(session.clone());
+                                _guard.media_session = Some(session);
                                 local_sdp = Some(sdp);
                                 info!(
                                     "[{}] Call established: From={}, To={}, Preferred Codec={}",
@@ -1143,8 +1155,9 @@ impl SipBot {
                     let answer_config = account.answer.clone();
                     let hangup_config = account.hangup.clone();
                     let keep_alive = hangup_config.is_some();
+                    let media_session_to_stop = media_session.clone();
 
-                    let media_future = async {
+                    let media_future = async move {
                         if let Some(media) = media_session {
                             if let Some(cfg) = answer_config {
                                 match cfg {
@@ -1260,6 +1273,10 @@ impl SipBot {
                         if let Err(e) = media_future.await {
                             error!("[{}] Media error: {:?}", account.username, e);
                         }
+                    }
+
+                    if let Some(media) = media_session_to_stop {
+                        media.stop().await;
                     }
                 }
             };
