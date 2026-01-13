@@ -16,10 +16,10 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.9.8"
 tracing = "0.1"
 anyhow = "1.0"
-rsipstack = "0.4.0"
+rsipstack = "0.4.1"
 rsip = "0.4.0"
 tokio-util = "0.7.18"
-rustrtc = "0.3.0"
+rustrtc = "0.3.1"
 audio-codec = { version = "0.3.30", default-features = false }
 clap = { version = "4", features = ["derive"] }
 chrono = "0.4.42"

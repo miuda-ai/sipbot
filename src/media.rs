@@ -553,7 +553,7 @@ impl MediaSession {
                                 if let Some(ref mut dec) = decoder {
                                     let ct = if let MediaSample::Audio(ref mut frame) = sample {
                                         let ct = get_codec_type(frame.payload_type, &session.pc.config().media_capabilities);
-                                        frame.sample_rate = ct.samplerate();
+                                        frame.clock_rate = ct.clock_rate();
                                         ct
                                     } else {
                                         CodecType::PCMU
@@ -572,6 +572,7 @@ impl MediaSession {
                                         &mut last_seq,
                                         &mut last_timestamp,
                                         rtp_clock_rate,
+                                        ct.samplerate(),
                                     )
                                     .await;
                                 }
@@ -608,7 +609,7 @@ impl MediaSession {
                                     if let Some(ref mut dec) = decoder {
                                         let ct = if let MediaSample::Audio(ref mut frame) = sample {
                                             let ct = get_codec_type(frame.payload_type, &session.pc.config().media_capabilities);
-                                            frame.sample_rate = ct.samplerate();
+                                            frame.clock_rate = ct.clock_rate();
                                             ct
                                         } else {
                                             CodecType::PCMU
@@ -627,6 +628,7 @@ impl MediaSession {
                                             &mut last_seq,
                                             &mut last_timestamp,
                                             rtp_clock_rate,
+                                            ct.samplerate(),
                                         )
                                         .await;
                                     }
@@ -656,46 +658,55 @@ impl MediaSession {
         last_seq: &mut Option<u16>,
         last_timestamp: &mut Option<u32>,
         rtp_clock_rate: u32,
+        actual_sample_rate: u32,
     ) {
+        let decoded = if let MediaSample::Audio(ref frame) = sample {
+            Some(decoder.decode(&frame.data))
+        } else {
+            None
+        };
+
         // Validate timestamp continuity and rewrite if needed to fix interleaved streams
         if let MediaSample::Audio(ref mut frame) = sample {
-            if let Some(last_ts) = *last_timestamp {
-                // Calculate expected timestamp based on last timestamp + samples
-                let ticks = (frame.samples as u64 * rtp_clock_rate as u64
-                    / frame.sample_rate as u64) as u32;
-                let expected_ts = last_ts.wrapping_add(ticks);
-                let ts_diff = frame.rtp_timestamp.wrapping_sub(expected_ts);
+            if let Some(ref decoded_data) = decoded {
+                if let Some(last_ts) = *last_timestamp {
+                    // Calculate expected timestamp based on last timestamp + samples
+                    let ticks = (decoded_data.len() as u64 * rtp_clock_rate as u64
+                        / actual_sample_rate as u64) as u32;
+                    let expected_ts = last_ts.wrapping_add(ticks);
+                    let ts_diff = frame.rtp_timestamp.wrapping_sub(expected_ts);
 
-                // Allow up to 10 seconds of jump to handle legitimate gaps
-                let max_reasonable_jump: u32 = rtp_clock_rate * 10;
+                    // Allow up to 10 seconds of jump to handle legitimate gaps
+                    let max_reasonable_jump: u32 = rtp_clock_rate * 10;
 
-                // Rewrite packets with large forward jumps
-                if ts_diff > max_reasonable_jump && ts_diff < (u32::MAX / 2) {
-                    tracing::debug!(
-                        "[{}] Rewriting timestamp (forward jump): seq={:?} original_ts={} -> expected_ts={} diff={} (>{:.1}s)",
-                        username,
-                        frame.sequence_number,
-                        frame.rtp_timestamp,
-                        expected_ts,
-                        ts_diff,
-                        ts_diff as f32 / rtp_clock_rate as f32
-                    );
-                    frame.rtp_timestamp = expected_ts;
-                }
-                // Rewrite packets with large backward jumps
-                else if ts_diff > (u32::MAX / 2) {
-                    let backward_diff = last_ts.wrapping_sub(frame.rtp_timestamp);
-                    if backward_diff > max_reasonable_jump {
+                    // Rewrite packets with large forward jumps
+                    if ts_diff > max_reasonable_jump && ts_diff < (u32::MAX / 2) {
                         tracing::debug!(
-                            "[{}] Rewriting timestamp (backward jump): seq={:?} original_ts={} -> expected_ts={} diff=-{} (>{:.1}s)",
+                            "[{}] Rewriting timestamp (forward jump): seq={:?} original_ts={} -> expected_ts={} diff={} (>{:.1}s)",
                             username,
                             frame.sequence_number,
                             frame.rtp_timestamp,
                             expected_ts,
-                            backward_diff,
-                            backward_diff as f32 / rtp_clock_rate as f32
+                            ts_diff,
+                            ts_diff as f32 / rtp_clock_rate as f32
                         );
                         frame.rtp_timestamp = expected_ts;
+                    }
+                    // Rewrite packets with large backward jumps
+                    else if ts_diff > (u32::MAX / 2) {
+                        let backward_diff = last_ts.wrapping_sub(frame.rtp_timestamp);
+                        if backward_diff > max_reasonable_jump {
+                            tracing::debug!(
+                                "[{}] Rewriting timestamp (backward jump): seq={:?} original_ts={} -> expected_ts={} diff=-{} (>{:.1}s)",
+                                username,
+                                frame.sequence_number,
+                                frame.rtp_timestamp,
+                                expected_ts,
+                                backward_diff,
+                                backward_diff as f32 / rtp_clock_rate as f32
+                            );
+                            frame.rtp_timestamp = expected_ts;
+                        }
                     }
                 }
             }
@@ -735,23 +746,24 @@ impl MediaSession {
 
                 let rec = recorder.lock().await;
                 if let Some(r) = rec.as_ref() {
-                    let decoded = decoder.decode(&frame.data);
-                    let resampled = if let Some(resampler) = recorder_resampler {
-                        resampler.resample(&decoded)
-                    } else {
-                        decoded
-                    };
-                    r.record_rx(&resampled);
-                    r.record_tx(&resampled);
+                    if let Some(ref decoded_data) = decoded {
+                        let resampled = if let Some(resampler) = recorder_resampler {
+                            resampler.resample(decoded_data)
+                        } else {
+                            decoded_data.clone()
+                        };
+                        r.record_rx(&resampled);
+                        r.record_tx(&resampled);
+                    }
                 }
             } else {
-                error!("RX SAMPLE: NOT AUDIO");
+                tracing::error!("RX SAMPLE: NOT AUDIO");
             }
         }
 
         // Echo
         if let Err(e) = audio_source.send(sample).await {
-            error!("[{}] Failed to send echo sample: {:?}", username, e);
+            tracing::error!("[{}] Failed to send echo sample: {:?}", username, e);
         }
     }
 
@@ -1070,10 +1082,9 @@ impl MediaSession {
 
                     stats.inc_tx(1, encoded.len() as u64);
                     let sample = MediaSample::Audio(AudioFrame {
-                        samples: samples_per_frame as u32,
-                        sample_rate: target_sample_rate,
                         rtp_timestamp,
                         data: encoded.into(),
+                        clock_rate: ct.clock_rate(),
                         ..Default::default()
                     });
                     if let Err(e) = audio_source.send(sample).await {
@@ -1491,9 +1502,7 @@ impl MediaSession {
 
             let frame = AudioFrame {
                 data: Bytes::from(encoded),
-                sample_rate: clock_rate,
-                channels: channels as u8,
-                samples: (chunk_size as u64 * clock_rate as u64 / sample_rate as u64) as u32,
+                clock_rate,
                 rtp_timestamp,
                 payload_type: Some(payload_type),
                 sequence_number: None,
@@ -1752,7 +1761,7 @@ fn spawn_track_recorder(
                                 if let Some(ref mut dec) = decoder {
                                     let ct = if let MediaSample::Audio(ref mut frame) = sample {
                                         let ct = get_codec_type(frame.payload_type, &session.pc.config().media_capabilities);
-                                        frame.sample_rate = ct.samplerate();
+                                        frame.clock_rate = ct.clock_rate();
                                         ct
                                     } else {
                                         CodecType::PCMU
@@ -1779,6 +1788,7 @@ fn spawn_track_recorder(
                                         &mut *resampler_lock,
                                         rtp_clock_rate,
                                         channels,
+                                        ct.samplerate(),
                                     )
                                     .await;
                                 }
@@ -1821,7 +1831,7 @@ fn spawn_track_recorder(
                                 if let Some(ref mut dec) = decoder {
                                     let ct = if let MediaSample::Audio(ref mut frame) = sample {
                                         let ct = get_codec_type(frame.payload_type, &session.pc.config().media_capabilities);
-                                        frame.sample_rate = ct.samplerate();
+                                        frame.clock_rate = ct.clock_rate();
                                         ct
                                     } else {
                                         CodecType::PCMU
@@ -1848,6 +1858,7 @@ fn spawn_track_recorder(
                                         &mut *resampler_lock,
                                         rtp_clock_rate,
                                         channels,
+                                        ct.samplerate(),
                                     )
                                     .await;
                                 }
@@ -1876,44 +1887,53 @@ async fn process_recorded_sample(
     #[cfg(feature = "local-device")] output_resampler: &mut Option<audio_codec::Resampler>,
     rtp_clock_rate: u32,
     channels: u16,
+    actual_sample_rate: u32,
 ) {
+    let decoded = if let MediaSample::Audio(ref frame) = sample {
+        Some(decoder.decode(&frame.data))
+    } else {
+        None
+    };
+
     // Validate timestamp continuity and rewrite if needed to fix interleaved streams
     if let MediaSample::Audio(ref mut frame) = sample {
-        if let Some(last_ts) = *last_timestamp {
-            // Calculate expected timestamp based on last timestamp + samples
-            let ticks =
-                (frame.samples as u64 * rtp_clock_rate as u64 / frame.sample_rate as u64) as u32;
-            let expected_ts = last_ts.wrapping_add(ticks);
-            let ts_diff = frame.rtp_timestamp.wrapping_sub(expected_ts);
+        if let Some(ref decoded_data) = decoded {
+            if let Some(last_ts) = *last_timestamp {
+                // Calculate expected timestamp based on last timestamp + samples
+                let ticks = (decoded_data.len() as u64 * rtp_clock_rate as u64
+                    / actual_sample_rate as u64) as u32;
+                let expected_ts = last_ts.wrapping_add(ticks);
+                let ts_diff = frame.rtp_timestamp.wrapping_sub(expected_ts);
 
-            // Allow up to 10 seconds of jump to handle legitimate gaps
-            let max_reasonable_jump: u32 = rtp_clock_rate * 10;
+                // Allow up to 10 seconds of jump to handle legitimate gaps
+                let max_reasonable_jump: u32 = rtp_clock_rate * 10;
 
-            // Rewrite packets with large forward jumps
-            if ts_diff > max_reasonable_jump && ts_diff < (u32::MAX / 2) {
-                tracing::debug!(
-                    "Recording: Rewriting timestamp (forward jump): seq={:?} original_ts={} -> expected_ts={} diff={} (>{:.1}s)",
-                    frame.sequence_number,
-                    frame.rtp_timestamp,
-                    expected_ts,
-                    ts_diff,
-                    ts_diff as f32 / rtp_clock_rate as f32
-                );
-                frame.rtp_timestamp = expected_ts;
-            }
-            // Rewrite packets with large backward jumps
-            else if ts_diff > (u32::MAX / 2) {
-                let backward_diff = last_ts.wrapping_sub(frame.rtp_timestamp);
-                if backward_diff > max_reasonable_jump {
+                // Rewrite packets with large forward jumps
+                if ts_diff > max_reasonable_jump && ts_diff < (u32::MAX / 2) {
                     tracing::debug!(
-                        "Recording: Rewriting timestamp (backward jump): seq={:?} original_ts={} -> expected_ts={} diff=-{} (>{:.1}s)",
+                        "Recording: Rewriting timestamp (forward jump): seq={:?} original_ts={} -> expected_ts={} diff={} (>{:.1}s)",
                         frame.sequence_number,
                         frame.rtp_timestamp,
                         expected_ts,
-                        backward_diff,
-                        backward_diff as f32 / rtp_clock_rate as f32
+                        ts_diff,
+                        ts_diff as f32 / rtp_clock_rate as f32
                     );
                     frame.rtp_timestamp = expected_ts;
+                }
+                // Rewrite packets with large backward jumps
+                else if ts_diff > (u32::MAX / 2) {
+                    let backward_diff = last_ts.wrapping_sub(frame.rtp_timestamp);
+                    if backward_diff > max_reasonable_jump {
+                        tracing::debug!(
+                            "Recording: Rewriting timestamp (backward jump): seq={:?} original_ts={} -> expected_ts={} diff=-{} (>{:.1}s)",
+                            frame.sequence_number,
+                            frame.rtp_timestamp,
+                            expected_ts,
+                            backward_diff,
+                            backward_diff as f32 / rtp_clock_rate as f32
+                        );
+                        frame.rtp_timestamp = expected_ts;
+                    }
                 }
             }
         }
@@ -1950,15 +1970,15 @@ async fn process_recorded_sample(
         *last_timestamp = Some(frame.rtp_timestamp);
 
         stats.inc_rx(1, frame.data.len() as u64);
-        let decoded = decoder.decode(&frame.data);
+        let decoded = decoded.as_ref().unwrap();
 
         if frame.sequence_number.unwrap_or(0) % 100 == 0 {
             tracing::debug!(
-                "RX Audio: seq={:?} pt={} rate={} rtp_samples={} decoded_len={} data_len={}",
+                "RX Audio: seq={:?} pt={} rate={} ticks={} decoded_len={} data_len={}",
                 frame.sequence_number,
                 frame.payload_type.unwrap_or(0),
-                frame.sample_rate,
-                frame.samples,
+                actual_sample_rate,
+                rtp_clock_rate,
                 decoded.len(),
                 frame.data.len()
             );
@@ -1987,7 +2007,7 @@ async fn process_recorded_sample(
                     // If it's just one-channel's worth of samples, we don't mix.
                     let mono_decoded = if channels == 2
                         && decoded.len() % 2 == 0
-                        && decoded.len() > (frame.sample_rate as usize / 50)
+                        && decoded.len() > (actual_sample_rate as usize / 50)
                     {
                         let mut mono = Vec::with_capacity(decoded.len() / 2);
                         for chunk in decoded.chunks(2) {
@@ -1996,10 +2016,10 @@ async fn process_recorded_sample(
                         }
                         mono
                     } else {
-                        decoded
+                        decoded.clone()
                     };
 
-                    if target_rate != frame.sample_rate {
+                    if target_rate != actual_sample_rate {
                         // Check if we need to recreate the resampler
                         let need_new = match output_resampler.as_ref() {
                             Some(_) => {
@@ -2019,7 +2039,7 @@ async fn process_recorded_sample(
 
                         if need_new {
                             *output_resampler = Some(audio_codec::Resampler::new(
-                                frame.sample_rate as usize,
+                                actual_sample_rate as usize,
                                 target_rate as usize,
                             ));
                         }
