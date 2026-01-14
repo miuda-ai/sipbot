@@ -26,7 +26,6 @@ use rsipstack::{
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::Semaphore;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -168,20 +167,27 @@ impl CallRunner {
                     dialog = dial;
                     break;
                 }
-                state = rx.recv(), if should_cancel => {
+                state = rx.recv() => {
                     if let Some(state) = state {
-                        if cancel_before_ringring && let DialogState::Trying(mut dialog_id) = state {
-                            tracing::info!("[{}] Canceling call before ringring", self.account.username);
-                            dialog_id.to_tag.clear();
-                            let dialog = dialog_layer.get_dialog(&dialog_id).expect("dialog not found");
-                            should_cancel = false;
-                            let _ = dialog.hangup().await;
-                        }else if !cancel_before_ringring && let DialogState::Early(mut dialog_id, _) = state{
-                            tracing::info!("[{}] Canceling call after ringring", self.account.username);
-                            dialog_id.to_tag.clear();
-                            let dialog = dialog_layer.get_dialog(&dialog_id).expect("dialog not found");
-                            should_cancel = false;
-                            let _ = dialog.hangup().await;
+                        if let DialogState::Early(_, res) = &state {
+                            let code: u16 = res.status_code().clone().into();
+                            self.stats.add_status(code).await;
+                        }
+
+                        if should_cancel {
+                            if cancel_before_ringring && let DialogState::Trying(mut dialog_id) = state {
+                                tracing::info!("[{}] Canceling call before ringring", self.account.username);
+                                dialog_id.to_tag.clear();
+                                let dialog = dialog_layer.get_dialog(&dialog_id).expect("dialog not found");
+                                should_cancel = false;
+                                let _ = dialog.hangup().await;
+                            }else if !cancel_before_ringring && let DialogState::Early(mut dialog_id, _) = state{
+                                tracing::info!("[{}] Canceling call after ringring", self.account.username);
+                                dialog_id.to_tag.clear();
+                                let dialog = dialog_layer.get_dialog(&dialog_id).expect("dialog not found");
+                                should_cancel = false;
+                                let _ = dialog.hangup().await;
+                            }
                         }
                     }
                 }
@@ -212,7 +218,7 @@ impl CallRunner {
                     "[{}] Call established: From={}, To={}, Preferred Codec={}",
                     self.account.username, from, to, codec_name
                 );
-                println!(
+                info!(
                     "[{}] Call established: From={}, To={}, Preferred Codec={}",
                     self.account.username, from, to, codec_name
                 );
@@ -498,8 +504,9 @@ impl SipBot {
         Ok(())
     }
 
-    pub async fn run_call(&mut self, total: u32, concurrent: u32) -> Result<()> {
+    pub async fn run_call(&mut self, total: u32, cps: u32) -> Result<()> {
         self.stats.add_total_planned(total);
+        self.stats.set_total_planned(total);
         self.init_endpoint().await?;
 
         // Register
@@ -508,18 +515,13 @@ impl SipBot {
         }
 
         if let Some(target) = &self.account.target {
-            info!(
-                "[{}] Starting outbound call to {} (total: {}, concurrent: {})",
-                self.account.username, target, total, concurrent
-            );
-
             let monitor_stats = self.stats.clone();
 
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                let mut interval = tokio::time::interval(Duration::from_millis(100));
                 loop {
                     interval.tick().await;
-                    monitor_stats.print_summary().await;
+                    monitor_stats.print_progress().await;
                 }
             });
 
@@ -534,23 +536,28 @@ impl SipBot {
                 stats: self.stats.clone(),
             };
 
-            let semaphore = Arc::new(Semaphore::new(concurrent as usize));
             let mut handles = vec![];
+            let delay = if cps > 0 {
+                Duration::from_secs_f64(1.0 / cps as f64)
+            } else {
+                Duration::from_millis(1)
+            };
 
             for i in 0..total {
-                let permit = semaphore.clone().acquire_owned();
                 let runner = runner.clone();
                 let target = target.clone();
 
                 let handle = tokio::spawn(async move {
-                    let guard = permit.await?;
                     if let Err(e) = runner.make_call(target, i).await {
-                        error!("Call {} failed: {:?}", i, e);
+                        debug!("Call {} failed: {:?}", i, e);
                     }
-                    drop(guard);
                     Ok::<(), anyhow::Error>(())
                 });
                 handles.push(handle);
+
+                if i < total - 1 && cps > 0 {
+                    tokio::time::sleep(delay).await;
+                }
             }
 
             let calls_future = futures::future::join_all(handles);
@@ -558,6 +565,7 @@ impl SipBot {
             tokio::select! {
                 _ = self.listen_loop() => {}
                 _ = calls_future => {
+                    println!(); // New line after progress
                     info!("[{}] All calls finished.", self.account.username);
                 }
             }
@@ -971,7 +979,7 @@ impl SipBot {
                                     "[{}] Call established: From={}, To={}, Preferred Codec={}",
                                     account.username, caller, callee, codec_name
                                 );
-                                println!(
+                                info!(
                                     "[{}] Call established: From={}, To={}, Preferred Codec={}",
                                     account.username, caller, callee, codec_name
                                 );
@@ -1019,6 +1027,7 @@ impl SipBot {
                             {
                                 error!("Early ring error: {:?}", e);
                             }
+                            stats_clone.add_status(183).await;
                         }
 
                         if let Some(media) = &mut media_session {
@@ -1079,11 +1088,13 @@ impl SipBot {
                                 error!("Ringing error: {:?}", e);
                                 return;
                             }
+                            stats_clone.add_status(183).await;
                         } else {
                             if let Err(e) = server_dialog_clone.ringing(None, None) {
                                 error!("Ringing error: {:?}", e);
                                 return;
                             }
+                            stats_clone.add_status(180).await;
                         }
 
                         if let Some(media) = &mut media_session {
@@ -1128,6 +1139,7 @@ impl SipBot {
                             error!("Ringing error: {:?}", e);
                             return;
                         }
+                        stats_clone.add_status(180).await;
                         tokio::time::sleep(Duration::from_secs(cfg.duration_secs)).await;
                     }
                 }

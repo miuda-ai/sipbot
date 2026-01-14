@@ -38,34 +38,43 @@ You can also run `sipbot` with CLI arguments for quick testing.
 
 - `-C, --conf <FILE>`: Path to the configuration file.
 - `-E, --external <IP>`: External IP address for SDP (NAT traversal).
+- `-v, --verbose`: Enable verbose logging.
 
 #### Initiate a Call
 
 ```bash
-cargo run -- call -t sip:user@domain --caller sip:me@mydomain --play audio.wav --hangup 10 --total 10 --concurrent 2
+cargo run -- call -t sip:user@domain -u sipbot --play audio.wav --hangup 10 --total 10 --cps 2
 ```
 
 - `-t, --target <TARGET>`: Target URI (e.g., sip:user@domain).
-- `-c, --caller <URI>`: Caller (username or full URI).
+- `-u, --username <USER>`: Username (e.g., sipbot). Alias: `--caller`.
 - `--auth-user <USER>`: Auth username (optional).
 - `--password <PASS>`: Auth password.
+- `--register [DOMAIN]`: Register to SIP server before calling (optional domain).
 - `--hangup <SECONDS>`: Hangup after seconds.
 - `--play <FILE>`: Play file (wav).
 - `--local`: Use local audio device for playback and capture.
 - `--record <FILE>`: Record to file (wav). If multiple calls are made, the filename will be suffixed with the call index (e.g., `record_1.wav`).
 - `--srtp`: Enable SRTP/SDES.
+- `--nack`: Enable NACK.
+- `--jitter`: Enable Jitter Buffer.
 - `--total <COUNT>`: Total number of calls to make (default: 1).
-- `--concurrent <COUNT>`: Max concurrent calls (default: 1).
+- `--cps <COUNT>`: Calls per second (default: 1).
+- `--cancel-prob <PROB>`: Cancel probability (0-99%) (default: 0).
+- `--codecs <LIST>`: Codecs to use (e.g., opus,g722,pcmu).
 
 #### Wait for Calls
 
 ```bash
-cargo run -- wait --addr 0.0.0.0:5060 --username sipbot --answer welcome.wav
+cargo run -- wait --addr 0.0.0.0:5060 -u sipbot --answer welcome.wav
 ```
 
 - `-a, --addr <ADDR>`: Bind address (e.g., 0.0.0.0:5060).
 - `-u, --username <USER>`: Username (e.g., sipbot).
-- `-d, --domain <DOMAIN>`: Domain (e.g., 127.0.0.1).
+- `-d, --domain <DOMAIN>`: Domain/Realm (e.g., 127.0.0.1). Alias: `--realm`.
+- `--auth-user <USER>`: Auth username (optional).
+- `-p, --password <PASS>`: Password for registration.
+- `--register [DOMAIN]`: Register to SIP server (optional domain).
 - `--ringback <FILE>`: Ringback file (wav).
 - `--ring-duration <SECONDS>`: Ring duration in seconds.
 - `--answer <FILE>`: Answer and play file (wav).
@@ -75,6 +84,9 @@ cargo run -- wait --addr 0.0.0.0:5060 --username sipbot --answer welcome.wav
 - `--reject <CODE>`: Reject with code (e.g. 486, 603).
 - `--reject-prob <PROB>`: Randomly reject call with probability 1-99% (default code 480).
 - `--srtp`: Enable SRTP/SDES.
+- `--nack`: Enable NACK.
+- `--jitter`: Enable Jitter Buffer.
+- `--codecs <LIST>`: Codecs to use (e.g., opus,g722,pcmu).
 
 > **Note**: By default, `wait` mode does not record calls. To enable recording, you must use a configuration file and specify the `recorders` directory.
 
@@ -111,10 +123,10 @@ sipbot wait --username announcer --answer welcome.wav --hangup 10
 
 ### 4. Load Testing (Outbound)
 
-Make 100 calls to a target, with 5 calls running concurrently, playing an audio file for 30 seconds each.
+Make 100 calls to a target, with 5 calls per second, playing an audio file for 30 seconds each.
 
 ```bash
-sipbot call -t sip:100@192.168.1.10 --play music.wav --total 100 --concurrent 5 --hangup 30
+sipbot call -t sip:100@192.168.1.10 --play music.wav --total 100 --cps 5 --hangup 30
 ```
 
 ### 5. High-Quality Audio (G.722)
@@ -192,11 +204,19 @@ after_secs = 10                 # Send BYE after 10 seconds
 - **`recorders`**: (Optional) Path to save call recordings.
 - **`accounts`**: List of account configurations.
     - `username`: SIP username.
+    - `auth_username`: (Optional) SIP authentication username.
     - `domain`: SIP domain/registrar.
     - `password`: SIP password.
+    - `proxy`: (Optional) SIP proxy server address.
     - `register`: (Bool) Whether to register with the domain.
     - `reject_prob`: (Optional) Probability (1-99) to randomly reject incoming calls with 480.
+    - `cancel_prob`: (Optional) Probability (1-99) to randomly cancel outgoing calls.
     - `target`: (Optional) URI to call on startup (for outbound bot).
+    - `record`: (Optional) Recording file path.
+    - `srtp_enabled`: (Bool) Enable SRTP/SDES.
+    - `nack_enabled`: (Bool) Enable RTP NACK.
+    - `jitter_buffer_enabled`: (Bool) Enable Jitter Buffer.
+    - `codecs`: (Optional) List of preferred codecs (e.g., `["opus", "g722", "pcmu"]`).
     - **`early_media`**: Configuration for the early media phase (183).
         - `wav_file`: (Optional) Path to WAV file.
         - `local`: (Optional) `true` to use local audio device for capture and playback.
@@ -280,11 +300,11 @@ code = 486         # currectly not used for caller
    ```
 
 2. **Start the Caller**:
-   The caller initiates the calls. You can use `--total` and `--concurrent` to control the load.
+   The caller initiates the calls. You can use `--total` and `--cps` to control the load.
 
    ```bash
-   # Make 100 total calls, with a maximum of 10 calls running concurrently
-   sipbot --conf caller.toml call --total 100 --concurrent 3
+   # Make 100 total calls, with a rate of 3 calls per second
+   sipbot --conf caller.toml call --total 100 --cps 3
    ```
 
 ## License

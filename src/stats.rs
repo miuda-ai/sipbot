@@ -34,6 +34,39 @@ impl CallStats {
         self.total_planned_calls.fetch_add(count, Ordering::Relaxed);
     }
 
+    pub async fn print_progress(&self) {
+        let current = self.current_calls.load(Ordering::Relaxed);
+        let finished = self.finished_calls.load(Ordering::Relaxed);
+        let total = self.total_planned_calls.load(Ordering::Relaxed);
+        let map = self.status_codes.lock().await;
+
+        let c200 = map.get(&200).cloned().unwrap_or(0);
+        let c180 = map.get(&180).cloned().unwrap_or(0);
+        let c183 = map.get(&183).cloned().unwrap_or(0);
+
+        let mut c3xx = 0;
+        let mut c4xx = 0;
+        let mut c5xx = 0;
+        let mut c6xx = 0;
+
+        for (&code, &count) in map.iter() {
+            match code {
+                300..=399 => c3xx += count,
+                400..=499 => c4xx += count,
+                500..=599 => c5xx += count,
+                600..=699 => c6xx += count,
+                _ => {}
+            }
+        }
+
+        print!(
+            "\rProgress: {}/{}, Active: {}, 200: {}, 180: {}, 183: {}, 3xx: {}, 4xx: {}, 5xx: {}, 6xx: {}",
+            finished, total, current, c200, c180, c183, c3xx, c4xx, c5xx, c6xx
+        );
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    }
+
     pub async fn print_summary(&self) {
         let total = self.total_planned_calls.load(Ordering::Relaxed);
         let finished = self.finished_calls.load(Ordering::Relaxed);

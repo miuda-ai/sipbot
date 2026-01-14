@@ -71,9 +71,9 @@ enum Commands {
         /// Total number of calls to make
         #[arg(long, default_value = "1")]
         total: u32,
-        /// Max concurrent calls
+        /// Calls per second
         #[arg(long, default_value = "1")]
-        concurrent: u32,
+        cps: u32,
         /// Cancel probability (0-99%)
         #[arg(long, default_value = "0")]
         cancel_prob: u8,
@@ -365,7 +365,7 @@ async fn main() -> Result<()> {
         jitter_buffer_override,
         local_override,
         total_calls,
-        concurrent_calls,
+        cps,
         register_override,
         proxy_override,
         cancel_prob_override,
@@ -385,7 +385,7 @@ async fn main() -> Result<()> {
             nack,
             jitter,
             total,
-            concurrent,
+            cps,
             cancel_prob,
             codecs,
         } => {
@@ -409,7 +409,7 @@ async fn main() -> Result<()> {
                 Some(*jitter),
                 *local,
                 *total,
-                *concurrent,
+                *cps,
                 is_register,
                 reg_target,
                 *cancel_prob,
@@ -501,6 +501,16 @@ async fn main() -> Result<()> {
     let global_config = config.clone();
     let shared_stats = Arc::new(CallStats::new());
 
+    if command_name == "call" {
+        println!(
+            "[*] Target:    {}",
+            target_override.as_deref().unwrap_or("")
+        );
+        println!("[*] Rate:      {} CPS", cps);
+        println!("[*] Duration:  {}s per call", hangup_override.unwrap_or(0));
+        println!("[*] Press Ctrl+C to stop and see the report.\n");
+    }
+
     for mut account in config.accounts {
         let global_config = global_config.clone();
         let target_override = target_override.clone();
@@ -541,7 +551,7 @@ async fn main() -> Result<()> {
             });
         } else if local_override {
             account.answer = Some(sipbot::config::AnswerConfig::Local);
-        } else if concurrent_calls == 1 && command_name == "call" {
+        } else if cps == 1 && command_name == "call" {
             account.answer = Some(sipbot::config::AnswerConfig::Local);
         }
 
@@ -600,7 +610,7 @@ async fn main() -> Result<()> {
             let mut bot = sip::SipBot::new(account, global_config, stats, verbose);
             match command_name {
                 "call" => {
-                    if let Err(e) = bot.run_call(total_calls, concurrent_calls).await {
+                    if let Err(e) = bot.run_call(total_calls, cps).await {
                         error!("Bot call error: {:?}", e);
                     }
                 }
