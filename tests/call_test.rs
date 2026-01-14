@@ -5,6 +5,7 @@ use sipbot::stats::CallStats;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
 async fn test_call_flow() -> Result<()> {
@@ -79,6 +80,7 @@ async fn test_call_flow() -> Result<()> {
             server_config,
             stats,
             false,
+            CancellationToken::new(),
         );
         if let Err(e) = bot.run_wait().await {
             eprintln!("Server error: {:?}", e);
@@ -96,6 +98,7 @@ async fn test_call_flow() -> Result<()> {
             client_config,
             stats,
             false,
+            CancellationToken::new(),
         );
         if let Err(e) = bot.run_call(1, 1).await {
             eprintln!("Client error: {:?}", e);
@@ -194,6 +197,7 @@ async fn test_options_flow() -> Result<()> {
             server_config,
             stats,
             false,
+            CancellationToken::new(),
         );
         if let Err(e) = bot.run_wait().await {
             eprintln!("Server error: {:?}", e);
@@ -211,6 +215,7 @@ async fn test_options_flow() -> Result<()> {
             client_config,
             stats,
             false,
+            CancellationToken::new(),
         );
         if let Err(e) = bot.run_options(None).await {
             eprintln!("Client error: {:?}", e);

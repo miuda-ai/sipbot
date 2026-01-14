@@ -6,7 +6,8 @@ use sipbot::sip;
 use sipbot::stats::CallStats;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{debug, error, info};
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time::ChronoLocal;
 
@@ -500,6 +501,7 @@ async fn main() -> Result<()> {
     let mut handles = vec![];
     let global_config = config.clone();
     let shared_stats = Arc::new(CallStats::new());
+    let cancel_token = CancellationToken::new();
 
     if command_name == "call" {
         println!(
@@ -606,8 +608,9 @@ async fn main() -> Result<()> {
         }
 
         let verbose = args.verbose;
+        let token = cancel_token.clone();
         let handle = tokio::spawn(async move {
-            let mut bot = sip::SipBot::new(account, global_config, stats, verbose);
+            let mut bot = sip::SipBot::new(account, global_config, stats, verbose, token);
             match command_name {
                 "call" => {
                     if let Err(e) = bot.run_call(total_calls, cps).await {
@@ -635,12 +638,29 @@ async fn main() -> Result<()> {
         handles.push(handle);
     }
 
-    tokio::select! {
-        _ = join_all(handles) => {
-            info!("All bots finished.");
-        }
-        _ = tokio::signal::ctrl_c() => {
-            debug!("Cancelled");
+    let all_bots = join_all(handles);
+    tokio::pin!(all_bots);
+
+    match tokio::select! {
+        _ = &mut all_bots => { Ok(()) }
+        _ = tokio::signal::ctrl_c() => { Err(()) }
+    } {
+        Ok(_) => info!("All bots finished."),
+        Err(_) => {
+            info!("Cancelled, hanging up active calls...");
+            cancel_token.cancel();
+
+            // Wait for bots to finish cleanup
+            all_bots.await;
+
+            if shared_stats.current() > 0 {
+                tracing::warn!(
+                    "Exiting with {} active calls still tracked in stats (should be 0)",
+                    shared_stats.current()
+                );
+            } else {
+                info!("All active calls cleared.");
+            }
         }
     }
 

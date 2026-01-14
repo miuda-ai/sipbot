@@ -39,6 +39,7 @@ struct CallRunner {
     account: AccountConfig,
     global_config: Config,
     stats: Arc<CallStats>,
+    cancel_token: CancellationToken,
 }
 
 struct CallGuard {
@@ -159,6 +160,8 @@ impl CallRunner {
         let invite = dialog_layer.do_invite(opt, tx);
         tokio::pin!(invite);
 
+        let mut latest_dialog_id = None;
+
         loop {
             tokio::select! {
                 res = &mut invite => {
@@ -169,9 +172,12 @@ impl CallRunner {
                 }
                 state = rx.recv() => {
                     if let Some(state) = state {
-                        if let DialogState::Early(_, res) = &state {
-                            let code: u16 = res.status_code().clone().into();
+                        if let DialogState::Trying(d_id) = &state {
+                            latest_dialog_id = Some(d_id.clone());
+                        } else if let DialogState::Early(d_id, res) = &state {
+                             let code: u16 = res.status_code().clone().into();
                             self.stats.add_status(code).await;
+                            latest_dialog_id = Some(d_id.clone());
                         }
 
                         if should_cancel {
@@ -190,6 +196,17 @@ impl CallRunner {
                             }
                         }
                     }
+                }
+                _ = self.cancel_token.cancelled() => {
+                    info!("[{}] Cancellation requested during INVITE phase.", self.account.username);
+                    if let Some(mut dialog_id) = latest_dialog_id {
+                         dialog_id.to_tag.clear();
+                         if let Some(dialog) = dialog_layer.get_dialog(&dialog_id) {
+                              info!("[{}] Cancelling pending INVITE...", self.account.username);
+                             let _ = dialog.hangup().await;
+                         }
+                    }
+                    return Ok(());
                 }
             }
         }
@@ -339,6 +356,9 @@ impl CallRunner {
                     play_handle.abort();
                     return Ok(());
                 }
+                _ = self.cancel_token.cancelled() => {
+                    info!("[{}] Cancellation requested.", self.account.username);
+                }
             }
             play_handle.abort();
         } else {
@@ -352,6 +372,9 @@ impl CallRunner {
                 }
                 _ = monitor_future => {
                     return Ok(());
+                }
+                _ = self.cancel_token.cancelled() => {
+                    info!("[{}] Cancellation requested.", self.account.username);
                 }
             }
         }
@@ -373,6 +396,7 @@ pub struct SipBot {
     stats: Arc<CallStats>,
     pub verbose: bool,
     pub is_wait: bool,
+    pub cancel_token: CancellationToken,
 }
 
 impl SipBot {
@@ -381,6 +405,7 @@ impl SipBot {
         global_config: Config,
         stats: Arc<CallStats>,
         verbose: bool,
+        cancel_token: CancellationToken,
     ) -> Self {
         Self {
             account,
@@ -391,6 +416,7 @@ impl SipBot {
             stats,
             verbose,
             is_wait: false,
+            cancel_token,
         }
     }
 
@@ -534,6 +560,7 @@ impl SipBot {
                 account: self.account.clone(),
                 global_config: self.global_config.clone(),
                 stats: self.stats.clone(),
+                cancel_token: self.cancel_token.clone(),
             };
 
             let mut handles = vec![];
@@ -556,7 +583,13 @@ impl SipBot {
                 handles.push(handle);
 
                 if i < total - 1 && cps > 0 {
-                    tokio::time::sleep(delay).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = self.cancel_token.cancelled() => {
+                            info!("[{}] Cancellation requested, checking existing calls...", self.account.username);
+                            break;
+                        }
+                    }
                 }
             }
 

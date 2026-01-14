@@ -165,6 +165,10 @@ impl CallStats {
         self.current_calls.fetch_sub(1, Ordering::Relaxed);
     }
 
+    pub fn current(&self) -> u32 {
+        self.current_calls.load(Ordering::Relaxed)
+    }
+
     pub fn inc_finished(&self) {
         self.finished_calls.fetch_add(1, Ordering::Relaxed);
     }
