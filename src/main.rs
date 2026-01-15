@@ -662,7 +662,7 @@ async fn main() -> Result<()> {
 
             if shared_stats.current() > 0 {
                 tracing::warn!(
-                    "Exiting with {} active calls still tracked in stats (should be 0)",
+                    "Exiting with {} active calls still tracked in stats (should be 0). This may happen if some calls did not hang up gracefully or tasks were dropped.",
                     shared_stats.current()
                 );
             } else {

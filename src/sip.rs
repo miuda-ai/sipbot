@@ -50,7 +50,8 @@ struct CallGuard {
 
 impl Drop for CallGuard {
     fn drop(&mut self) {
-        self.stats.dec_current();
+        // Note: stats decrement moved to after BYE is sent
+        // self.stats.dec_current();
         self.stats.inc_finished();
         self.stats.add_duration(self.start_time.elapsed());
         if let Some(media) = self.media_session.take() {
@@ -435,6 +436,7 @@ pub struct SipBot {
     pub verbose: bool,
     pub is_wait: bool,
     pub cancel_token: CancellationToken,
+    transport_token: CancellationToken,
 }
 
 impl SipBot {
@@ -454,6 +456,7 @@ impl SipBot {
             stats,
             verbose,
             is_wait: false,
+            transport_token: CancellationToken::new(),
             cancel_token,
         }
     }
@@ -479,7 +482,7 @@ impl SipBot {
             }
         }
 
-        let transport_layer = TransportLayer::new(self.cancel_token.child_token());
+        let transport_layer = TransportLayer::new(CancellationToken::new());
 
         // Bind to configured address or default
         let addr_str = self
@@ -489,9 +492,7 @@ impl SipBot {
             .unwrap_or("0.0.0.0:35060");
         let addr = addr_str.parse().context("Invalid bind address")?;
 
-        let udp_conn =
-            UdpConnection::create_connection(addr, None, Some(self.cancel_token.child_token()))
-                .await?;
+        let udp_conn = UdpConnection::create_connection(addr, None, None).await?;
         let local_addr = udp_conn.get_addr();
         info!("[{}] Listening on {}", self.account.username, local_addr);
 
@@ -573,6 +574,52 @@ impl SipBot {
         // Listen for incoming calls
         self.listen_loop().await?;
 
+        info!(
+            "[{}] Listen loop exited, giving tasks 200ms to start cleanup",
+            self.account.username
+        );
+        // Give spawned call tasks time to send BYE before closing transport
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        if self.stats.current() > 0 {
+            info!(
+                "[{}] Waiting for {} active calls to finish cleanup...",
+                self.account.username,
+                self.stats.current()
+            );
+            let mut wait_count = 0;
+            while self.stats.current() > 0 && wait_count < 50 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                wait_count += 1;
+                if wait_count % 10 == 0 {
+                    info!(
+                        "[{}] Still waiting... {} calls active",
+                        self.account.username,
+                        self.stats.current()
+                    );
+                }
+            }
+            if self.stats.current() > 0 {
+                warn!(
+                    "[{}] {} calls still active after waiting 5 seconds",
+                    self.account.username,
+                    self.stats.current()
+                );
+            } else {
+                info!(
+                    "[{}] All active calls finished cleanup.",
+                    self.account.username
+                );
+            }
+        } else {
+            info!(
+                "[{}] No active calls at listen loop exit",
+                self.account.username
+            );
+        }
+        info!("[{}] Cancelling transport token", self.account.username);
+        self.transport_token.cancel();
+
         Ok(())
     }
 
@@ -640,14 +687,21 @@ impl SipBot {
             }
 
             let calls_future = futures::future::join_all(handles);
+            tokio::pin!(calls_future);
 
             tokio::select! {
-                _ = self.listen_loop() => {}
-                _ = calls_future => {
+                _ = self.listen_loop() => {
+                    if self.cancel_token.is_cancelled() {
+                        info!("[{}] Listen loop stopped due to cancellation, waiting for active calls to finish cleanup...", self.account.username);
+                    }
+                    calls_future.await;
+                }
+                _ = &mut calls_future => {
                     println!(); // New line after progress
                     info!("[{}] All calls finished.", self.account.username);
                 }
             }
+            self.transport_token.cancel();
         } else {
             warn!(
                 "[{}] No target configured for outbound call",
@@ -672,6 +726,7 @@ impl SipBot {
                 self.account.username
             );
         }
+        self.transport_token.cancel();
         Ok(())
     }
 
@@ -685,6 +740,7 @@ impl SipBot {
         } else {
             warn!("[{}] No target configured for INFO", self.account.username);
         }
+        self.transport_token.cancel();
         Ok(())
     }
 
@@ -965,10 +1021,12 @@ impl SipBot {
         let offer_body = transaction.original.body().clone();
         let stats_clone = self.stats.clone();
         let cancel_token = self.cancel_token.clone();
+        self.stats.add_total_planned(1);
+        self.stats.inc_current();
+        let username_log = self.account.username.clone();
         tokio::spawn(async move {
-            stats_clone.add_total_planned(1);
-            stats_clone.inc_current();
-            let mut _guard = CallGuard {
+            info!("[{}] Call task started", username_log);
+            let mut _call_guard = CallGuard {
                 stats: stats_clone.clone(),
                 start_time: std::time::Instant::now(),
                 media_session: None,
@@ -980,7 +1038,6 @@ impl SipBot {
                 if let Err(e) = server_dialog_handler.handle(&mut transaction).await {
                     error!("Transaction handler error: {:?}", e);
                 }
-                let _ = _guard;
             });
 
             // Monitor loop
@@ -1013,9 +1070,10 @@ impl SipBot {
                     }
                 }
             };
-            let cancel_token_clone = cancel_token.clone();
             // Call logic
+            let stats_for_decrement = stats_clone.clone();
             let call_logic = async move {
+                info!("[{}] Call logic started", account.username);
                 // Random rejection check
                 if let Some(prob) = account.reject_prob {
                     let should_reject = {
@@ -1066,7 +1124,7 @@ impl SipBot {
                         {
                             Ok((session, sdp, codec_name)) => {
                                 media_session = Some(session.clone());
-                                _guard.media_session = Some(session);
+                                _call_guard.media_session = Some(session);
                                 local_sdp = Some(sdp);
                                 info!(
                                     "[{}] Call established: From={}, To={}, Preferred Codec={}",
@@ -1238,93 +1296,83 @@ impl SipBot {
                 }
 
                 // Stage 2: Answer or Reject
+                if cancel_token.is_cancelled() {
+                    info!(
+                        "[{}] Stage 2: Cancellation requested, rejecting call",
+                        account.username
+                    );
+                    let _ = server_dialog_clone.reject(Some(StatusCode::BusyHere), None);
+                    return;
+                }
+
                 // Always answer with configured or default media
-                {
-                    info!("[{}] Stage 2: Answering (200 OK)", account.username);
-                    let mut headers = vec![];
-                    let mut body = None;
-                    // Add SDP if we have local SDP
-                    if let Some(sdp) = local_sdp.as_ref() {
-                        body = Some(sdp.clone().into_bytes());
-                        headers.push(Header::ContentType("application/sdp".into()));
-                    }
+                info!("[{}] Stage 2: Answering (200 OK)", account.username);
+                let mut headers = vec![];
+                let mut body = None;
+                // Add SDP if we have local SDP
+                if let Some(sdp) = local_sdp.as_ref() {
+                    body = Some(sdp.clone().into_bytes());
+                    headers.push(Header::ContentType("application/sdp".into()));
+                }
 
-                    if let Err(e) = server_dialog_clone.accept(Some(headers), body) {
-                        error!("Accept error: {:?}", e);
-                        return;
-                    }
-                    stats_clone.add_status(200).await;
+                if let Err(e) = server_dialog_clone.accept(Some(headers), body) {
+                    error!("Accept error: {:?}", e);
+                    return;
+                }
+                stats_clone.add_status(200).await;
 
-                    if media_session.is_none() {
-                        warn!(
-                            "[{}] No media session established (missing SDP?)",
-                            account.username
-                        );
-                    }
+                if media_session.is_none() {
+                    warn!(
+                        "[{}] No media session established (missing SDP?)",
+                        account.username
+                    );
+                }
 
-                    let username_media = account.username.clone();
-                    let answer_config = account.answer.clone();
-                    let hangup_config = account.hangup.clone();
-                    let keep_alive = hangup_config.is_some();
-                    let media_session_to_stop = media_session.clone();
+                let username_media = account.username.clone();
+                let answer_config = account.answer.clone();
+                let hangup_config = account.hangup.clone();
+                let keep_alive = hangup_config.is_some();
+                let media_session_to_stop = media_session.clone();
 
-                    let media_future = async move {
-                        if let Some(media) = media_session {
-                            if let Some(cfg) = answer_config {
-                                match cfg {
-                                    AnswerConfig::Echo => {
-                                        info!("[{}] Stage 2: Starting Echo", username_media);
-                                        media
-                                            .start_echo(
+                let media_future = async move {
+                    if let Some(media) = media_session {
+                        if let Some(cfg) = answer_config {
+                            match cfg {
+                                AnswerConfig::Echo => {
+                                    info!("[{}] Stage 2: Starting Echo", username_media);
+                                    media
+                                        .start_echo(
+                                            username_media.clone(),
+                                            recording_path.as_deref(),
+                                        )
+                                        .await
+                                }
+                                AnswerConfig::Play { wav_file } => {
+                                    info!("[{}] Stage 2: Playing {}", username_media, wav_file);
+                                    media
+                                        .play_file(
+                                            username_media.clone(),
+                                            std::path::Path::new(&wav_file),
+                                            recording_path.as_deref(),
+                                            keep_alive,
+                                        )
+                                        .await
+                                }
+                                AnswerConfig::Local => {
+                                    info!("[{}] Stage 2: Starting Local Audio", username_media);
+                                    #[cfg(feature = "local-device")]
+                                    {
+                                        if let Err(e) = media
+                                            .play_local_device(
                                                 username_media.clone(),
-                                                recording_path.as_deref(),
-                                            )
-                                            .await
-                                    }
-                                    AnswerConfig::Play { wav_file } => {
-                                        info!("[{}] Stage 2: Playing {}", username_media, wav_file);
-                                        media
-                                            .play_file(
-                                                username_media.clone(),
-                                                std::path::Path::new(&wav_file),
                                                 recording_path.as_deref(),
                                                 keep_alive,
                                             )
                                             .await
-                                    }
-                                    AnswerConfig::Local => {
-                                        info!("[{}] Stage 2: Starting Local Audio", username_media);
-                                        #[cfg(feature = "local-device")]
-                                        {
-                                            if let Err(e) = media
-                                                .play_local_device(
-                                                    username_media.clone(),
-                                                    recording_path.as_deref(),
-                                                    keep_alive,
-                                                )
-                                                .await
-                                            {
-                                                warn!(
-                                                    "[{}] Failed to start local audio: {:?}, falling back to default answer",
-                                                    username_media, e
-                                                );
-                                                media
-                                                    .play_wav_bytes(
-                                                        username_media,
-                                                        ANSWER_WAV,
-                                                        recording_path.as_deref(),
-                                                        keep_alive,
-                                                    )
-                                                    .await
-                                            } else {
-                                                Ok(())
-                                            }
-                                        }
-                                        #[cfg(not(feature = "local-device"))]
                                         {
                                             warn!(
-                                                "[{}] Local device support is disabled in this build, falling back to default answer",
-                                                username_media
+                                                "[{}] Failed to start local audio: {:?}, falling back to default answer",
+                                                username_media, e
                                             );
                                             media
                                                 .play_wav_bytes(
@@ -1334,63 +1382,68 @@ impl SipBot {
                                                     keep_alive,
                                                 )
                                                 .await
+                                        } else {
+                                            Ok(())
                                         }
                                     }
-                                }
-                            } else {
-                                // Default answer
-                                info!("[{}] Stage 2: Playing default answer", username_media);
-                                media
-                                    .play_wav_bytes(
-                                        username_media,
-                                        ANSWER_WAV,
-                                        recording_path.as_deref(),
-                                        keep_alive,
-                                    )
-                                    .await
-                            }
-                        } else {
-                            Ok(())
-                        }
-                    };
-
-                    if let Some(ref hangup) = hangup_config {
-                        if let Some(secs) = hangup.after_secs {
-                            info!(
-                                "[{}] Stage 3: Will hangup after {} seconds",
-                                account.username, secs
-                            );
-                            tokio::select! {
-                                res = media_future => {
-                                    if let Err(e) = res {
-                                        error!("[{}] Media error: {:?}", account.username, e);
-                                    }
-                                    info!("[{}] Media finished", account.username);
-                                }
-                                _ = tokio::time::sleep(Duration::from_secs(secs)) => {
-                                    info!("[{}] Hangup timer expired", account.username);
-                                }
-                                _ = cancel_token.cancelled() => {
-                                    info!("[{}] Cancellation requested during call.", account.username);
-                                }
-                            }
-                            info!("[{}] Stage 3: Sending BYE", account.username);
-                            if let Err(e) = server_dialog_clone.bye().await {
-                                error!("[{}] Failed to send BYE: {:?}", account.username, e);
-                            }
-                        } else {
-                            tokio::select! {
-                                res = media_future => {
-                                    if let Err(e) = res {
-                                        error!("[{}] Media error: {:?}", account.username, e);
+                                    #[cfg(not(feature = "local-device"))]
+                                    {
+                                        warn!(
+                                            "[{}] Local device support is disabled in this build, falling back to default answer",
+                                            username_media
+                                        );
+                                        media
+                                            .play_wav_bytes(
+                                                username_media,
+                                                ANSWER_WAV,
+                                                recording_path.as_deref(),
+                                                keep_alive,
+                                            )
+                                            .await
                                     }
                                 }
-                                _ = cancel_token.cancelled() => {
-                                    info!("[{}] Cancellation requested during call.", account.username);
-                                }
                             }
+                        } else {
+                            // Default answer
+                            info!("[{}] Stage 2: Playing default answer", username_media);
+                            media
+                                .play_wav_bytes(
+                                    username_media,
+                                    ANSWER_WAV,
+                                    recording_path.as_deref(),
+                                    keep_alive,
+                                )
+                                .await
                         }
                     } else {
+                        Ok(())
+                    }
+                };
+
+                let wait_timeout = hangup_config.as_ref().and_then(|h| h.after_secs);
+
+                match wait_timeout {
+                    Some(secs) => {
+                        info!(
+                            "[{}] Stage 3: Will hangup after {} seconds",
+                            account.username, secs
+                        );
+                        tokio::select! {
+                            res = media_future => {
+                                if let Err(e) = res {
+                                    error!("[{}] Media error: {:?}", account.username, e);
+                                }
+                                info!("[{}] Media finished", account.username);
+                            }
+                            _ = tokio::time::sleep(Duration::from_secs(secs)) => {
+                                info!("[{}] Hangup timer expired", account.username);
+                            }
+                            _ = cancel_token.cancelled() => {
+                                info!("[{}] Cancellation requested during call.", account.username);
+                            }
+                        }
+                    }
+                    None => {
                         tokio::select! {
                             res = media_future => {
                                 if let Err(e) = res {
@@ -1402,25 +1455,39 @@ impl SipBot {
                             }
                         }
                     }
+                }
 
-                    if let Some(media) = media_session_to_stop {
-                        media.stop().await;
+                if let Some(media) = media_session_to_stop {
+                    media.stop().await;
+                }
+
+                // Send BYE explicitly before dropping the guard
+                info!("[{}] About to send BYE", account.username);
+                match server_dialog_clone.bye().await {
+                    Ok(_) => {
+                        info!("[{}] BYE sent successfully", account.username);
+                    }
+                    Err(e) => {
+                        debug!("[{}] BYE send result: {:?}", account.username, e);
                     }
                 }
+                info!("[{}] Call logic completed", account.username);
             };
 
-            tokio::select! {
-                _ = monitor_future => {
-                    // Terminated early
-                }
-                _ = call_logic => {
-                    // Finished normally
-                }
-                _ = cancel_token_clone.cancelled() => {
-                    info!("[{}] Call handling cancelled.", username);
-                    // Optionally, send BYE if in confirmed state
-                }
-            }
+            // Run monitor and call logic concurrently, but ensure call_logic always finishes
+            let monitor_handle = tokio::spawn(monitor_future);
+
+            info!("[{}] Running call logic to completion", username_log);
+            // Always run call_logic to completion (it handles cancellation and sends BYE)
+            call_logic.await;
+            info!("[{}] Call logic finished, decrementing stats", username_log);
+
+            // Decrement stats AFTER BYE is sent
+            stats_for_decrement.dec_current();
+
+            // Cancel monitor if still running
+            monitor_handle.abort();
+            info!("[{}] Call task completed", username_log);
         });
 
         Ok(())

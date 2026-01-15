@@ -821,7 +821,7 @@ impl MediaSession {
 
         // Stop any existing local playback if requested or just return if already active
         {
-            let mut stop_tx = self.local_stop_tx.lock().await;
+            let stop_tx = self.local_stop_tx.lock().await;
             if stop_tx.is_some() {
                 info!(
                     "[{}] Local audio already active, updating recorder if needed",
@@ -1969,7 +1969,7 @@ fn spawn_track_recorder(
 }
 
 async fn process_recorded_sample(
-    mut sample: MediaSample,
+    sample: MediaSample,
     recorder: &Mutex<Option<Recorder>>,
     stats: &CallStats,
     decoder: &mut Box<dyn Decoder + Send>,
@@ -1988,35 +1988,6 @@ async fn process_recorded_sample(
     } else {
         None
     };
-
-    // Validate timestamp continuity and rewrite if needed to fix interleaved streams
-    if let MediaSample::Audio(ref mut frame) = sample {
-        if let Some(ref decoded_data) = decoded {
-            if let Some(last_ts) = *last_timestamp {
-                // Calculate expected timestamp based on last timestamp + samples
-                let ticks = (decoded_data.len() as u64 * rtp_clock_rate as u64
-                    / actual_sample_rate as u64) as u32;
-                let expected_ts = last_ts.wrapping_add(ticks);
-                let ts_diff = frame.rtp_timestamp.wrapping_sub(expected_ts);
-
-                // Allow up to 10 seconds of jump to handle legitimate gaps
-                let max_reasonable_jump: u32 = rtp_clock_rate * 10;
-
-                // Rewrite packets with large forward jumps
-                if ts_diff > max_reasonable_jump && ts_diff < (u32::MAX / 2) {
-                    tracing::debug!(
-                        "Recording: Rewriting timestamp (forward jump): seq={:?} original_ts={} -> expected_ts={} diff={} (>{:.1}s)",
-                        frame.sequence_number,
-                        frame.rtp_timestamp,
-                        expected_ts,
-                        ts_diff,
-                        ts_diff as f32 / rtp_clock_rate as f32
-                    );
-                    frame.rtp_timestamp = expected_ts;
-                }
-            }
-        }
-    }
 
     if let MediaSample::Audio(frame) = &sample {
         if let Some(seq) = frame.sequence_number {
