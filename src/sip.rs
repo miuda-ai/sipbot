@@ -148,6 +148,7 @@ impl CallRunner {
 
         let dialog;
         let response;
+        let mut media_task = None;
         let mut should_cancel;
         let cancel_before_ringring: bool;
         {
@@ -178,6 +179,38 @@ impl CallRunner {
                              let code: u16 = res.status_code().clone().into();
                             self.stats.add_status(code).await;
                             latest_dialog_id = Some(d_id.clone());
+
+                            if code == 183 {
+                                let answer_sdp = String::from_utf8_lossy(&res.body);
+                                if !answer_sdp.is_empty() {
+                                    debug!("[{}] Received Early Media (183) SDP:\n{}", self.account.username, answer_sdp);
+                                    if let Err(e) = media_session.set_remote_answer(&answer_sdp).await {
+                                        warn!("[{}] Failed to set remote answer for early media: {:?}", self.account.username, e);
+                                    } else if media_task.is_none() {
+                                        info!("[{}] Early media session established", self.account.username);
+                                        // Start playing early media if configured
+                                        let media_clone = media_session.clone();
+                                        let username = self.account.username.clone();
+                                        let answer_config = self.account.answer.clone();
+                                        media_task = Some(tokio::spawn(async move {
+                                            if let Some(cfg) = answer_config {
+                                                match cfg {
+                                                    AnswerConfig::Echo => {
+                                                        let _ = media_clone.start_echo(username, None).await;
+                                                    }
+                                                    AnswerConfig::Play { wav_file } => {
+                                                        let _ = media_clone.play_file(username, Path::new(&wav_file), None, true).await;
+                                                    }
+                                                    AnswerConfig::Local => {
+                                                        #[cfg(feature = "local-device")]
+                                                        let _ = media_clone.play_local_device(username, None, true).await;
+                                                    }
+                                                }
+                                            }
+                                        }));
+                                    }
+                                }
+                            }
                         }
 
                         if should_cancel {
@@ -280,6 +313,11 @@ impl CallRunner {
         let keep_alive = hangup_secs.is_some();
 
         let play_future = async move {
+            if let Some(task) = media_task {
+                info!("[{}] Using already started early media.", username);
+                let _ = task.await;
+                return;
+            }
             let record_path_ref = record_path.as_deref();
             if let Some(answer_config) = answer_config {
                 match answer_config {
@@ -441,8 +479,7 @@ impl SipBot {
             }
         }
 
-        let cancel_token = CancellationToken::new();
-        let transport_layer = TransportLayer::new(cancel_token.child_token());
+        let transport_layer = TransportLayer::new(self.cancel_token.child_token());
 
         // Bind to configured address or default
         let addr_str = self
@@ -453,7 +490,8 @@ impl SipBot {
         let addr = addr_str.parse().context("Invalid bind address")?;
 
         let udp_conn =
-            UdpConnection::create_connection(addr, None, Some(cancel_token.child_token())).await?;
+            UdpConnection::create_connection(addr, None, Some(self.cancel_token.child_token()))
+                .await?;
         let local_addr = udp_conn.get_addr();
         info!("[{}] Listening on {}", self.account.username, local_addr);
 
@@ -518,9 +556,17 @@ impl SipBot {
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
+            let mut last_was_zero = false;
             loop {
                 interval.tick().await;
-                monitor_stats.print_summary().await;
+                let current = monitor_stats.current();
+                if current > 0 {
+                    monitor_stats.print_summary().await;
+                    last_was_zero = false;
+                } else if !last_was_zero {
+                    monitor_stats.print_summary().await;
+                    last_was_zero = true;
+                }
             }
         });
 
@@ -801,12 +847,25 @@ impl SipBot {
         let endpoint = self.endpoint.as_ref().context("Endpoint not initialized")?;
         let mut incoming = endpoint.incoming_transactions()?;
 
-        while let Some(transaction) = incoming.recv().await {
-            if let Err(e) = self.handle_incoming_transaction(transaction).await {
-                error!(
-                    "[{}] Error handling incoming transaction: {:?}",
-                    self.account.username, e
-                );
+        loop {
+            tokio::select! {
+                transaction = incoming.recv() => {
+                    match transaction {
+                        Some(transaction) => {
+                            if let Err(e) = self.handle_incoming_transaction(transaction).await {
+                                error!(
+                                    "[{}] Error handling incoming transaction: {:?}",
+                                    self.account.username, e
+                                );
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                _ = self.cancel_token.cancelled() => {
+                    info!("[{}] Listen loop stopped due to cancellation.", self.account.username);
+                    break;
+                }
             }
         }
         Ok(())
@@ -905,6 +964,7 @@ impl SipBot {
         let server_dialog_clone = server_dialog.clone();
         let offer_body = transaction.original.body().clone();
         let stats_clone = self.stats.clone();
+        let cancel_token = self.cancel_token.clone();
         tokio::spawn(async move {
             stats_clone.add_total_planned(1);
             stats_clone.inc_current();
@@ -953,7 +1013,7 @@ impl SipBot {
                     }
                 }
             };
-
+            let cancel_token_clone = cancel_token.clone();
             // Call logic
             let call_logic = async move {
                 // Random rejection check
@@ -1310,19 +1370,36 @@ impl SipBot {
                                 _ = tokio::time::sleep(Duration::from_secs(secs)) => {
                                     info!("[{}] Hangup timer expired", account.username);
                                 }
+                                _ = cancel_token.cancelled() => {
+                                    info!("[{}] Cancellation requested during call.", account.username);
+                                }
                             }
                             info!("[{}] Stage 3: Sending BYE", account.username);
                             if let Err(e) = server_dialog_clone.bye().await {
                                 error!("[{}] Failed to send BYE: {:?}", account.username, e);
                             }
                         } else {
-                            if let Err(e) = media_future.await {
-                                error!("[{}] Media error: {:?}", account.username, e);
+                            tokio::select! {
+                                res = media_future => {
+                                    if let Err(e) = res {
+                                        error!("[{}] Media error: {:?}", account.username, e);
+                                    }
+                                }
+                                _ = cancel_token.cancelled() => {
+                                    info!("[{}] Cancellation requested during call.", account.username);
+                                }
                             }
                         }
                     } else {
-                        if let Err(e) = media_future.await {
-                            error!("[{}] Media error: {:?}", account.username, e);
+                        tokio::select! {
+                            res = media_future => {
+                                if let Err(e) = res {
+                                    error!("[{}] Media error: {:?}", account.username, e);
+                                }
+                            }
+                            _ = cancel_token.cancelled() => {
+                                info!("[{}] Cancellation requested during call.", account.username);
+                            }
                         }
                     }
 
@@ -1338,6 +1415,10 @@ impl SipBot {
                 }
                 _ = call_logic => {
                     // Finished normally
+                }
+                _ = cancel_token_clone.cancelled() => {
+                    info!("[{}] Call handling cancelled.", username);
+                    // Optionally, send BYE if in confirmed state
                 }
             }
         });

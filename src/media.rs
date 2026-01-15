@@ -133,6 +133,8 @@ pub struct MediaSession {
     output_sample_rate: Arc<std::sync::atomic::AtomicU32>,
     #[cfg(feature = "local-device")]
     output_resampler: Arc<Mutex<Option<audio_codec::Resampler>>>,
+    #[cfg(feature = "local-device")]
+    local_stop_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>>,
     tracked_mids: Arc<Mutex<std::collections::HashSet<String>>>,
     cancel_token: CancellationToken,
 }
@@ -302,6 +304,8 @@ impl MediaSession {
             output_sample_rate: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             #[cfg(feature = "local-device")]
             output_resampler: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "local-device")]
+            local_stop_tx: Arc::new(Mutex::new(None)),
             tracked_mids: Arc::new(Mutex::new(std::collections::HashSet::new())),
             cancel_token: cancel_token.clone(),
         };
@@ -464,6 +468,8 @@ impl MediaSession {
                 output_sample_rate: Arc::new(std::sync::atomic::AtomicU32::new(8000)),
                 #[cfg(feature = "local-device")]
                 output_resampler: Arc::new(Mutex::new(None)),
+                #[cfg(feature = "local-device")]
+                local_stop_tx: Arc::new(Mutex::new(None)),
                 tracked_mids: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 cancel_token,
             },
@@ -473,18 +479,28 @@ impl MediaSession {
 
     pub async fn set_remote_answer(&self, remote_sdp: &str) -> Result<String> {
         let remote_desc = SessionDescription::parse(SdpType::Answer, remote_sdp)?;
+
+        if let Some(current_remote) = self.pc.remote_description() {
+            if current_remote.to_sdp_string() == remote_sdp {
+                return Ok(self.get_codec_name_from_sdp(remote_sdp));
+            }
+        }
+
         self.pc.set_remote_description(remote_desc).await?;
 
+        Ok(self.get_codec_name_from_sdp(remote_sdp))
+    }
+
+    fn get_codec_name_from_sdp(&self, sdp: &str) -> String {
         let mut codec_name = "Unknown".to_string();
-        if let Some(mline) = remote_sdp
+        if let Some(mline) = sdp
             .lines()
             .find(|l| l.to_lowercase().starts_with("m=audio"))
         {
             if let Some(pt_str) = mline.split_whitespace().nth(3) {
                 if let Ok(pt) = pt_str.parse::<u8>() {
                     let rtpmap_prefix = format!("a=rtpmap:{} ", pt);
-                    if let Some(rtpmap) = remote_sdp.lines().find(|l| l.starts_with(&rtpmap_prefix))
-                    {
+                    if let Some(rtpmap) = sdp.lines().find(|l| l.starts_with(&rtpmap_prefix)) {
                         if let Some(spec) = rtpmap.split_whitespace().nth(1) {
                             codec_name = spec.split('/').next().unwrap_or("Unknown").to_uppercase();
                         }
@@ -499,8 +515,6 @@ impl MediaSession {
                         .to_string();
                     }
 
-                    // Special case for Opus if it wasn't found in rtpmap via simple string match or handled by static map
-                    // (Though Opus should always have rtpmap 111 or similar)
                     #[cfg(feature = "opus")]
                     if codec_name == "Unknown" && pt == 111 {
                         codec_name = "OPUS".to_string();
@@ -508,7 +522,7 @@ impl MediaSession {
                 }
             }
         }
-        Ok(codec_name)
+        codec_name
     }
 
     fn spawn_audio_loop(
@@ -805,6 +819,24 @@ impl MediaSession {
             username
         );
 
+        // Stop any existing local playback if requested or just return if already active
+        {
+            let mut stop_tx = self.local_stop_tx.lock().await;
+            if stop_tx.is_some() {
+                info!(
+                    "[{}] Local audio already active, updating recorder if needed",
+                    username
+                );
+                if let Some(path) = recording_path {
+                    let mut rec = self.recorder.lock().await;
+                    if rec.is_none() {
+                        *rec = Some(Recorder::new(username.clone(), path.to_path_buf()));
+                    }
+                }
+                return Ok(());
+            }
+        }
+
         if let Some(path) = recording_path {
             let mut rec = self.recorder.lock().await;
             *rec = Some(Recorder::new(username.clone(), path.to_path_buf()));
@@ -876,6 +908,21 @@ impl MediaSession {
 
         // Move stream creation to a separate thread to avoid Send issues with cpal::Stream on some platforms
         let (stream_stop_tx, stream_stop_rx) = std::sync::mpsc::channel();
+        {
+            let mut stop_tx = self.local_stop_tx.lock().await;
+            *stop_tx = Some(stream_stop_tx.clone());
+        }
+
+        struct StreamGuard(Option<std::sync::mpsc::Sender<()>>);
+        impl Drop for StreamGuard {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        let mut _guard = StreamGuard(Some(stream_stop_tx.clone()));
+
         let (init_tx, init_rx) = tokio::sync::oneshot::channel::<Result<()>>();
 
         std::thread::spawn(move || {
@@ -978,8 +1025,7 @@ impl MediaSession {
             .context("Audio initialization thread panicked or dropped")??;
 
         let pc = self.pc.clone();
-        let cancel_token = CancellationToken::new();
-        let child_token = cancel_token.clone();
+        let child_token = self.cancel_token.child_token();
 
         // Handle existing transceivers
         let transceivers = pc.get_transceivers();
@@ -1141,6 +1187,9 @@ impl MediaSession {
                 _ = &mut input_task => {
                     break;
                 }
+                _ = self.cancel_token.cancelled() => {
+                    break;
+                }
                 _ = tokio::signal::ctrl_c() => {
                     break;
                 }
@@ -1193,8 +1242,7 @@ impl MediaSession {
         };
 
         let pc = self.pc.clone();
-        let cancel_token = CancellationToken::new();
-        let child_token = cancel_token.clone();
+        let child_token = self.cancel_token.child_token();
 
         // Handle existing transceivers
         let transceivers = pc.get_transceivers();
@@ -1281,6 +1329,9 @@ impl MediaSession {
                 _ = &mut rx_task => {
                     return Ok(())
                 }
+                _ = self.cancel_token.cancelled() => {
+                    return Ok(())
+                }
             }
         }
     }
@@ -1329,8 +1380,7 @@ impl MediaSession {
 
         let pc = self.pc.clone();
         let _username_rx = username.clone();
-        let cancel_token = CancellationToken::new();
-        let child_token = cancel_token.clone();
+        let child_token = self.cancel_token.child_token();
 
         // Handle existing transceivers
         let transceivers = pc.get_transceivers();
@@ -1423,6 +1473,9 @@ impl MediaSession {
                     info!("[{}] Playback finished, keeping alive...", username);
                 }
                 _ = &mut rx_task => {
+                    return Ok(());
+                }
+                _ = self.cancel_token.cancelled() => {
                     return Ok(());
                 }
             }
@@ -1961,21 +2014,6 @@ async fn process_recorded_sample(
                     );
                     frame.rtp_timestamp = expected_ts;
                 }
-                // Rewrite packets with large backward jumps
-                else if ts_diff > (u32::MAX / 2) {
-                    let backward_diff = last_ts.wrapping_sub(frame.rtp_timestamp);
-                    if backward_diff > max_reasonable_jump {
-                        tracing::debug!(
-                            "Recording: Rewriting timestamp (backward jump): seq={:?} original_ts={} -> expected_ts={} diff=-{} (>{:.1}s)",
-                            frame.sequence_number,
-                            frame.rtp_timestamp,
-                            expected_ts,
-                            backward_diff,
-                            backward_diff as f32 / rtp_clock_rate as f32
-                        );
-                        frame.rtp_timestamp = expected_ts;
-                    }
-                }
             }
         }
     }
@@ -2093,17 +2131,11 @@ async fn process_recorded_sample(
                             let pushed = prod.push_slice(&resampled);
 
                             if pushed < resampled.len() {
-                                tracing::warn!(
+                                tracing::trace!(
                                     "Local playback buffer full! ({} / {}), dropped {} output samples",
                                     occupied,
                                     capacity,
                                     resampled.len() - pushed
-                                );
-                            } else if occupied > capacity.get() * 8 / 10 {
-                                tracing::debug!(
-                                    "Local playback buffer high: {} / {}",
-                                    occupied,
-                                    capacity
                                 );
                             }
                         }
@@ -2122,12 +2154,6 @@ async fn process_recorded_sample(
                                 occupied,
                                 capacity,
                                 mono_decoded.len() - pushed
-                            );
-                        } else if occupied > capacity.get() * 8 / 10 {
-                            tracing::debug!(
-                                "Local playback buffer high: {} / {}",
-                                occupied,
-                                capacity
                             );
                         }
                     }

@@ -1,6 +1,6 @@
 [package]
 name = "sipbot"
-version = "0.2.13"
+version = "0.2.14"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 repository = "https://github.com/miuda-ai/sipbot"
@@ -16,13 +16,13 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.9.8"
 tracing = "0.1"
 anyhow = "1.0"
-rsipstack = "0.4.1"
+rsipstack = "0.4.2"
 rsip = "0.4.0"
 tokio-util = "0.7.18"
 rustrtc = "0.3.1"
 audio-codec = { version = "0.3.30", default-features = false }
 clap = { version = "4", features = ["derive"] }
-chrono = "0.4.42"
+chrono = "0.4.43"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "chrono"] }
 hound = "3.5.1"
 bytes = "1.11.0"

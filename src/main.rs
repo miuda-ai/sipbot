@@ -643,15 +643,22 @@ async fn main() -> Result<()> {
 
     match tokio::select! {
         _ = &mut all_bots => { Ok(()) }
-        _ = tokio::signal::ctrl_c() => { Err(()) }
+        _ = tokio::signal::ctrl_c() => {
+            println!("\n[!] Ctrl+C received, shutting down...");
+            Err(()) }
     } {
         Ok(_) => info!("All bots finished."),
         Err(_) => {
             info!("Cancelled, hanging up active calls...");
             cancel_token.cancel();
-
             // Wait for bots to finish cleanup
-            all_bots.await;
+            tokio::select! {
+                _ = tokio::time::sleep(tokio::time::Duration::from_secs(10)) => {
+                    error!("Timeout waiting for bots to finish cleanup.");
+                }
+                _ = &mut all_bots => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
 
             if shared_stats.current() > 0 {
                 tracing::warn!(
