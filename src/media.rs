@@ -1528,31 +1528,27 @@ impl MediaSession {
             _ => 0,
         });
 
-        let mut ticker = interval(Duration::from_millis(20));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
         let chunk_size = (sample_rate / 50) as usize; // 20ms
-        let mut rtp_timestamp: u32 = random_u32();
-        let mut sent_chunks = 0;
-
-        let mut recorder_resampler = if sample_rate != 16000 {
-            Some(Resampler::new(sample_rate as usize, 16000))
-        } else {
-            None
-        };
-
-        let total_chunks = (samples.len() + chunk_size - 1) / chunk_size;
 
         info!(
-            "[{}] Playback started: {} samples ({} chunks) using {:?} at {}Hz (clock {}Hz, pt={})",
+            "[{}] Playback started: {} samples using {:?} at {}Hz (clock {}Hz, pt={})",
             username,
             samples.len(),
-            total_chunks,
             ct,
             sample_rate,
             clock_rate,
             payload_type
         );
+
+        // Pre-process: Resample audio for recording (16000Hz target) if needed
+        let record_samples = if sample_rate != 16000 {
+            let mut resampler = Resampler::new(sample_rate as usize, 16000);
+            resampler.resample(&samples)
+        } else {
+            samples.clone()
+        };
+
+        let total_chunks = (samples.len() + chunk_size - 1) / chunk_size;
 
         // Recording background task to avoid blocking the main loop
         let recorder_clone = self.recorder.clone();
@@ -1566,65 +1562,85 @@ impl MediaSession {
             }
         });
 
-        for chunk in samples.chunks(chunk_size) {
+        // Use ticker-based timing with Skip missed ticks behavior for precise RTP intervals
+        let mut ticker = interval(Duration::from_millis(20));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let mut chunks_iter = samples.chunks(chunk_size).enumerate().peekable();
+        let record_chunk_size = if sample_rate != 16000 {
+            // Resample changes sample count: 20ms of samples at sample_rate becomes 20ms at 16000Hz
+            (chunk_size as u32 * 16000 / sample_rate) as usize
+        } else {
+            chunk_size
+        };
+        let mut record_chunks_iter = record_samples.chunks(record_chunk_size).peekable();
+
+        let mut sent_chunks = 0u64;
+        let mut rtp_timestamp: u32 = random_u32();
+
+        loop {
             ticker.tick().await;
 
-            let final_chunk = if chunk.len() == chunk_size {
-                chunk.to_vec()
-            } else {
-                let mut v = chunk.to_vec();
-                v.resize(chunk_size, 0);
-                v
-            };
+            if let Some((_, chunk)) = chunks_iter.next() {
+                let final_chunk = if chunk.len() == chunk_size {
+                    chunk.to_vec()
+                } else {
+                    let mut v = chunk.to_vec();
+                    v.resize(chunk_size, 0);
+                    v
+                };
 
-            // Send to recorder (non-blocking)
-            let recorder_samples = if let Some(resampler) = recorder_resampler.as_mut() {
-                resampler.resample(&final_chunk)
-            } else {
-                final_chunk.clone()
-            };
-            let _ = rec_tx.send(recorder_samples);
-
-            let audio_to_encode = if channels == 2 {
-                let mut stereo = Vec::with_capacity(final_chunk.len() * 2);
-                for &s in &final_chunk {
-                    stereo.push(s);
-                    stereo.push(s);
+                // Send pre-resampled chunk to recorder (non-blocking)
+                if let Some(record_chunk) = record_chunks_iter.next() {
+                    let _ = rec_tx.send(record_chunk.to_vec());
                 }
-                stereo
+
+                // Expand to channels if needed for encoding (minimal work)
+                let audio_to_encode = if channels == 2 {
+                    let mut stereo = Vec::with_capacity(final_chunk.len() * 2);
+                    for &s in &final_chunk {
+                        stereo.push(s);
+                        stereo.push(s);
+                    }
+                    stereo
+                } else {
+                    final_chunk
+                };
+
+                // Encode and send
+                let encoded = encoder.encode(&audio_to_encode);
+                if encoded.is_empty() {
+                    continue;
+                }
+
+                self.stats.inc_tx(1, encoded.len() as u64);
+
+                let frame = AudioFrame {
+                    data: Bytes::from(encoded),
+                    clock_rate,
+                    rtp_timestamp,
+                    payload_type: Some(payload_type),
+                    sequence_number: None,
+                };
+
+                let ticks = (chunk_size as u64 * clock_rate as u64 / sample_rate as u64) as u32;
+                rtp_timestamp = rtp_timestamp.wrapping_add(ticks);
+
+                if let Err(e) = self.audio_source.send_audio(frame).await {
+                    error!("[{}] Failed to send audio: {:?}", username, e);
+                    break;
+                }
+
+                sent_chunks += 1;
+                if sent_chunks % 100 == 0 {
+                    info!(
+                        "[{}] Sent {}/{} chunks",
+                        username, sent_chunks, total_chunks
+                    );
+                }
             } else {
-                final_chunk
-            };
-
-            let encoded = encoder.encode(&audio_to_encode);
-            if encoded.is_empty() {
-                continue;
-            }
-
-            self.stats.inc_tx(1, encoded.len() as u64);
-
-            let frame = AudioFrame {
-                data: Bytes::from(encoded),
-                clock_rate,
-                rtp_timestamp,
-                payload_type: Some(payload_type),
-                sequence_number: None,
-            };
-
-            let ticks = (chunk_size as u64 * clock_rate as u64 / sample_rate as u64) as u32;
-            rtp_timestamp = rtp_timestamp.wrapping_add(ticks);
-
-            if let Err(e) = self.audio_source.send_audio(frame).await {
-                error!("[{}] Failed to send audio: {:?}", username, e);
+                // No more chunks to send
                 break;
-            }
-
-            sent_chunks += 1;
-            if sent_chunks % 100 == 0 {
-                info!(
-                    "[{}] Sent {}/{} chunks",
-                    username, sent_chunks, total_chunks
-                );
             }
         }
 
