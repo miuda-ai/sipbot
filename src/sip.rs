@@ -50,8 +50,6 @@ struct CallGuard {
 
 impl Drop for CallGuard {
     fn drop(&mut self) {
-        // Note: stats decrement moved to after BYE is sent
-        // self.stats.dec_current();
         self.stats.inc_finished();
         self.stats.add_duration(self.start_time.elapsed());
         if let Some(media) = self.media_session.take() {
@@ -64,6 +62,147 @@ impl Drop for CallGuard {
 }
 
 impl CallRunner {
+    fn build_record_path(&self, call_index: u32) -> Option<PathBuf> {
+        self.account.record.clone().map(|p| {
+            let path = PathBuf::from(p);
+            if call_index > 0 {
+                if let Some(stem) = path.file_stem() {
+                    let mut new_name = stem.to_os_string();
+                    new_name.push(format!("_{}", call_index));
+                    if let Some(ext) = path.extension() {
+                        new_name.push(".");
+                        new_name.push(ext);
+                    }
+                    path.with_file_name(new_name)
+                } else {
+                    path
+                }
+            } else {
+                path
+            }
+        })
+    }
+
+    /// Handle early media (183) response
+    async fn handle_early_media(
+        &self,
+        media_session: &MediaSession,
+        answer_sdp: &str,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        debug!(
+            "[{}] Received Early Media (183) SDP:\n{}",
+            self.account.username, answer_sdp
+        );
+        match media_session.set_remote_answer(answer_sdp).await {
+            Ok(codec_name) => {
+                info!(
+                    "[{}] Early media (183) remote description set, codec: {}",
+                    self.account.username, codec_name
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "[{}] Failed to set remote answer for early media (183): {:?}",
+                    self.account.username, e
+                );
+                return None;
+            }
+        }
+
+        info!(
+            "[{}] Early media session established",
+            self.account.username
+        );
+        let media_clone = media_session.clone();
+        let username = self.account.username.clone();
+        let answer_config = self.account.answer.clone();
+
+        Some(tokio::spawn(async move {
+            if let Some(cfg) = answer_config {
+                match cfg {
+                    AnswerConfig::Echo => {
+                        let _ = media_clone.start_echo(username, None).await;
+                    }
+                    AnswerConfig::Play { wav_file } => {
+                        let _ = media_clone
+                            .play_file(username, Path::new(&wav_file), None, true)
+                            .await;
+                    }
+                    AnswerConfig::Local => {
+                        #[cfg(feature = "local-device")]
+                        let _ = media_clone
+                            .play_local_device(username, None, true, None)
+                            .await;
+                    }
+                }
+            }
+        }))
+    }
+
+    /// Start media playback based on configuration
+    async fn start_media_playback(
+        username: String,
+        media_session: MediaSession,
+        record_path: Option<PathBuf>,
+        media_task: Option<tokio::task::JoinHandle<()>>,
+        keep_alive: bool,
+        answer_config: Option<AnswerConfig>,
+    ) {
+        if let Some(task) = media_task {
+            info!("[{}] Using already started early media.", username);
+            let _ = task.await;
+            return;
+        }
+
+        let record_path_ref = record_path.as_deref();
+        if let Some(answer_config) = &answer_config {
+            match answer_config {
+                AnswerConfig::Play { wav_file } => {
+                    let file_path = PathBuf::from(wav_file);
+                    if let Err(e) = media_session
+                        .play_file(username, &file_path, record_path_ref, keep_alive)
+                        .await
+                    {
+                        error!("Failed to play file: {:?}", e);
+                    }
+                }
+                AnswerConfig::Local => {
+                    #[cfg(feature = "local-device")]
+                    if let Err(e) = media_session
+                        .play_local_device(username.clone(), record_path_ref, keep_alive, None)
+                        .await
+                    {
+                        error!("Failed to play local device: {:?}, falling back to file", e);
+                        if let Err(e) = media_session
+                            .play_wav_bytes(username, PLAY_WAV, record_path_ref, keep_alive)
+                            .await
+                        {
+                            error!("Fallback failed: {:?}", e);
+                        }
+                    }
+                    #[cfg(not(feature = "local-device"))]
+                    {
+                        error!("Local device support is disabled in this build");
+                        if let Err(e) = media_session
+                            .play_wav_bytes(username, PLAY_WAV, record_path_ref, keep_alive)
+                            .await
+                        {
+                            error!("Fallback failed: {:?}", e);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            if let Err(e) = media_session
+                .play_wav_bytes(username, PLAY_WAV, record_path_ref, keep_alive)
+                .await
+            {
+                warn!("Play built-in answer stopped: {:?}", e);
+            }
+        }
+    }
+
     async fn make_call(&self, target_uri: String, call_index: u32) -> Result<()> {
         self.stats.inc_current();
         let mut _guard = CallGuard {
@@ -183,33 +322,8 @@ impl CallRunner {
 
                             if code == 183 {
                                 let answer_sdp = String::from_utf8_lossy(&res.body);
-                                if !answer_sdp.is_empty() {
-                                    debug!("[{}] Received Early Media (183) SDP:\n{}", self.account.username, answer_sdp);
-                                    if let Err(e) = media_session.set_remote_answer(&answer_sdp).await {
-                                        warn!("[{}] Failed to set remote answer for early media: {:?}", self.account.username, e);
-                                    } else if media_task.is_none() {
-                                        info!("[{}] Early media session established", self.account.username);
-                                        // Start playing early media if configured
-                                        let media_clone = media_session.clone();
-                                        let username = self.account.username.clone();
-                                        let answer_config = self.account.answer.clone();
-                                        media_task = Some(tokio::spawn(async move {
-                                            if let Some(cfg) = answer_config {
-                                                match cfg {
-                                                    AnswerConfig::Echo => {
-                                                        let _ = media_clone.start_echo(username, None).await;
-                                                    }
-                                                    AnswerConfig::Play { wav_file } => {
-                                                        let _ = media_clone.play_file(username, Path::new(&wav_file), None, true).await;
-                                                    }
-                                                    AnswerConfig::Local => {
-                                                        #[cfg(feature = "local-device")]
-                                                        let _ = media_clone.play_local_device(username, None, true).await;
-                                                    }
-                                                }
-                                            }
-                                        }));
-                                    }
+                                if !answer_sdp.is_empty() && media_task.is_none() {
+                                    media_task = self.handle_early_media(&media_session, &answer_sdp).await;
                                 }
                             }
                         }
@@ -260,14 +374,13 @@ impl CallRunner {
             ) {
                 let answer_sdp = String::from_utf8_lossy(&res.body);
                 debug!(
-                    "[{}] Received Answer SDP:\n{}",
+                    "[{}] Received 200 OK Answer SDP:\n{}",
                     self.account.username, answer_sdp
                 );
                 let codec_name = media_session.set_remote_answer(&answer_sdp).await?;
-                info!("[{}] Set remote answer", self.account.username);
                 info!(
-                    "[{}] Call established: From={}, To={}, Preferred Codec={}",
-                    self.account.username, from, to, codec_name
+                    "[{}] 200 OK remote description set (supports reinvite after 183), codec: {}",
+                    self.account.username, codec_name
                 );
                 info!(
                     "[{}] Call established: From={}, To={}, Preferred Codec={}",
@@ -287,86 +400,21 @@ impl CallRunner {
         }
 
         let hangup_secs = self.account.hangup.as_ref().and_then(|h| h.after_secs);
-
-        // Handle recording filename prefix
-        let record_path = self.account.record.clone().map(|p| {
-            let path = PathBuf::from(p);
-            if call_index > 0 {
-                if let Some(stem) = path.file_stem() {
-                    let mut new_name = stem.to_os_string();
-                    new_name.push(format!("_{}", call_index));
-                    if let Some(ext) = path.extension() {
-                        new_name.push(".");
-                        new_name.push(ext);
-                    }
-                    path.with_file_name(new_name)
-                } else {
-                    path
-                }
-            } else {
-                path
-            }
-        });
-
-        let media_session_clone = media_session.clone();
-        let answer_config = self.account.answer.clone();
-        let username = self.account.username.clone();
+        let record_path = self.build_record_path(call_index);
         let keep_alive = hangup_secs.is_some();
 
-        let play_future = async move {
-            if let Some(task) = media_task {
-                info!("[{}] Using already started early media.", username);
-                let _ = task.await;
-                return;
-            }
-            let record_path_ref = record_path.as_deref();
-            if let Some(answer_config) = answer_config {
-                match answer_config {
-                    AnswerConfig::Play { wav_file } => {
-                        let file_path = PathBuf::from(wav_file);
-                        if let Err(e) = media_session_clone
-                            .play_file(username, &file_path, record_path_ref, keep_alive)
-                            .await
-                        {
-                            error!("Failed to play file: {:?}", e);
-                        }
-                    }
-                    AnswerConfig::Local => {
-                        #[cfg(feature = "local-device")]
-                        if let Err(e) = media_session_clone
-                            .play_local_device(username.clone(), record_path_ref, keep_alive)
-                            .await
-                        {
-                            error!("Failed to play local device: {:?}, falling back to file", e);
-                            if let Err(e) = media_session_clone
-                                .play_wav_bytes(username, PLAY_WAV, record_path_ref, keep_alive)
-                                .await
-                            {
-                                error!("Fallback failed: {:?}", e);
-                            }
-                        }
-                        #[cfg(not(feature = "local-device"))]
-                        {
-                            error!("Local device support is disabled in this build");
-                            if let Err(e) = media_session_clone
-                                .play_wav_bytes(username, PLAY_WAV, record_path_ref, keep_alive)
-                                .await
-                            {
-                                error!("Fallback failed: {:?}", e);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            } else {
-                if let Err(e) = media_session_clone
-                    .play_wav_bytes(username, PLAY_WAV, record_path_ref, keep_alive)
-                    .await
-                {
-                    warn!("Play built-in answer stopped: {:?}", e);
-                }
-            }
-        };
+        let username_clone = self.account.username.clone();
+        let answer_config_clone = self.account.answer.clone();
+        let media_session_clone = media_session.clone();
+
+        let play_future = Self::start_media_playback(
+            username_clone,
+            media_session_clone,
+            record_path,
+            media_task,
+            keep_alive,
+            answer_config_clone,
+        );
 
         let username_monitor = self.account.username.clone();
         let monitor_future = async move {
@@ -1041,6 +1089,10 @@ impl SipBot {
             });
 
             // Monitor loop
+            let call_token = CancellationToken::new();
+            let call_token_for_monitor = call_token.clone();
+            let call_token_for_logic = call_token.clone();
+
             let username_monitor = username.clone();
             let monitor_future = async move {
                 while let Some(state) = rx.recv().await {
@@ -1062,6 +1114,7 @@ impl SipBot {
                         }
                         DialogState::Terminated(..) => {
                             info!("[{}] Call terminated remotely", username_monitor);
+                            call_token_for_monitor.cancel();
                             return;
                         }
                         _ => {
@@ -1185,10 +1238,12 @@ impl SipBot {
                             if play_local {
                                 #[cfg(feature = "local-device")]
                                 {
-                                    if let Err(e) = media
-                                        .play_local_device(account.username.clone(), None, false)
-                                        .await
-                                    {
+                                    let res = tokio::select! {
+                                        res = media.play_local_device(account.username.clone(), None, false, None) => res,
+                                        _ = cancel_token.cancelled() => Ok(()),
+                                        _ = call_token_for_logic.cancelled() => Ok(()),
+                                    };
+                                    if let Err(e) = res {
                                         error!(
                                             "Failed to play local device in early media: {:?}",
                                             e
@@ -1200,15 +1255,17 @@ impl SipBot {
                                     error!("Local device support is disabled in this build");
                                 }
                             } else if let Some(wav) = wav_file {
-                                if let Err(e) = media
-                                    .play_file(
+                                let res = tokio::select! {
+                                    res = media.play_file(
                                         account.username.clone(),
                                         std::path::Path::new(wav),
                                         None,
                                         false,
-                                    )
-                                    .await
-                                {
+                                    ) => res,
+                                    _ = cancel_token.cancelled() => Ok(()),
+                                    _ = call_token_for_logic.cancelled() => Ok(()),
+                                };
+                                if let Err(e) = res {
                                     error!("Failed to play early media file: {:?}", e);
                                 }
                             }
@@ -1252,37 +1309,48 @@ impl SipBot {
                             if play_local {
                                 #[cfg(feature = "local-device")]
                                 {
-                                    let _ = tokio::time::timeout(
-                                        Duration::from_secs(cfg.duration_secs),
-                                        media.play_local_device(
+                                    let _ = tokio::select! {
+                                        _ = media.play_local_device(
                                             account.username.clone(),
                                             None,
-                                            false,
-                                        ),
-                                    )
-                                    .await;
+                                            true, // keep_alive=true so it doesn't stop
+                                            Some(cfg.duration_secs),
+                                        ) => {},
+                                        _ = cancel_token.cancelled() => {},
+                                        _ = call_token_for_logic.cancelled() => {},
+                                    };
                                 }
                                 #[cfg(not(feature = "local-device"))]
                                 {
                                     error!("Local device support is disabled in this build");
-                                    tokio::time::sleep(Duration::from_secs(cfg.duration_secs))
-                                        .await;
+                                    tokio::select! {
+                                        _ = tokio::time::sleep(Duration::from_secs(cfg.duration_secs)) => {}
+                                        _ = cancel_token.cancelled() => {}
+                                        _ = call_token_for_logic.cancelled() => {}
+                                    }
                                 }
                             } else if let Some(wav) = cfg.ringback.as_ref() {
                                 // Play file with timeout
-                                let _ = tokio::time::timeout(
-                                    Duration::from_secs(cfg.duration_secs),
-                                    media.play_file(
-                                        account.username.clone(),
-                                        std::path::Path::new(wav),
-                                        None,
-                                        false,
-                                    ),
-                                )
-                                .await;
+                                let _ = tokio::select! {
+                                    _ = tokio::time::timeout(
+                                        Duration::from_secs(cfg.duration_secs),
+                                        media.play_file(
+                                            account.username.clone(),
+                                            std::path::Path::new(wav),
+                                            None,
+                                            false,
+                                        ),
+                                    ) => {},
+                                    _ = cancel_token.cancelled() => {},
+                                    _ = call_token_for_logic.cancelled() => {},
+                                };
                             }
                         } else {
-                            tokio::time::sleep(Duration::from_secs(cfg.duration_secs)).await;
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_secs(cfg.duration_secs)) => {}
+                                _ = cancel_token.cancelled() => {}
+                                _ = call_token_for_logic.cancelled() => {}
+                            }
                         }
                     } else {
                         info!("[{}] Stage 1: Sending 180 Ringing", account.username);
@@ -1291,7 +1359,11 @@ impl SipBot {
                             return;
                         }
                         stats_clone.add_status(180).await;
-                        tokio::time::sleep(Duration::from_secs(cfg.duration_secs)).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(cfg.duration_secs)) => {}
+                            _ = cancel_token.cancelled() => {}
+                            _ = call_token_for_logic.cancelled() => {}
+                        }
                     }
                 }
 
@@ -1367,6 +1439,7 @@ impl SipBot {
                                                 username_media.clone(),
                                                 recording_path.as_deref(),
                                                 keep_alive,
+                                                None, // No timeout for answer phase
                                             )
                                             .await
                                         {
@@ -1441,6 +1514,9 @@ impl SipBot {
                             _ = cancel_token.cancelled() => {
                                 info!("[{}] Cancellation requested during call.", account.username);
                             }
+                            _ = call_token_for_logic.cancelled() => {
+                                info!("[{}] Call ended remotely during playback.", account.username);
+                            }
                         }
                     }
                     None => {
@@ -1452,6 +1528,9 @@ impl SipBot {
                             }
                             _ = cancel_token.cancelled() => {
                                 info!("[{}] Cancellation requested during call.", account.username);
+                            }
+                            _ = call_token_for_logic.cancelled() => {
+                                info!("[{}] Call ended remotely.", account.username);
                             }
                         }
                     }

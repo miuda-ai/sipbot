@@ -28,6 +28,83 @@ use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
+pub trait AudioSource: Send + Sync {
+    fn next_chunk(&mut self, chunk_size: usize) -> Option<Vec<i16>>;
+    fn sample_rate(&self) -> u32;
+    fn channels(&self) -> u16;
+    fn description(&self) -> String;
+}
+
+pub struct FileAudioSource {
+    samples: Vec<i16>,
+    offset: usize,
+    sample_rate: u32,
+    channels: u16,
+    path: String,
+}
+
+impl FileAudioSource {
+    pub fn from_file(path: &Path) -> Result<Self> {
+        let mut reader = hound::WavReader::open(path)?;
+        let spec = reader.spec();
+        let samples: Vec<i16> = reader.samples::<i16>().map(|s| s.unwrap_or(0)).collect();
+
+        Ok(Self {
+            samples,
+            offset: 0,
+            sample_rate: spec.sample_rate,
+            channels: spec.channels,
+            path: path.display().to_string(),
+        })
+    }
+
+    pub fn from_bytes(wav_bytes: &[u8], name: &str) -> Result<Self> {
+        let cursor = Cursor::new(wav_bytes);
+        let mut reader = hound::WavReader::new(cursor)?;
+        let spec = reader.spec();
+        let samples: Vec<i16> = reader.samples::<i16>().map(|s| s.unwrap_or(0)).collect();
+
+        Ok(Self {
+            samples,
+            offset: 0,
+            sample_rate: spec.sample_rate,
+            channels: spec.channels,
+            path: name.to_string(),
+        })
+    }
+}
+
+impl AudioSource for FileAudioSource {
+    fn next_chunk(&mut self, chunk_size: usize) -> Option<Vec<i16>> {
+        if self.offset >= self.samples.len() {
+            return None;
+        }
+
+        let end = (self.offset + chunk_size).min(self.samples.len());
+        let mut chunk = self.samples[self.offset..end].to_vec();
+        self.offset = end;
+
+        // Pad with silence if needed
+        if chunk.len() < chunk_size {
+            chunk.resize(chunk_size, 0);
+        }
+
+        Some(chunk)
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    fn description(&self) -> String {
+        format!("file:{}", self.path)
+    }
+}
+
 fn codec_from_name(name: &str) -> Option<CodecType> {
     match name.to_lowercase().as_str() {
         "pcmu" => Some(CodecType::PCMU),
@@ -480,10 +557,17 @@ impl MediaSession {
     pub async fn set_remote_answer(&self, remote_sdp: &str) -> Result<String> {
         let remote_desc = SessionDescription::parse(SdpType::Answer, remote_sdp)?;
 
+        // In RTP mode, rustrtc now supports setting remote description multiple times
+        // (e.g., 183 early media followed by 200 OK reinvite)
+        // Only skip if the SDP content is exactly the same
         if let Some(current_remote) = self.pc.remote_description() {
             if current_remote.to_sdp_string() == remote_sdp {
+                tracing::debug!("Remote description unchanged, skipping set_remote_description");
                 return Ok(self.get_codec_name_from_sdp(remote_sdp));
             }
+            tracing::debug!("Remote description changed, updating (supports reinvite scenario)");
+        } else {
+            tracing::debug!("Setting remote description for the first time");
         }
 
         self.pc.set_remote_description(remote_desc).await?;
@@ -523,6 +607,76 @@ impl MediaSession {
             }
         }
         codec_name
+    }
+
+    /// Setup transceivers for recording by spawning track recorders for existing receivers
+    async fn setup_transceivers_for_recording(&self, child_token: CancellationToken) {
+        let transceivers = self.pc.get_transceivers();
+        for transceiver in transceivers {
+            if let Some(receiver) = transceiver.receiver().as_ref() {
+                let mid = transceiver
+                    .mid()
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
+                {
+                    let mut mids = self.tracked_mids.lock().await;
+                    if mids.contains(&mid) {
+                        continue;
+                    }
+                    mids.insert(mid);
+                }
+                spawn_track_recorder(self.clone(), receiver.track(), child_token.clone());
+            }
+        }
+    }
+
+    /// Initialize recording if path is provided
+    async fn init_recorder(&self, username: &str, recording_path: Option<&Path>) {
+        if let Some(path) = recording_path {
+            let mut rec = self.recorder.lock().await;
+            *rec = Some(Recorder::new(username.to_string(), path.to_path_buf()));
+        }
+    }
+
+    /// Spawn a task to handle incoming PC track events
+    fn spawn_track_event_handler(
+        &self,
+        username: String,
+        child_token: CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        let pc = self.pc.clone();
+        let session = self.clone();
+
+        tokio::spawn(async move {
+            while let Some(event) = pc.recv().await {
+                if let PeerConnectionEvent::Track(transceiver) = event {
+                    let mid = transceiver
+                        .mid()
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    {
+                        let mut mids = session.tracked_mids.lock().await;
+                        if mids.contains(&mid) {
+                            tracing::debug!(
+                                "[{}] Track {} already being recorded, skipping",
+                                username,
+                                mid
+                            );
+                            continue;
+                        }
+                        mids.insert(mid);
+                    }
+
+                    if let Some(receiver) = transceiver.receiver().as_ref() {
+                        spawn_track_recorder(
+                            session.clone(),
+                            receiver.track(),
+                            child_token.clone(),
+                        );
+                    }
+                }
+            }
+        })
     }
 
     fn spawn_audio_loop(
@@ -813,34 +967,30 @@ impl MediaSession {
         username: String,
         recording_path: Option<&Path>,
         _keep_alive: bool,
+        timeout_secs: Option<u64>,
     ) -> Result<()> {
         info!(
             "[{}] Using local audio device for playback and capture",
             username
         );
 
-        // Stop any existing local playback if requested or just return if already active
+        // Check if local playback is already active
         {
             let stop_tx = self.local_stop_tx.lock().await;
             if stop_tx.is_some() {
                 info!(
-                    "[{}] Local audio already active, updating recorder if needed",
+                    "[{}] Local audio already active, updating recorder and continuing",
                     username
                 );
-                if let Some(path) = recording_path {
-                    let mut rec = self.recorder.lock().await;
-                    if rec.is_none() {
-                        *rec = Some(Recorder::new(username.clone(), path.to_path_buf()));
-                    }
-                }
+                self.init_recorder(&username, recording_path).await;
+                // Wait indefinitely since the streams are already running
+                // This will be cancelled by cancel_token or remote hangup
+                self.cancel_token.cancelled().await;
                 return Ok(());
             }
         }
 
-        if let Some(path) = recording_path {
-            let mut rec = self.recorder.lock().await;
-            *rec = Some(Recorder::new(username.clone(), path.to_path_buf()));
-        }
+        self.init_recorder(&username, recording_path).await;
 
         let host = cpal::default_host();
         let input_device = host
@@ -947,7 +1097,7 @@ impl MediaSession {
 
                     if cons.occupied_len() == 0 {
                         is_playing = false;
-                        tracing::warn!("Local playback underrun! Buffer empty.");
+                        tracing::debug!("Local playback underrun! Buffer empty.");
                         data.fill(0.0);
                         return;
                     }
@@ -1024,61 +1174,14 @@ impl MediaSession {
             .await
             .context("Audio initialization thread panicked or dropped")??;
 
-        let pc = self.pc.clone();
         let child_token = self.cancel_token.child_token();
 
         // Handle existing transceivers
-        let transceivers = pc.get_transceivers();
-        for transceiver in transceivers {
-            if let Some(receiver) = transceiver.receiver().as_ref() {
-                let mid = transceiver
-                    .mid()
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string());
-                {
-                    let mut mids = self.tracked_mids.lock().await;
-                    if mids.contains(&mid) {
-                        continue;
-                    }
-                    mids.insert(mid);
-                }
-                spawn_track_recorder(self.clone(), receiver.track(), child_token.clone());
-            }
-        }
+        self.setup_transceivers_for_recording(child_token.clone())
+            .await;
 
-        let username_rx = username.clone();
-        let session_rx = self.clone();
         let session_input_clone = self.clone();
-        let rx_task = async move {
-            while let Some(event) = pc.recv().await {
-                if let PeerConnectionEvent::Track(transceiver) = event {
-                    let mid = transceiver
-                        .mid()
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_string());
-                    {
-                        let mut mids = session_rx.tracked_mids.lock().await;
-                        if mids.contains(&mid) {
-                            tracing::debug!(
-                                "[{}] Track {} already being recorded, skipping",
-                                username_rx,
-                                mid
-                            );
-                            continue;
-                        }
-                        mids.insert(mid);
-                    }
-
-                    if let Some(receiver) = transceiver.receiver().as_ref() {
-                        spawn_track_recorder(
-                            session_rx.clone(),
-                            receiver.track(),
-                            child_token.clone(),
-                        );
-                    }
-                }
-            }
-        };
+        let rx_task = self.spawn_track_event_handler(username.clone(), child_token.clone());
 
         let username_input = username.clone();
         let input_task = async move {
@@ -1175,28 +1278,75 @@ impl MediaSession {
         tokio::pin!(input_task);
 
         let mut sync_interval = tokio::time::interval(Duration::from_secs(1));
+        let timeout_future = if let Some(secs) = timeout_secs {
+            Some(tokio::time::sleep(Duration::from_secs(secs)))
+        } else {
+            None
+        };
 
-        loop {
-            tokio::select! {
-                _ = sync_interval.tick() => {
-                    self.sync_nack_stats();
+        if let Some(timeout) = timeout_future {
+            tokio::pin!(timeout);
+            loop {
+                tokio::select! {
+                    _ = sync_interval.tick() => {
+                        self.sync_nack_stats();
+                    }
+                    _ = &mut rx_task => {
+                        break;
+                    }
+                    _ = &mut input_task => {
+                        break;
+                    }
+                    _ = &mut timeout => {
+                        info!("[{}] Local audio timeout reached", username);
+                        break;
+                    }
+                    _ = self.cancel_token.cancelled() => {
+                        break;
+                    }
+                    _ = tokio::signal::ctrl_c() => {
+                        break;
+                    }
                 }
-                _ = &mut rx_task => {
-                    break;
-                }
-                _ = &mut input_task => {
-                    break;
-                }
-                _ = self.cancel_token.cancelled() => {
-                    break;
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    break;
+            }
+        } else {
+            loop {
+                tokio::select! {
+                    _ = sync_interval.tick() => {
+                        self.sync_nack_stats();
+                    }
+                    _ = &mut rx_task => {
+                        break;
+                    }
+                    _ = &mut input_task => {
+                        break;
+                    }
+                    _ = self.cancel_token.cancelled() => {
+                        break;
+                    }
+                    _ = tokio::signal::ctrl_c() => {
+                        break;
+                    }
                 }
             }
         }
 
         let _ = stream_stop_tx.send(());
+
+        // Clear all local audio state to allow future calls to restart streams properly
+        {
+            let mut stop_tx = self.local_stop_tx.lock().await;
+            *stop_tx = None;
+        }
+        {
+            let mut playback_tx = self.local_playback_tx.lock().await;
+            *playback_tx = None;
+        }
+        {
+            let mut resampler = self.output_resampler.lock().await;
+            *resampler = None;
+        }
+
         Ok(())
     }
 
@@ -1209,10 +1359,7 @@ impl MediaSession {
     ) -> Result<()> {
         info!("[{}] Playing file: {:?}", username, file_path);
 
-        if let Some(path) = recording_path {
-            let mut rec = self.recorder.lock().await;
-            *rec = Some(Recorder::new(username.clone(), path.to_path_buf()));
-        }
+        self.init_recorder(&username, recording_path).await;
 
         let mut reader = hound::WavReader::open(file_path).context("Failed to open WAV file")?;
         let spec = reader.spec();
@@ -1241,68 +1388,13 @@ impl MediaSession {
             raw_samples
         };
 
-        let pc = self.pc.clone();
         let child_token = self.cancel_token.child_token();
 
         // Handle existing transceivers
-        let transceivers = pc.get_transceivers();
-        info!("[{}] Found {} transceivers", username, transceivers.len());
-        for transceiver in transceivers {
-            if let Some(receiver) = transceiver.receiver().as_ref() {
-                info!(
-                    "[{}] Transceiver has receiver, track id={}",
-                    username,
-                    receiver.track().id()
-                );
-                let mid = transceiver
-                    .mid()
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string());
-                {
-                    let mut mids = self.tracked_mids.lock().await;
-                    if mids.contains(&mid) {
-                        continue;
-                    }
-                    mids.insert(mid);
-                }
-                spawn_track_recorder(self.clone(), receiver.track(), child_token.clone());
-            } else {
-                info!("[{}] Transceiver has NO receiver", username);
-            }
-        }
+        self.setup_transceivers_for_recording(child_token.clone())
+            .await;
 
-        let username_rx = username.clone();
-        let session_rx = self.clone();
-        let rx_task = async move {
-            while let Some(event) = pc.recv().await {
-                if let PeerConnectionEvent::Track(transceiver) = event {
-                    info!("[{}] Received PC event: Track", username_rx);
-                    let mid = transceiver
-                        .mid()
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_string());
-                    {
-                        let mut mids = session_rx.tracked_mids.lock().await;
-                        if mids.contains(&mid) {
-                            tracing::debug!(
-                                "[{}] Track {} already being recorded, skipping",
-                                username_rx,
-                                mid
-                            );
-                            continue;
-                        }
-                        mids.insert(mid);
-                    }
-                    if let Some(receiver) = transceiver.receiver().as_ref() {
-                        spawn_track_recorder(
-                            session_rx.clone(),
-                            receiver.track(),
-                            child_token.clone(),
-                        );
-                    }
-                }
-            }
-        };
+        let rx_task = self.spawn_track_event_handler(username.clone(), child_token.clone());
 
         let play_fut = self.play_samples(username.clone(), samples);
         tokio::pin!(play_fut);
@@ -1345,10 +1437,7 @@ impl MediaSession {
     ) -> Result<()> {
         info!("[{}] Playing embedded wav...", username);
 
-        if let Some(path) = recording_path {
-            let mut rec = self.recorder.lock().await;
-            *rec = Some(Recorder::new(username.clone(), path.to_path_buf()));
-        }
+        self.init_recorder(&username, recording_path).await;
 
         let cursor = Cursor::new(wav_bytes);
         let mut reader = hound::WavReader::new(cursor).context("Failed to read WAV bytes")?;
@@ -1378,77 +1467,12 @@ impl MediaSession {
             raw_samples
         };
 
-        let pc = self.pc.clone();
-        let _username_rx = username.clone();
         let child_token = self.cancel_token.child_token();
 
-        // Handle existing transceivers
-        let transceivers = pc.get_transceivers();
-        info!("[{}] Found {} transceivers", username, transceivers.len());
-        for (i, transceiver) in transceivers.iter().enumerate() {
-            info!(
-                "[{}] Transceiver {}: mid={:?} direction={:?}",
-                username,
-                i,
-                transceiver.mid(),
-                transceiver.direction()
-            );
-            if let Some(receiver) = transceiver.receiver().as_ref() {
-                info!(
-                    "[{}] Transceiver {} has receiver, track id={}",
-                    username,
-                    i,
-                    receiver.track().id()
-                );
-                let mid = transceiver
-                    .mid()
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string());
-                {
-                    let mut mids = self.tracked_mids.lock().await;
-                    if mids.contains(&mid) {
-                        continue;
-                    }
-                    mids.insert(mid);
-                }
-                spawn_track_recorder(self.clone(), receiver.track(), child_token.clone());
-            } else {
-                info!("[{}] Transceiver {} has NO receiver", username, i);
-            }
-        }
+        self.setup_transceivers_for_recording(child_token.clone())
+            .await;
 
-        let session_rx = self.clone();
-        let username_rx = username.clone();
-        let rx_task = async move {
-            while let Some(event) = pc.recv().await {
-                if let PeerConnectionEvent::Track(transceiver) = event {
-                    let mid = transceiver
-                        .mid()
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_string());
-                    {
-                        let mut mids = session_rx.tracked_mids.lock().await;
-                        if mids.contains(&mid) {
-                            tracing::debug!(
-                                "[{}] Track {} already being recorded, skipping",
-                                username_rx,
-                                mid
-                            );
-                            continue;
-                        }
-                        mids.insert(mid);
-                    }
-
-                    if let Some(receiver) = transceiver.receiver().as_ref() {
-                        spawn_track_recorder(
-                            session_rx.clone(),
-                            receiver.track(),
-                            child_token.clone(),
-                        );
-                    }
-                }
-            }
-        };
+        let rx_task = self.spawn_track_event_handler(username.clone(), child_token.clone());
 
         let play_fut = self.play_samples(username.clone(), samples);
         tokio::pin!(play_fut);
@@ -2050,11 +2074,6 @@ async fn process_recorded_sample(
             if let Some(prod) = tx.as_mut() {
                 let target_rate = output_sample_rate.load(std::sync::atomic::Ordering::Relaxed);
                 if target_rate > 0 {
-                    // Mix to mono if stereo
-                    // Note: 'channels' refers to the negotiated codec channels.
-                    // For Opus, it is often 2 in SDP but the decoder might return mono (1 channel).
-                    // We check if the decoded length is twice the expected mono samples for 20ms (standard frame).
-                    // If it's just one-channel's worth of samples, we don't mix.
                     let mono_decoded = if channels == 2
                         && decoded.len() % 2 == 0
                         && decoded.len() > (actual_sample_rate as usize / 50)
@@ -2070,22 +2089,10 @@ async fn process_recorded_sample(
                     };
 
                     if target_rate != actual_sample_rate {
-                        // Check if we need to recreate the resampler
                         let need_new = match output_resampler.as_ref() {
-                            Some(_) => {
-                                // For now, we don't have a way to check existing resampler rates.
-                                // But if it's already there, we check if the PT (and thus input rate) changed
-                                // Actually, it's safer to just check if source/target rate changed if we can.
-                                // Since we don't have access to resampler internals, we rely on the caller reset.
-                                false
-                            }
+                            Some(_) => false,
                             None => true,
                         };
-
-                        // We reset the resampler if it's None or if the source rate doesn't match
-                        // Wait, we need to store the current source rate to detect change.
-                        // Let's use a simpler approach: recreate it if it's the first time
-                        // or if we detect a change in pt (handled in spawn_track_recorder).
 
                         if need_new {
                             *output_resampler = Some(audio_codec::Resampler::new(
@@ -2096,7 +2103,6 @@ async fn process_recorded_sample(
 
                         if let Some(resampler) = output_resampler.as_mut() {
                             let resampled = resampler.resample(&mono_decoded);
-                            // Push the slice. If it's full, we just drop to avoid blocking the RX task.
                             let capacity = prod.capacity();
                             let occupied = prod.occupied_len();
                             let pushed = prod.push_slice(&resampled);
@@ -2111,7 +2117,6 @@ async fn process_recorded_sample(
                             }
                         }
                     } else {
-                        // If no resampling needed, clear the old resampler if any
                         if output_resampler.is_some() {
                             *output_resampler = None;
                         }

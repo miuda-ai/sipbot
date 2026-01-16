@@ -1,7 +1,66 @@
 use std::path::PathBuf;
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::{Duration, interval};
 use tracing::{error, info};
+
+/// Manager for handling recording operations across sessions
+pub struct RecorderManager {
+    recorder: Arc<Mutex<Option<Recorder>>>,
+}
+
+impl RecorderManager {
+    pub fn new() -> Self {
+        Self {
+            recorder: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Initialize or replace the current recorder
+    pub async fn init(&self, username: String, path: PathBuf) {
+        let mut rec = self.recorder.lock().await;
+        *rec = Some(Recorder::new(username, path));
+    }
+
+    /// Record received audio samples
+    pub async fn record_rx(&self, samples: &[i16]) {
+        let rec = self.recorder.lock().await;
+        if let Some(r) = rec.as_ref() {
+            r.record_rx(samples);
+        }
+    }
+
+    /// Record transmitted audio samples
+    pub async fn record_tx(&self, samples: &[i16]) {
+        let rec = self.recorder.lock().await;
+        if let Some(r) = rec.as_ref() {
+            r.record_tx(samples);
+        }
+    }
+
+    /// Check if recording is active
+    pub async fn is_active(&self) -> bool {
+        let rec = self.recorder.lock().await;
+        rec.is_some()
+    }
+
+    /// Stop recording
+    pub async fn stop(&self) {
+        let mut rec = self.recorder.lock().await;
+        *rec = None;
+    }
+
+    /// Get the internal recorder mutex (for backward compatibility)
+    pub fn get_recorder(&self) -> Arc<Mutex<Option<Recorder>>> {
+        self.recorder.clone()
+    }
+}
+
+impl Default for RecorderManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 pub struct Recorder {
     tx: mpsc::UnboundedSender<AudioPacket>,
