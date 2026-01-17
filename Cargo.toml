@@ -16,7 +16,8 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.9.8"
 tracing = "0.1"
 anyhow = "1.0"
-rsipstack = "0.4.2"
+rsipstack = "0.4.3"
+#rsipstack = { path = "../rsipstack" }
 rsip = "0.4.0"
 tokio-util = "0.7.18"
 rustrtc = "0.3.2"

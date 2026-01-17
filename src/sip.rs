@@ -331,13 +331,13 @@ impl CallRunner {
                         if should_cancel {
                             if cancel_before_ringring && let DialogState::Trying(mut dialog_id) = state {
                                 tracing::info!("[{}] Canceling call before ringring", self.account.username);
-                                dialog_id.to_tag.clear();
+                                dialog_id.remote_tag.clear();
                                 let dialog = dialog_layer.get_dialog(&dialog_id).expect("dialog not found");
                                 should_cancel = false;
                                 let _ = dialog.hangup().await;
                             }else if !cancel_before_ringring && let DialogState::Early(mut dialog_id, _) = state{
                                 tracing::info!("[{}] Canceling call after ringring", self.account.username);
-                                dialog_id.to_tag.clear();
+                                dialog_id.remote_tag.clear();
                                 let dialog = dialog_layer.get_dialog(&dialog_id).expect("dialog not found");
                                 should_cancel = false;
                                 let _ = dialog.hangup().await;
@@ -348,7 +348,7 @@ impl CallRunner {
                 _ = self.cancel_token.cancelled() => {
                     info!("[{}] Cancellation requested during INVITE phase.", self.account.username);
                     if let Some(mut dialog_id) = latest_dialog_id {
-                         dialog_id.to_tag.clear();
+                         dialog_id.remote_tag.clear();
                          if let Some(dialog) = dialog_layer.get_dialog(&dialog_id) {
                               info!("[{}] Cancelling pending INVITE...", self.account.username);
                              let _ = dialog.hangup().await;
@@ -981,7 +981,7 @@ impl SipBot {
             Method::Ack => info!("[{}] Received ACK", self.account.username),
             Method::Bye => {
                 info!("[{}] Received BYE", self.account.username);
-                let id = DialogId::try_from(&transaction.original)?;
+                let id = DialogId::from_uas_request(&transaction.original)?;
                 let dialog = self.dialog_layer.as_ref().and_then(|d| d.get_dialog(&id));
                 if let Some(mut dlg) = dialog {
                     let _ = dlg.handle(&mut transaction).await?;
