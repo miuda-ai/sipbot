@@ -1620,8 +1620,7 @@ impl MediaSession {
                     clock_rate,
                     rtp_timestamp,
                     payload_type: Some(payload_type),
-                    sequence_number: None,
-                    marker: false,
+                    ..Default::default()
                 };
 
                 let ticks = (chunk_size as u64 * clock_rate as u64 / sample_rate as u64) as u32;
