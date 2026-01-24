@@ -105,33 +105,58 @@ impl AudioSource for FileAudioSource {
     }
 }
 
-fn codec_from_name(name: &str) -> Option<CodecType> {
-    match name.to_lowercase().as_str() {
-        "pcmu" => Some(CodecType::PCMU),
-        "pcma" => Some(CodecType::PCMA),
-        "g722" => Some(CodecType::G722),
-        "g729" => Some(CodecType::G729),
-        #[cfg(feature = "opus")]
-        "opus" => Some(CodecType::Opus),
-        _ => None,
-    }
-}
+// Removed: codec_from_name - use CodecType::try_from(&str) instead
 
 fn get_codec_type(pt: Option<u8>, caps: &Option<MediaCapabilities>) -> CodecType {
-    pt.and_then(|p| {
+    // First try: match by payload type
+    let by_pt = pt.and_then(|p| {
         caps.as_ref()
             .and_then(|c| c.audio.iter().find(|a| a.payload_type == p))
-            .and_then(|a| codec_from_name(&a.codec_name))
-    })
-    .unwrap_or_else(|| match pt {
-        Some(0) => CodecType::PCMU,
-        Some(8) => CodecType::PCMA,
-        Some(9) => CodecType::G722,
-        Some(18) => CodecType::G729,
-        #[cfg(feature = "opus")]
-        Some(111) => CodecType::Opus,
-        _ => CodecType::PCMU,
-    })
+            .and_then(|a| {
+                let name = a.codec_name.to_lowercase();
+                match name.as_str() {
+                    "opus" => Some(CodecType::Opus),
+                    "pcmu" => Some(CodecType::PCMU),
+                    "pcma" => Some(CodecType::PCMA),
+                    "g722" => Some(CodecType::G722),
+                    "g729" => Some(CodecType::G729),
+                    _ => CodecType::try_from(a.codec_name.as_str()).ok(),
+                }
+            })
+    });
+
+    if by_pt.is_some() {
+        return by_pt.unwrap();
+    }
+
+    // Second try: for dynamic PTs (96-127), try matching by standard PT ranges
+    if let Some(p) = pt {
+        if let Ok(ct) = CodecType::try_from(p) {
+            return ct;
+        }
+    }
+
+    // Third try: if PT didn't match, check if there's a single codec capability
+    // This handles the case where local and remote use different dynamic PTs
+    if let Some(c) = caps {
+        if c.audio.len() == 1 {
+            let name = c.audio[0].codec_name.to_lowercase();
+            match name.as_str() {
+                "opus" => return CodecType::Opus,
+                "pcmu" => return CodecType::PCMU,
+                "pcma" => return CodecType::PCMA,
+                "g722" => return CodecType::G722,
+                "g729" => return CodecType::G729,
+                _ => {
+                    if let Ok(ct) = CodecType::try_from(c.audio[0].codec_name.as_str()) {
+                        return ct;
+                    }
+                }
+            }
+        }
+    }
+
+    CodecType::PCMU
 }
 
 fn get_audio_caps(codecs: &Option<Vec<String>>, nack_enabled: bool) -> Vec<AudioCapability> {
@@ -156,23 +181,11 @@ fn get_audio_caps(codecs: &Option<Vec<String>>, nack_enabled: bool) -> Vec<Audio
             #[cfg(feature = "opus")]
             "opus" => AudioCapability::opus(),
             _ => {
-                if let Some(ct) = codec_from_name(&codec) {
+                if let Ok(ct) = CodecType::try_from(codec.as_str()) {
                     AudioCapability {
-                        payload_type: match ct {
-                            CodecType::PCMU => 0,
-                            CodecType::PCMA => 8,
-                            CodecType::G722 => 9,
-                            CodecType::G729 => 18,
-                            #[cfg(feature = "opus")]
-                            CodecType::Opus => 111,
-                            _ => 0,
-                        },
+                        payload_type: ct.payload_type(),
                         codec_name: format!("{:?}", ct).to_uppercase(),
-                        clock_rate: if ct == CodecType::G722 {
-                            16000
-                        } else {
-                            ct.clock_rate()
-                        },
+                        clock_rate: ct.clock_rate(),
                         channels: ct.channels() as u8,
                         rtcp_fbs: vec!["nack".to_string()],
                         ..Default::default()
@@ -238,6 +251,28 @@ impl MediaSession {
         };
         let mut audio_caps = get_audio_caps(&codecs, nack_enabled);
         let remote_sdp_upper = remote_sdp.to_uppercase();
+
+        // Extract PT mappings from remote SDP for dynamic payload types
+        let mut remote_pt_map: std::collections::HashMap<String, u8> =
+            std::collections::HashMap::new();
+        for line in remote_sdp.lines() {
+            if line.to_lowercase().starts_with("a=rtpmap:") {
+                // Format: a=rtpmap:111 opus/48000/2
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Some(pt_and_codec) = parts[1].split_once(' ') {
+                        let pt_str = pt_and_codec.0;
+                        let codec_spec = pt_and_codec.1;
+                        if let Ok(pt) = pt_str.parse::<u8>() {
+                            let codec_name =
+                                codec_spec.split('/').next().unwrap_or("").to_uppercase();
+                            remote_pt_map.insert(codec_name, pt);
+                        }
+                    }
+                }
+            }
+        }
+
         audio_caps.retain(|cap| {
             let pt = cap.payload_type;
             let name = cap.codec_name.to_uppercase();
@@ -256,6 +291,14 @@ impl MediaSession {
 
             pt_in_mline || name_in_rtpmap
         });
+
+        // Update payload types from remote SDP to match remote's dynamic PT assignments
+        for cap in &mut audio_caps {
+            let name = cap.codec_name.to_uppercase();
+            if let Some(&remote_pt) = remote_pt_map.get(&name) {
+                cap.payload_type = remote_pt;
+            }
+        }
 
         if audio_caps.is_empty() {
             info!("No matching codecs found in offer, falling back to PCMU");
@@ -290,40 +333,6 @@ impl MediaSession {
 
         let remote_desc = SessionDescription::parse(SdpType::Offer, remote_sdp)?;
         pc.set_remote_description(remote_desc).await?;
-
-        // Attach track to the active transceiver
-        let transceivers = pc.get_transceivers();
-        if let Some(t) = transceivers.first() {
-            let params = t
-                .sender()
-                .as_ref()
-                .map(|s| s.params())
-                .unwrap_or(RtpCodecParameters {
-                    payload_type: 0,
-                    clock_rate: 8000,
-                    channels: 1,
-                });
-
-            let mut builder = RtpSenderBuilder::new(track.clone(), ssrc_id)
-                .stream_id("audio".to_string())
-                .params(params);
-            if nack_enabled {
-                builder = builder
-                    .nack(pc.config().nack_buffer_size)
-                    .bitrate_controller();
-            }
-            let sender = builder.build();
-            t.set_sender(Some(sender));
-            t.set_direction(TransceiverDirection::SendRecv);
-        } else {
-            // This shouldn't happen if we set remote description with audio
-            let params = RtpCodecParameters {
-                payload_type: 0,
-                clock_rate: 8000,
-                channels: 1,
-            };
-            pc.add_track(track.clone(), params)?;
-        }
 
         // Attach sender so that the PeerConnection has a listener mapping for incoming packets
         let transceivers = pc.get_transceivers();
@@ -575,6 +584,17 @@ impl MediaSession {
         Ok(self.get_codec_name_from_sdp(remote_sdp))
     }
 
+    pub fn get_negotiated_codec(&self) -> String {
+        let pt = self
+            .pc
+            .get_transceivers()
+            .first()
+            .and_then(|t| t.sender().as_ref().map(|s| s.params().payload_type));
+
+        let ct = get_codec_type(pt, &self.pc.config().media_capabilities);
+        format!("{:?}", ct).to_uppercase()
+    }
+
     fn get_codec_name_from_sdp(&self, sdp: &str) -> String {
         let mut codec_name = "Unknown".to_string();
         if let Some(mline) = sdp
@@ -589,19 +609,10 @@ impl MediaSession {
                             codec_name = spec.split('/').next().unwrap_or("Unknown").to_uppercase();
                         }
                     } else {
-                        codec_name = match pt {
-                            0 => "PCMU",
-                            8 => "PCMA",
-                            9 => "G722",
-                            18 => "G729",
-                            _ => "Unknown",
-                        }
-                        .to_string();
-                    }
-
-                    #[cfg(feature = "opus")]
-                    if codec_name == "Unknown" && pt == 111 {
-                        codec_name = "OPUS".to_string();
+                        codec_name = CodecType::try_from(pt)
+                            .ok()
+                            .map(|ct| format!("{:?}", ct).to_uppercase())
+                            .unwrap_or_else(|| "Unknown".to_string());
                     }
                 }
             }
@@ -1516,28 +1527,28 @@ impl MediaSession {
 
         let sample_rate = ct.samplerate();
         let clock_rate = ct.clock_rate();
-        let channels = ct.channels();
+        // audio-codec's Opus encoder only supports mono despite SDP declaring stereo
+        let channels = if ct == CodecType::Opus {
+            1
+        } else {
+            ct.channels()
+        };
         let mut encoder = audio_codec::create_encoder(ct);
-        let payload_type = pt.unwrap_or(match ct {
-            CodecType::PCMU => 0,
-            CodecType::PCMA => 8,
-            CodecType::G722 => 9,
-            CodecType::G729 => 18,
-            #[cfg(feature = "opus")]
-            CodecType::Opus => 111,
-            _ => 0,
-        });
+        let payload_type = pt.unwrap_or(ct.payload_type());
 
+        // chunk_size is always in mono samples since we never expand to stereo
         let chunk_size = (sample_rate / 50) as usize; // 20ms
 
         info!(
-            "[{}] Playback started: {} samples using {:?} at {}Hz (clock {}Hz, pt={})",
+            "[{}] Playback started: {} samples using {:?} at {}Hz (clock {}Hz, pt={}, channels={}, chunk_size={})",
             username,
             samples.len(),
             ct,
             sample_rate,
             clock_rate,
-            payload_type
+            payload_type,
+            channels,
+            chunk_size
         );
 
         // Pre-process: Resample audio for recording (16000Hz target) if needed
@@ -1595,17 +1606,9 @@ impl MediaSession {
                     let _ = rec_tx.send(record_chunk.to_vec());
                 }
 
-                // Expand to channels if needed for encoding (minimal work)
-                let audio_to_encode = if channels == 2 {
-                    let mut stereo = Vec::with_capacity(final_chunk.len() * 2);
-                    for &s in &final_chunk {
-                        stereo.push(s);
-                        stereo.push(s);
-                    }
-                    stereo
-                } else {
-                    final_chunk
-                };
+                // Note: audio-codec's Opus encoder only supports mono, so we always pass mono data
+                // Even if SDP declares opus/48000/2, the encoder works with mono samples
+                let audio_to_encode = final_chunk;
 
                 // Encode and send
                 let encoded = encoder.encode(&audio_to_encode);

@@ -26,6 +26,7 @@ use rsipstack::{
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -1088,6 +1089,9 @@ impl SipBot {
                 }
             });
 
+            let shared_media_session: Arc<Mutex<Option<MediaSession>>> = Arc::new(Mutex::new(None));
+            let shared_media_monitor = shared_media_session.clone();
+
             // Monitor loop
             let call_token = CancellationToken::new();
             let call_token_for_monitor = call_token.clone();
@@ -1102,7 +1106,16 @@ impl SipBot {
                             info!("[{}] Call is ringing", username_monitor);
                         }
                         DialogState::Confirmed(_, _) => {
-                            info!("[{}] Call is confirmed", username_monitor);
+                            let codec = {
+                                let m = shared_media_monitor.lock().await;
+                                m.as_ref()
+                                    .map(|s| s.get_negotiated_codec())
+                                    .unwrap_or_else(|| "Unknown".to_string())
+                            };
+                            info!(
+                                "[{}] Call is confirmed (Negotiated Codec: {})",
+                                username_monitor, codec
+                            );
                         }
                         DialogState::Updated(_, _, tx_handle) => {
                             info!("[{}] Call is updated", username_monitor);
@@ -1176,16 +1189,16 @@ impl SipBot {
                         .await
                         {
                             Ok((session, sdp, codec_name)) => {
+                                {
+                                    let mut m = shared_media_session.lock().await;
+                                    *m = Some(session.clone());
+                                }
                                 media_session = Some(session.clone());
                                 _call_guard.media_session = Some(session);
                                 local_sdp = Some(sdp);
                                 info!(
-                                    "[{}] Call established: From={}, To={}, Preferred Codec={}",
-                                    account.username, caller, callee, codec_name
-                                );
-                                info!(
-                                    "[{}] Call established: From={}, To={}, Preferred Codec={}",
-                                    account.username, caller, callee, codec_name
+                                    "[{}] Media session established. Preferred Codec: {}",
+                                    account.username, codec_name
                                 );
                             }
                             Err(e) => {
