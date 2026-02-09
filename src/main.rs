@@ -81,6 +81,9 @@ enum Commands {
         /// Codecs to use (e.g., opus,g722,pcmu)
         #[arg(long, value_delimiter = ',')]
         codecs: Option<Vec<String>>,
+        /// Custom headers (e.g., -H 'X-Custom: value')
+        #[arg(short = 'H', long = "header")]
+        headers: Option<Vec<String>>,
     },
     /// Wait for incoming calls
     Wait {
@@ -138,6 +141,9 @@ enum Commands {
         /// Codecs to use (e.g., opus,g722,pcmu)
         #[arg(long, value_delimiter = ',')]
         codecs: Option<Vec<String>>,
+        /// Custom headers (e.g., -H 'X-Custom: value')
+        #[arg(short = 'H', long = "header")]
+        headers: Option<Vec<String>>,
     },
     /// Send OPTIONS request
     Options {
@@ -209,6 +215,7 @@ async fn main() -> Result<()> {
                         answer: None,
                         hangup: None,
                         codecs: None,
+                        headers: None,
                     }],
                 }
             }
@@ -243,6 +250,7 @@ async fn main() -> Result<()> {
                         answer: None,
                         hangup: None,
                         codecs: codecs.clone(),
+                        headers: None,
                     }],
                 }
             }
@@ -265,6 +273,7 @@ async fn main() -> Result<()> {
                 nack,
                 jitter,
                 codecs,
+                headers,
             } => {
                 info!("Configuration file not found, using default configuration for wait command");
 
@@ -338,6 +347,7 @@ async fn main() -> Result<()> {
                         answer: answer_config,
                         hangup: hangup_config,
                         codecs: codecs.clone(),
+                        headers: headers.clone(),
                     }],
                 }
             }
@@ -371,6 +381,7 @@ async fn main() -> Result<()> {
         proxy_override,
         cancel_prob_override,
         codecs_override,
+        headers_override,
     ) = match &args.command {
         Commands::Call {
             target,
@@ -389,6 +400,7 @@ async fn main() -> Result<()> {
             cps,
             cancel_prob,
             codecs,
+            headers,
         } => {
             let is_register = register.is_some() || password.is_some();
             let reg_target = if let Some(r) = register {
@@ -415,6 +427,7 @@ async fn main() -> Result<()> {
                 reg_target,
                 *cancel_prob,
                 codecs.clone(),
+                headers.clone(),
             )
         }
         Commands::Wait {
@@ -427,6 +440,7 @@ async fn main() -> Result<()> {
             auth_user,
             local,
             codecs,
+            headers,
             ..
         } => {
             let is_register = register.is_some() || password.is_some();
@@ -454,6 +468,7 @@ async fn main() -> Result<()> {
                 reg_target,
                 0,
                 codecs.clone(),
+                headers.clone(),
             )
         }
         Commands::Options { target } => (
@@ -475,6 +490,7 @@ async fn main() -> Result<()> {
             None,
             0,
             None,
+            None,
         ),
         Commands::Info { target } => (
             "info",
@@ -494,6 +510,7 @@ async fn main() -> Result<()> {
             false,
             None,
             0,
+            None,
             None,
         ),
     };
@@ -545,6 +562,10 @@ async fn main() -> Result<()> {
 
         if let Some(codecs) = &codecs_override {
             account.codecs = Some(codecs.clone());
+        }
+
+        if let Some(headers) = &headers_override {
+            account.headers = Some(headers.clone());
         }
 
         if let Some(play_file) = &play_file_override {

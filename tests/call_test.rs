@@ -21,23 +21,10 @@ async fn test_call_flow() -> Result<()> {
         recorders: Some("/tmp/recorders_test".to_string()),
         accounts: vec![AccountConfig {
             username: "server".to_string(),
-            auth_username: None,
             domain: "127.0.0.1".to_string(),
-            password: None,
-            proxy: None,
             register: Some(false),
-            target: None,
-            record: None,
-            srtp_enabled: None,
-            nack_enabled: None,
-            jitter_buffer_enabled: None,
-            early_media: None,
-            ring: None,
             answer: Some(AnswerConfig::Echo),
-            hangup: None,
-            reject_prob: None,
-            cancel_prob: 0,
-            codecs: None,
+            ..Default::default()
         }],
     };
 
@@ -49,26 +36,14 @@ async fn test_call_flow() -> Result<()> {
         recorders: None,
         accounts: vec![AccountConfig {
             username: "client".to_string(),
-            auth_username: None,
             domain: "127.0.0.1".to_string(),
-            password: None,
-            proxy: None,
             register: Some(false),
             target: Some(format!("sip:server@{}", server_addr)),
-            record: None,
-            srtp_enabled: None,
-            nack_enabled: None,
-            jitter_buffer_enabled: None,
-            early_media: None,
-            ring: None,
-            answer: None,
             hangup: Some(sipbot::config::HangupConfig {
                 code: 200,
                 after_secs: Some(5),
             }),
-            reject_prob: None,
-            cancel_prob: 0,
-            codecs: None,
+            ..Default::default()
         }],
     };
 
@@ -141,23 +116,9 @@ async fn test_options_flow() -> Result<()> {
         recorders: None,
         accounts: vec![AccountConfig {
             username: "server".to_string(),
-            auth_username: None,
             domain: "127.0.0.1".to_string(),
-            password: None,
-            proxy: None,
             register: Some(false),
-            target: None,
-            record: None,
-            srtp_enabled: None,
-            nack_enabled: None,
-            jitter_buffer_enabled: None,
-            reject_prob: None,
-            cancel_prob: 0,
-            early_media: None,
-            ring: None,
-            answer: None,
-            hangup: None,
-            codecs: None,
+            ..Default::default()
         }],
     };
 
@@ -169,23 +130,10 @@ async fn test_options_flow() -> Result<()> {
         recorders: None,
         accounts: vec![AccountConfig {
             username: "client".to_string(),
-            auth_username: None,
             domain: "127.0.0.1".to_string(),
-            password: None,
-            proxy: None,
             register: Some(false),
             target: Some(format!("sip:server@{}", server_addr)),
-            record: None,
-            srtp_enabled: None,
-            nack_enabled: None,
-            jitter_buffer_enabled: None,
-            reject_prob: None,
-            cancel_prob: 0,
-            early_media: None,
-            ring: None,
-            answer: None,
-            hangup: None,
-            codecs: None,
+            ..Default::default()
         }],
     };
 

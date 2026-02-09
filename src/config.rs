@@ -21,7 +21,7 @@ impl Config {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct AccountConfig {
     pub username: String,
     pub auth_username: Option<String>,
@@ -36,6 +36,7 @@ pub struct AccountConfig {
     pub jitter_buffer_enabled: Option<bool>, // Enable Jitter Buffer
     pub reject_prob: Option<u8>,             // Reject probability (1-99%)
     pub codecs: Option<Vec<String>>,         // Preferred codecs (opus, g722, g729, pcmu, pcma)
+    pub headers: Option<Vec<String>>,        // Custom SIP headers (e.g., "X-Custom: value")
     #[serde(default)]
     pub cancel_prob: u8, // Cancel probability (1-99%)
 

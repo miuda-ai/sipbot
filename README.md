@@ -62,6 +62,7 @@ cargo run -- call -t sip:user@domain -u sipbot --play audio.wav --hangup 10 --to
 - `--cps <COUNT>`: Calls per second (default: 1).
 - `--cancel-prob <PROB>`: Cancel probability (0-99%) (default: 0).
 - `--codecs <LIST>`: Codecs to use (e.g., opus,g722,pcmu).
+- `-H, --header <HEADER>`: Add custom SIP header (e.g., `-H 'X-Custom: value'`). Can be used multiple times.
 
 #### Wait for Calls
 
@@ -87,6 +88,7 @@ cargo run -- wait --addr 0.0.0.0:5060 -u sipbot --answer welcome.wav
 - `--nack`: Enable NACK.
 - `--jitter`: Enable Jitter Buffer.
 - `--codecs <LIST>`: Codecs to use (e.g., opus,g722,pcmu).
+- `-H, --header <HEADER>`: Add custom SIP header (e.g., `-H 'X-Custom: value'`). Can be used multiple times.
 
 > **Note**: By default, `wait` mode does not record calls. To enable recording, you must use a configuration file and specify the `recorders` directory.
 
@@ -116,6 +118,22 @@ sipbot wait --username intercom --local
 ### 3. Automated Announcement
 
 Answer calls, play a welcome message, and hang up after 10 seconds.
+
+```bash
+sipbot wait --username announcement --answer welcome.wav --hangup 10
+```
+
+### 4. Custom SIP Headers
+
+Add custom SIP headers to outgoing calls and incoming responses:
+
+```bash
+# Outgoing call with custom headers
+sipbot call -t sip:user@domain -u caller -H 'X-Call-Type: test' -H 'X-Session-ID: 12345' --hangup 5
+
+# Incoming call handling with custom headers in response
+sipbot wait --username responder --answer welcome.wav -H 'X-Server-ID: bot-01' -H 'X-Region: US-West'
+```
 
 ```bash
 sipbot wait --username announcer --answer welcome.wav --hangup 10
@@ -167,6 +185,12 @@ domain = "sip.example.com"
 password = "secretpassword"
 register = true                 # Enable registration
 reject_prob = 20                # Randomly reject 20% of calls with 480
+codecs = ["opus", "g722", "pcmu"]  # Preferred codecs
+headers = [                     # Custom SIP headers
+    "X-Server-ID: sipbot-01",
+    "X-Region: US-West",
+    "X-Environment: production"
+]
 
 # --- Call Handling Flow ---
 
@@ -216,6 +240,8 @@ after_secs = 10                 # Send BYE after 10 seconds
     - `srtp_enabled`: (Bool) Enable SRTP/SDES.
     - `nack_enabled`: (Bool) Enable RTP NACK.
     - `jitter_buffer_enabled`: (Bool) Enable Jitter Buffer.
+    - `codecs`: (Array) List of preferred codecs (e.g., `["opus", "g722", "pcmu"]`).
+    - `headers`: (Array) List of custom SIP headers to include in INVITE requests and 200 OK responses (e.g., `["X-Custom-Header: value", "X-Call-ID: 12345"]`).
     - `codecs`: (Optional) List of preferred codecs (e.g., `["opus", "g722", "pcmu"]`).
     - **`early_media`**: Configuration for the early media phase (183).
         - `wav_file`: (Optional) Path to WAV file.

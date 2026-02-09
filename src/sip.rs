@@ -3,6 +3,7 @@ use crate::media::MediaSession;
 use crate::stats::CallStats;
 use anyhow::{Context, Result};
 use chrono::Local;
+use rand::RngExt;
 use rsip::headers::{
     CallId, From as UntypedFrom, To as UntypedTo, UntypedHeader, Via as UntypedVia,
 };
@@ -276,6 +277,17 @@ impl CallRunner {
             to.host_with_port.clone().into()
         };
 
+        let mut custom_headers = vec![];
+        if let Some(headers) = &self.account.headers {
+            for header_str in headers {
+                if let Some((name, value)) = header_str.split_once(':') {
+                    let name = name.trim();
+                    let value = value.trim();
+                    custom_headers.push(Header::Other(name.to_string(), value.into()));
+                }
+            }
+        }
+
         let opt = InviteOption {
             destination: Some(destination),
             caller: from.clone(),
@@ -284,6 +296,7 @@ impl CallRunner {
             content_type: Some("application/sdp".to_string()),
             offer: Some(local_sdp.into_bytes()),
             credential,
+            headers: Some(custom_headers),
             ..Default::default()
         };
 
@@ -293,7 +306,6 @@ impl CallRunner {
         let mut should_cancel;
         let cancel_before_ringring: bool;
         {
-            use rand::Rng;
             let mut rng = rand::rng();
             should_cancel = rng.random_range(0..100) <= self.account.cancel_prob;
             cancel_before_ringring = rng.random();
@@ -982,7 +994,7 @@ impl SipBot {
             Method::Ack => info!("[{}] Received ACK", self.account.username),
             Method::Bye => {
                 info!("[{}] Received BYE", self.account.username);
-                let id = DialogId::from_uas_request(&transaction.original)?;
+                let id = DialogId::try_from((&transaction.original, TransactionRole::Server))?;
                 let dialog = self.dialog_layer.as_ref().and_then(|d| d.get_dialog(&id));
                 if let Some(mut dlg) = dialog {
                     let _ = dlg.handle(&mut transaction).await?;
@@ -1143,7 +1155,6 @@ impl SipBot {
                 // Random rejection check
                 if let Some(prob) = account.reject_prob {
                     let should_reject = {
-                        use rand::Rng;
                         let mut rng = rand::rng();
                         rng.random_range(1..=100) <= prob
                     };
@@ -1398,6 +1409,16 @@ impl SipBot {
                 if let Some(sdp) = local_sdp.as_ref() {
                     body = Some(sdp.clone().into_bytes());
                     headers.push(Header::ContentType("application/sdp".into()));
+                }
+                // Add custom headers
+                if let Some(custom_headers) = &account.headers {
+                    for header_str in custom_headers {
+                        if let Some((name, value)) = header_str.split_once(':') {
+                            let name = name.trim();
+                            let value = value.trim();
+                            headers.push(Header::Other(name.to_string(), value.into()));
+                        }
+                    }
                 }
 
                 if let Err(e) = server_dialog_clone.accept(Some(headers), body) {
