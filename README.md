@@ -30,6 +30,13 @@ Install the `sipbot` from `crates.io`.
 cargo install sipbot
 ```
 
+## Build from source
+
+Linux users can build a static binary with musl for maximum compatibility:
+```bash
+cargo build -r --target x86_64-unknown-linux-musl --no-default-features --features opus
+```
+
 ### CLI Usage
 
 You can also run `sipbot` with CLI arguments for quick testing.
