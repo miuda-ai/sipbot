@@ -115,6 +115,7 @@ fn get_codec_type(pt: Option<u8>, caps: &Option<MediaCapabilities>) -> CodecType
             .and_then(|a| {
                 let name = a.codec_name.to_lowercase();
                 match name.as_str() {
+                    #[cfg(feature = "opus")]
                     "opus" => Some(CodecType::Opus),
                     "pcmu" => Some(CodecType::PCMU),
                     "pcma" => Some(CodecType::PCMA),
@@ -866,7 +867,23 @@ impl MediaSession {
         actual_sample_rate: u32,
     ) {
         let decoded = if let MediaSample::Audio(ref frame) = sample {
-            Some(decoder.decode(&frame.data))
+            let decoded_data = decoder.decode(&frame.data);
+            // Debug: calculate output RMS every 50 packets
+            static DEBUG_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let count = DEBUG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if count % 50 == 0 {
+                let rms = if !decoded_data.is_empty() {
+                    let sum: f64 = decoded_data.iter().map(|&s| (s as f64).powi(2)).sum();
+                    (sum / decoded_data.len() as f64).sqrt()
+                } else {
+                    0.0
+                };
+                info!(
+                    "[{}] Audio decode: packet_len={}, decoded_len={}, rms={:.2}",
+                    username, frame.data.len(), decoded_data.len(), rms
+                );
+            }
+            Some(decoded_data)
         } else {
             None
         };
@@ -1528,11 +1545,14 @@ impl MediaSession {
         let sample_rate = ct.samplerate();
         let clock_rate = ct.clock_rate();
         // audio-codec's Opus encoder only supports mono despite SDP declaring stereo
+        #[cfg(feature = "opus")]
         let channels = if ct == CodecType::Opus {
             1
         } else {
             ct.channels()
         };
+        #[cfg(not(feature = "opus"))]
+        let channels = ct.channels();
         let mut encoder = audio_codec::create_encoder(ct);
         let payload_type = pt.unwrap_or(ct.payload_type());
 
@@ -1610,8 +1630,25 @@ impl MediaSession {
                 // Even if SDP declares opus/48000/2, the encoder works with mono samples
                 let audio_to_encode = final_chunk;
 
+                // Debug: calculate input RMS
+                let input_rms = if !audio_to_encode.is_empty() {
+                    let sum: f64 = audio_to_encode.iter().map(|&s| (s as f64).powi(2)).sum();
+                    (sum / audio_to_encode.len() as f64).sqrt()
+                } else {
+                    0.0
+                };
+
                 // Encode and send
                 let encoded = encoder.encode(&audio_to_encode);
+
+                // Debug log every 50 frames
+                if sent_chunks % 50 == 0 {
+                    info!(
+                        "[{}] Audio encode: input_rms={:.2}, input_len={}, encoded_len={}",
+                        username, input_rms, audio_to_encode.len(), encoded.len()
+                    );
+                }
+
                 if encoded.is_empty() {
                     continue;
                 }
@@ -2027,7 +2064,23 @@ async fn process_recorded_sample(
     actual_sample_rate: u32,
 ) {
     let decoded = if let MediaSample::Audio(ref frame) = sample {
-        Some(decoder.decode(&frame.data))
+        let decoded_data = decoder.decode(&frame.data);
+        // Debug: calculate output RMS every 50 packets
+        static DEBUG_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let count = DEBUG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count % 50 == 0 {
+            let rms = if !decoded_data.is_empty() {
+                let sum: f64 = decoded_data.iter().map(|&s| (s as f64).powi(2)).sum();
+                (sum / decoded_data.len() as f64).sqrt()
+            } else {
+                0.0
+            };
+            info!(
+                "[RX] Audio decode: packet_len={}, decoded_len={}, rms={:.2}",
+                frame.data.len(), decoded_data.len(), rms
+            );
+        }
+        Some(decoded_data)
     } else {
         None
     };
