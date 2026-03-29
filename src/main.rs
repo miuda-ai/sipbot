@@ -216,6 +216,7 @@ async fn main() -> Result<()> {
                         hangup: None,
                         codecs: None,
                         headers: None,
+                        refer_reject: None,
                     }],
                 }
             }
@@ -251,6 +252,7 @@ async fn main() -> Result<()> {
                         hangup: None,
                         codecs: codecs.clone(),
                         headers: None,
+                        refer_reject: None,
                     }],
                 }
             }
@@ -348,6 +350,7 @@ async fn main() -> Result<()> {
                         hangup: hangup_config,
                         codecs: codecs.clone(),
                         headers: headers.clone(),
+                        refer_reject: None,
                     }],
                 }
             }

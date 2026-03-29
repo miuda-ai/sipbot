@@ -51,6 +51,9 @@ pub struct AccountConfig {
 
     // Stage 4: Hangup
     pub hangup: Option<HangupConfig>,
+
+    // REFER handling (for transfer testing)
+    pub refer_reject: Option<u16>, // If set, reject REFER with this status code (e.g., 405)
 }
 
 #[derive(Debug, Deserialize, Clone)]

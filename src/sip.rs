@@ -11,7 +11,7 @@ use rsip::message::HeadersExt;
 use rsip::typed::{From, To, Via};
 use rsip::{Header, Method, StatusCode, Uri};
 use rsipstack::dialog::DialogId;
-use rsipstack::dialog::dialog::DialogState;
+use rsipstack::dialog::dialog::{Dialog, DialogState};
 use rsipstack::{
     EndpointBuilder,
     dialog::authenticate::Credential,
@@ -988,6 +988,103 @@ impl SipBot {
         Ok(())
     }
 
+    /// Handle REFER request (RFC 3515)
+    /// 
+    /// For testing transfer scenarios, this implementation:
+    /// 1. Accepts the REFER with 202 Accepted (default)
+    /// 2. Or rejects with configured status code (e.g., 405 for 3PCC fallback testing)
+    /// 3. Sends NOTIFY with 100 Trying
+    /// 4. Sends NOTIFY with 200 OK (simulated success)
+    async fn handle_refer(&self, mut transaction: Transaction) -> Result<()> {
+        let refer_to = transaction
+            .original
+            .headers
+            .iter()
+            .find_map(|h| {
+                if let Header::Other(name, value) = h {
+                    if name.to_string().eq_ignore_ascii_case("refer-to") {
+                        return Some(value.to_string());
+                    }
+                }
+                None
+            });
+
+        info!(
+            "[{}] REFER target: {:?}",
+            self.account.username, refer_to
+        );
+
+        // Check if we should reject REFER (for testing 3PCC fallback)
+        if let Some(reject_code) = self.account.refer_reject {
+            let status_code = StatusCode::try_from(reject_code)
+                .unwrap_or(StatusCode::MethodNotAllowed);
+            info!(
+                "[{}] Rejecting REFER with {}",
+                self.account.username, status_code
+            );
+            transaction.reply(status_code).await?;
+            return Ok(());
+        }
+
+        // Reply 202 Accepted to REFER
+        transaction.reply(StatusCode::Accepted).await?;
+        info!("[{}] Sent 202 Accepted for REFER", self.account.username);
+
+        // Get dialog for sending NOTIFY
+        let dialog_layer = self
+            .dialog_layer
+            .as_ref()
+            .context("DialogLayer not initialized")?;
+        
+        let dialog_id = DialogId::try_from((&transaction.original, TransactionRole::Server))?;
+        
+        // Spawn task to send NOTIFY sequence
+        let dialog_layer_clone = dialog_layer.clone();
+        let username = self.account.username.clone();
+        let cancel_token = self.cancel_token.clone();
+        
+        tokio::spawn(async move {
+            // Wait a bit for REFER to be processed
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            
+            if let Some(dialog) = dialog_layer_clone.get_dialog(&dialog_id) {
+                if let Dialog::ServerInvite(server_dialog) = dialog {
+                    // Send NOTIFY 100 Trying
+                    if let Err(e) = server_dialog
+                        .notify_refer(StatusCode::Trying, "active")
+                        .await
+                    {
+                        warn!("[{}] Failed to send NOTIFY 100: {:?}", username, e);
+                        return;
+                    }
+                    info!("[{}] Sent NOTIFY 100 Trying", username);
+
+                    // Simulate some delay
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+
+                    // Check if cancelled
+                    if cancel_token.is_cancelled() {
+                        return;
+                    }
+
+                    // Send NOTIFY 200 OK (success)
+                    if let Err(e) = server_dialog
+                        .notify_refer(StatusCode::OK, "terminated;reason=noresource")
+                        .await
+                    {
+                        warn!("[{}] Failed to send NOTIFY 200: {:?}", username, e);
+                        return;
+                    }
+                    info!("[{}] Sent NOTIFY 200 OK", username);
+                }
+            } else {
+                warn!("[{}] Dialog not found for NOTIFY", username);
+            }
+        });
+
+        Ok(())
+    }
+
     async fn handle_incoming_transaction(&self, mut transaction: Transaction) -> Result<()> {
         match transaction.original.method {
             Method::Invite => self.handle_invite(transaction).await?,
@@ -1016,6 +1113,10 @@ impl SipBot {
             Method::Update => {
                 info!("[{}] Received UPDATE", self.account.username);
                 transaction.reply(StatusCode::OK).await?;
+            }
+            Method::Refer => {
+                info!("[{}] Received REFER", self.account.username);
+                self.handle_refer(transaction).await?;
             }
             _ => info!(
                 "[{}] Received other method: {:?}",
