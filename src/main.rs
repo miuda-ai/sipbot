@@ -598,12 +598,12 @@ async fn main() -> Result<()> {
 
         if let Some(caller) = &caller_override {
             if caller.starts_with("sip:") {
-                if let Ok(uri) = rsip::Uri::try_from(caller.as_str()) {
+                if let Ok(uri) = rsipstack::rsip::Uri::try_from(caller.as_str()) {
                     if let Some(user) = uri.user() {
                         account.username = user.to_string();
                     }
-                    let host = uri.host();
-                    account.domain = host.to_string();
+                    let host = uri.host_with_port.to_string();
+                    account.domain = host;
                 }
             } else {
                 account.username = caller.clone();

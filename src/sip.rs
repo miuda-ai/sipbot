@@ -4,12 +4,12 @@ use crate::stats::CallStats;
 use anyhow::{Context, Result};
 use chrono::Local;
 use rand::RngExt;
-use rsip::headers::{
-    CallId, From as UntypedFrom, To as UntypedTo, UntypedHeader, Via as UntypedVia,
+use rsipstack::rsip::headers::{
+    CallId, From as UntypedFrom, To as UntypedTo, Via as UntypedVia,
 };
-use rsip::message::HeadersExt;
-use rsip::typed::{From, To, Via};
-use rsip::{Header, Method, StatusCode, Uri};
+use rsipstack::rsip::headers::ToTypedHeader;
+use rsipstack::rsip::message::HeadersExt;
+use rsipstack::rsip::{Header, Method, StatusCode, Uri};
 use rsipstack::dialog::DialogId;
 use rsipstack::dialog::dialog::{Dialog, DialogState};
 use rsipstack::{
@@ -219,9 +219,9 @@ impl CallRunner {
         );
 
         let dialog_layer = &self.dialog_layer;
-        let from: rsip::Uri =
+        let from: rsipstack::rsip::Uri =
             format!("sip:{}@{}", self.account.username, self.account.domain).try_into()?;
-        let to: rsip::Uri = target_uri.as_str().try_into()?;
+        let to: rsipstack::rsip::Uri = target_uri.as_str().try_into()?;
         let contact =
             dialog_layer.build_local_contact(Some(self.account.username.clone()), None)?;
 
@@ -383,7 +383,7 @@ impl CallRunner {
             );
             if matches!(
                 res.status_code().kind(),
-                rsip::status_code::StatusCodeKind::Successful
+                rsipstack::rsip::status_code::StatusCodeKind::Successful
             ) {
                 let answer_sdp = String::from_utf8_lossy(&res.body);
                 debug!(
@@ -822,7 +822,7 @@ impl SipBot {
             generate_random_string()
         );
         let untyped_via = UntypedVia::try_from(via_str.as_str())?;
-        let via = Via::try_from(untyped_via)?;
+        let via = untyped_via.typed()?;
 
         let from_str = format!(
             "sip:{}@{};tag={}",
@@ -831,11 +831,11 @@ impl SipBot {
             generate_random_string()
         );
         let untyped_from = UntypedFrom::try_from(from_str.as_str())?;
-        let from = From::try_from(untyped_from)?;
+        let from = untyped_from.typed()?;
 
         let to_str = target_uri;
         let untyped_to = UntypedTo::try_from(to_str)?;
-        let to = To::try_from(untyped_to)?;
+        let to = untyped_to.typed()?;
 
         let call_id_str = format!("{}@{}", generate_random_string(), local_ip);
         let call_id = CallId::try_from(call_id_str.as_str())?;
@@ -859,7 +859,7 @@ impl SipBot {
 
         while let Some(msg) = transaction.receive().await {
             match msg {
-                rsip::SipMessage::Response(res) => {
+                rsipstack::rsip::SipMessage::Response(res) => {
                     info!("[{}] Received response:\n{}", self.account.username, res);
                     // Log body if present
                     if !res.body.is_empty() {
@@ -1097,7 +1097,7 @@ impl SipBot {
                     let _ = dlg.handle(&mut transaction).await?;
                 } else {
                     transaction
-                        .reply(rsip::StatusCode::CallTransactionDoesNotExist)
+                        .reply(rsipstack::rsip::StatusCode::CallTransactionDoesNotExist)
                         .await
                         .ok();
                 }
@@ -1232,11 +1232,11 @@ impl SipBot {
                         }
                         DialogState::Updated(_, _, tx_handle) => {
                             info!("[{}] Call is updated", username_monitor);
-                            tx_handle.reply(rsip::StatusCode::OK).await.ok();
+                            tx_handle.reply(rsipstack::rsip::StatusCode::OK).await.ok();
                         }
                         DialogState::Options(_, _, tx_handle) => {
                             info!("[{}] Call is options", username_monitor);
-                            tx_handle.reply(rsip::StatusCode::OK).await.ok();
+                            tx_handle.reply(rsipstack::rsip::StatusCode::OK).await.ok();
                         }
                         DialogState::Terminated(..) => {
                             info!("[{}] Call terminated remotely", username_monitor);
