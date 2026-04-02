@@ -17,12 +17,13 @@ use rustrtc::media::track::{MediaStreamTrack, SampleStreamSource, sample_track};
 use rustrtc::peer_connection::{
     PeerConnection, PeerConnectionEvent, RtpCodecParameters, RtpSenderBuilder, TransceiverDirection,
 };
+use rustrtc::rtp::RtcpPacket;
 use rustrtc::sdp::{SdpType, SessionDescription};
 use rustrtc::transports::ice::stun::random_u32;
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
@@ -208,6 +209,36 @@ fn get_audio_caps(codecs: &Option<Vec<String>>, nack_enabled: bool) -> Vec<Audio
     caps
 }
 
+fn now_ntp_short_16_16() -> u32 {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let ntp_seconds = duration.as_secs().saturating_add(2_208_988_800);
+    let ntp_fraction = (duration.subsec_nanos() as u64 * (1u64 << 32) / 1_000_000_000u64) as u32;
+
+    (((ntp_seconds as u32) & 0xFFFF) << 16) | (ntp_fraction >> 16)
+}
+
+fn rtt_from_report_block(
+    last_sender_report: u32,
+    delay_since_last_sender_report: u32,
+) -> Option<Duration> {
+    if last_sender_report == 0 {
+        return None;
+    }
+
+    let now = now_ntp_short_16_16();
+    let rtt_ntp = now
+        .wrapping_sub(last_sender_report)
+        .wrapping_sub(delay_since_last_sender_report);
+
+    let rtt_seconds = rtt_ntp as f64 / 65_536.0;
+    if !(0.0..=10.0).contains(&rtt_seconds) {
+        return None;
+    }
+    Some(Duration::from_secs_f64(rtt_seconds))
+}
+
 #[derive(Clone)]
 pub struct MediaSession {
     pc: Arc<PeerConnection>,
@@ -231,6 +262,45 @@ pub struct MediaSession {
 }
 
 impl MediaSession {
+    fn spawn_rtcp_rtt_collectors(&self) {
+        let transceivers = self.pc.get_transceivers();
+        for transceiver in transceivers {
+            if let Some(sender) = transceiver.sender() {
+                let sender_ssrc = sender.ssrc();
+                let stats = self.stats.clone();
+                let mut rtcp_rx = sender.subscribe_rtcp();
+                let token = self.cancel_token.child_token();
+
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = token.cancelled() => break,
+                            packet = rtcp_rx.recv() => {
+                                match packet {
+                                    Ok(RtcpPacket::ReceiverReport(rr)) => {
+                                        for block in rr.report_blocks {
+                                            if block.ssrc != sender_ssrc {
+                                                continue;
+                                            }
+                                            if let Some(rtt) = rtt_from_report_block(
+                                                block.last_sender_report,
+                                                block.delay_since_last_sender_report,
+                                            ) {
+                                                stats.add_rtcp_rtt(rtt);
+                                            }
+                                        }
+                                    }
+                                    Ok(_) => {}
+                                    Err(_) => break,
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     pub async fn new(
         remote_sdp: &str,
         srtp_enabled: bool,
@@ -459,6 +529,8 @@ impl MediaSession {
             }
         }
 
+        session.spawn_rtcp_rtt_collectors();
+
         Ok((session, local_sdp, chosen_codec_name))
     }
 
@@ -539,29 +611,30 @@ impl MediaSession {
         }
 
         let cancel_token = CancellationToken::new();
-        Ok((
-            Self {
-                pc,
-                audio_source,
-                recorder,
-                stats,
-                jitter_buffer_enabled,
-                last_nack_sent: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                last_nack_recv: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                last_nack_recovered: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                #[cfg(feature = "local-device")]
-                local_playback_tx: Arc::new(Mutex::new(None)),
-                #[cfg(feature = "local-device")]
-                output_sample_rate: Arc::new(std::sync::atomic::AtomicU32::new(8000)),
-                #[cfg(feature = "local-device")]
-                output_resampler: Arc::new(Mutex::new(None)),
-                #[cfg(feature = "local-device")]
-                local_stop_tx: Arc::new(Mutex::new(None)),
-                tracked_mids: Arc::new(Mutex::new(std::collections::HashSet::new())),
-                cancel_token,
-            },
-            local_sdp,
-        ))
+        let session = Self {
+            pc,
+            audio_source,
+            recorder,
+            stats,
+            jitter_buffer_enabled,
+            last_nack_sent: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_nack_recv: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_nack_recovered: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(feature = "local-device")]
+            local_playback_tx: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "local-device")]
+            output_sample_rate: Arc::new(std::sync::atomic::AtomicU32::new(8000)),
+            #[cfg(feature = "local-device")]
+            output_resampler: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "local-device")]
+            local_stop_tx: Arc::new(Mutex::new(None)),
+            tracked_mids: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            cancel_token,
+        };
+
+        session.spawn_rtcp_rtt_collectors();
+
+        Ok((session, local_sdp))
     }
 
     pub async fn set_remote_answer(&self, remote_sdp: &str) -> Result<String> {
@@ -869,7 +942,8 @@ impl MediaSession {
         let decoded = if let MediaSample::Audio(ref frame) = sample {
             let decoded_data = decoder.decode(&frame.data);
             // Debug: calculate output RMS every 50 packets
-            static DEBUG_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            static DEBUG_COUNTER: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
             let count = DEBUG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if count % 50 == 0 {
                 let rms = if !decoded_data.is_empty() {
@@ -878,9 +952,12 @@ impl MediaSession {
                 } else {
                     0.0
                 };
-                info!(
+                tracing::debug!(
                     "[{}] Audio decode: packet_len={}, decoded_len={}, rms={:.2}",
-                    username, frame.data.len(), decoded_data.len(), rms
+                    username,
+                    frame.data.len(),
+                    decoded_data.len(),
+                    rms
                 );
             }
             Some(decoded_data)
@@ -966,16 +1043,17 @@ impl MediaSession {
                 // Also record TX since we are echoing
                 stats.inc_tx(1, frame.data.len() as u64);
 
-                let rec = recorder.lock().await;
-                if let Some(r) = rec.as_ref() {
-                    if let Some(ref decoded_data) = decoded {
-                        let resampled = if let Some(resampler) = recorder_resampler {
-                            resampler.resample(decoded_data)
-                        } else {
-                            decoded_data.clone()
-                        };
-                        r.record_rx(&resampled);
-                        r.record_tx(&resampled);
+                if let Ok(rec) = recorder.try_lock() {
+                    if let Some(r) = rec.as_ref() {
+                        if let Some(ref decoded_data) = decoded {
+                            let resampled = if let Some(resampler) = recorder_resampler {
+                                resampler.resample(decoded_data)
+                            } else {
+                                decoded_data.clone()
+                            };
+                            r.record_rx(&resampled);
+                            r.record_tx(&resampled);
+                        }
                     }
                 }
             } else {
@@ -1645,7 +1723,10 @@ impl MediaSession {
                 if sent_chunks % 50 == 0 {
                     info!(
                         "[{}] Audio encode: input_rms={:.2}, input_len={}, encoded_len={}",
-                        username, input_rms, audio_to_encode.len(), encoded.len()
+                        username,
+                        input_rms,
+                        audio_to_encode.len(),
+                        encoded.len()
                     );
                 }
 
@@ -2066,7 +2147,8 @@ async fn process_recorded_sample(
     let decoded = if let MediaSample::Audio(ref frame) = sample {
         let decoded_data = decoder.decode(&frame.data);
         // Debug: calculate output RMS every 50 packets
-        static DEBUG_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static DEBUG_COUNTER: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
         let count = DEBUG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if count % 50 == 0 {
             let rms = if !decoded_data.is_empty() {
@@ -2075,9 +2157,11 @@ async fn process_recorded_sample(
             } else {
                 0.0
             };
-            info!(
+            tracing::debug!(
                 "[RX] Audio decode: packet_len={}, decoded_len={}, rms={:.2}",
-                frame.data.len(), decoded_data.len(), rms
+                frame.data.len(),
+                decoded_data.len(),
+                rms
             );
         }
         Some(decoded_data)
@@ -2130,14 +2214,15 @@ async fn process_recorded_sample(
             );
         }
 
-        let rec = recorder.lock().await;
-        if let Some(r) = rec.as_ref() {
-            let resampled = if let Some(resampler) = recorder_resampler {
-                resampler.resample(&decoded)
-            } else {
-                decoded.clone()
-            };
-            r.record_rx(&resampled);
+        if let Ok(rec) = recorder.try_lock() {
+            if let Some(r) = rec.as_ref() {
+                let resampled = if let Some(resampler) = recorder_resampler {
+                    resampler.resample(&decoded)
+                } else {
+                    decoded.clone()
+                };
+                r.record_rx(&resampled);
+            }
         }
 
         #[cfg(feature = "local-device")]

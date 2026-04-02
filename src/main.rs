@@ -695,7 +695,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    shared_stats.print_summary().await;
+    shared_stats.print_summary();
 
     Ok(())
 }

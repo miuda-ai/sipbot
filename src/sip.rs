@@ -311,6 +311,7 @@ impl CallRunner {
             cancel_before_ringring = rng.random();
         }
 
+        let invite_started = std::time::Instant::now();
         let invite = dialog_layer.do_invite(opt, tx);
         tokio::pin!(invite);
 
@@ -330,7 +331,7 @@ impl CallRunner {
                             latest_dialog_id = Some(d_id.clone());
                         } else if let DialogState::Early(d_id, res) = &state {
                              let code: u16 = res.status_code().clone().into();
-                            self.stats.add_status(code).await;
+                            self.stats.add_status(code);
                             latest_dialog_id = Some(d_id.clone());
 
                             if code == 183 {
@@ -373,9 +374,7 @@ impl CallRunner {
         }
 
         if let Some(res) = response {
-            self.stats
-                .add_status(res.status_code().clone().into())
-                .await;
+            self.stats.add_status(res.status_code().clone().into());
             info!(
                 "[{}] Received INVITE response: {}",
                 self.account.username,
@@ -399,6 +398,7 @@ impl CallRunner {
                     "[{}] Call established: From={}, To={}, Preferred Codec={}",
                     self.account.username, from, to, codec_name
                 );
+                self.stats.add_setup_latency(invite_started.elapsed());
             } else {
                 warn!(
                     "[{}] Call failed with status: {}",
@@ -623,10 +623,10 @@ impl SipBot {
                 interval.tick().await;
                 let current = monitor_stats.current();
                 if current > 0 {
-                    monitor_stats.print_summary().await;
+                    monitor_stats.print_summary();
                     last_was_zero = false;
                 } else if !last_was_zero {
-                    monitor_stats.print_summary().await;
+                    monitor_stats.print_summary();
                     last_was_zero = true;
                 }
             }
@@ -701,7 +701,7 @@ impl SipBot {
                 let mut interval = tokio::time::interval(Duration::from_millis(100));
                 loop {
                     interval.tick().await;
-                    monitor_stats.print_progress().await;
+                    monitor_stats.print_progress();
                 }
             });
 
@@ -877,7 +877,7 @@ impl SipBot {
                     if res.status_code().code() >= 200 {
                         self.stats
                             .add_status(res.status_code().clone().into())
-                            .await;
+                            ;
                         break;
                     }
                 }
@@ -1158,6 +1158,7 @@ impl SipBot {
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let username = self.account.username.clone();
+        let invite_received_at = std::time::Instant::now();
 
         let credential = if let Some(password) = &self.account.password {
             Some(Credential {
@@ -1209,42 +1210,54 @@ impl SipBot {
             let call_token = CancellationToken::new();
             let call_token_for_monitor = call_token.clone();
             let call_token_for_logic = call_token.clone();
+            let call_token_for_join = call_token.clone();
 
             let username_monitor = username.clone();
             let monitor_future = async move {
-                while let Some(state) = rx.recv().await {
-                    info!(%state, "[{}] Dialog state changed", username_monitor);
-                    match state {
-                        DialogState::Early(_, _) => {
-                            info!("[{}] Call is ringing", username_monitor);
-                        }
-                        DialogState::Confirmed(_, _) => {
-                            let codec = {
-                                let m = shared_media_monitor.lock().await;
-                                m.as_ref()
-                                    .map(|s| s.get_negotiated_codec())
-                                    .unwrap_or_else(|| "Unknown".to_string())
-                            };
-                            info!(
-                                "[{}] Call is confirmed (Negotiated Codec: {})",
-                                username_monitor, codec
-                            );
-                        }
-                        DialogState::Updated(_, _, tx_handle) => {
-                            info!("[{}] Call is updated", username_monitor);
-                            tx_handle.reply(rsipstack::rsip::StatusCode::OK).await.ok();
-                        }
-                        DialogState::Options(_, _, tx_handle) => {
-                            info!("[{}] Call is options", username_monitor);
-                            tx_handle.reply(rsipstack::rsip::StatusCode::OK).await.ok();
-                        }
-                        DialogState::Terminated(..) => {
-                            info!("[{}] Call terminated remotely", username_monitor);
-                            call_token_for_monitor.cancel();
+                loop {
+                    tokio::select! {
+                        _ = call_token_for_monitor.cancelled() => {
                             return;
                         }
-                        _ => {
-                            info!("[{}] Dialog state changed: {}", username_monitor, state);
+                        state = rx.recv() => {
+                            let Some(state) = state else {
+                                return;
+                            };
+
+                            info!(%state, "[{}] Dialog state changed", username_monitor);
+                            match state {
+                                DialogState::Early(_, _) => {
+                                    info!("[{}] Call is ringing", username_monitor);
+                                }
+                                DialogState::Confirmed(_, _) => {
+                                    let codec = {
+                                        let m = shared_media_monitor.lock().await;
+                                        m.as_ref()
+                                            .map(|s| s.get_negotiated_codec())
+                                            .unwrap_or_else(|| "Unknown".to_string())
+                                    };
+                                    info!(
+                                        "[{}] Call is confirmed (Negotiated Codec: {})",
+                                        username_monitor, codec
+                                    );
+                                }
+                                DialogState::Updated(_, _, tx_handle) => {
+                                    info!("[{}] Call is updated", username_monitor);
+                                    tx_handle.reply(rsipstack::rsip::StatusCode::OK).await.ok();
+                                }
+                                DialogState::Options(_, _, tx_handle) => {
+                                    info!("[{}] Call is options", username_monitor);
+                                    tx_handle.reply(rsipstack::rsip::StatusCode::OK).await.ok();
+                                }
+                                DialogState::Terminated(..) => {
+                                    info!("[{}] Call terminated remotely", username_monitor);
+                                    call_token_for_monitor.cancel();
+                                    return;
+                                }
+                                _ => {
+                                    info!("[{}] Dialog state changed: {}", username_monitor, state);
+                                }
+                            }
                         }
                     }
                 }
@@ -1275,7 +1288,7 @@ impl SipBot {
                         if let Err(e) = server_dialog_clone.reject(Some(status_code), None) {
                             error!("Reject error: {:?}", e);
                         }
-                        stats_clone.add_status(code).await;
+                        stats_clone.add_status(code);
                         return;
                     }
                 }
@@ -1325,7 +1338,7 @@ impl SipBot {
                                 }
                                 stats_clone
                                     .add_status(StatusCode::TemporarilyUnavailable.into())
-                                    .await;
+                                    ;
                                 return;
                             }
                         }
@@ -1356,7 +1369,7 @@ impl SipBot {
                             {
                                 error!("Early ring error: {:?}", e);
                             }
-                            stats_clone.add_status(183).await;
+                            stats_clone.add_status(183);
                         }
 
                         if let Some(media) = &mut media_session {
@@ -1421,13 +1434,13 @@ impl SipBot {
                                 error!("Ringing error: {:?}", e);
                                 return;
                             }
-                            stats_clone.add_status(183).await;
+                            stats_clone.add_status(183);
                         } else {
                             if let Err(e) = server_dialog_clone.ringing(None, None) {
                                 error!("Ringing error: {:?}", e);
                                 return;
                             }
-                            stats_clone.add_status(180).await;
+                            stats_clone.add_status(180);
                         }
 
                         if let Some(media) = &mut media_session {
@@ -1483,7 +1496,7 @@ impl SipBot {
                             error!("Ringing error: {:?}", e);
                             return;
                         }
-                        stats_clone.add_status(180).await;
+                        stats_clone.add_status(180);
                         tokio::select! {
                             _ = tokio::time::sleep(Duration::from_secs(cfg.duration_secs)) => {}
                             _ = cancel_token.cancelled() => {}
@@ -1526,7 +1539,8 @@ impl SipBot {
                     error!("Accept error: {:?}", e);
                     return;
                 }
-                stats_clone.add_status(200).await;
+                stats_clone.add_status(200);
+                stats_clone.add_setup_latency(invite_received_at.elapsed());
 
                 if media_session.is_none() {
                     warn!(
@@ -1688,19 +1702,16 @@ impl SipBot {
                 info!("[{}] Call logic completed", account.username);
             };
 
-            // Run monitor and call logic concurrently, but ensure call_logic always finishes
-            let monitor_handle = tokio::spawn(monitor_future);
-
-            info!("[{}] Running call logic to completion", username_log);
-            // Always run call_logic to completion (it handles cancellation and sends BYE)
-            call_logic.await;
+            info!("[{}] Running call logic and monitor", username_log);
+            let call_logic_with_shutdown = async move {
+                call_logic.await;
+                call_token_for_join.cancel();
+            };
+            tokio::join!(monitor_future, call_logic_with_shutdown);
             info!("[{}] Call logic finished, decrementing stats", username_log);
 
             // Decrement stats AFTER BYE is sent
             stats_for_decrement.dec_current();
-
-            // Cancel monitor if still running
-            monitor_handle.abort();
             info!("[{}] Call task completed", username_log);
         });
 

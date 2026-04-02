@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Duration, interval};
 use tracing::{error, info};
 
@@ -63,8 +63,10 @@ impl Default for RecorderManager {
 }
 
 pub struct Recorder {
-    tx: mpsc::UnboundedSender<AudioPacket>,
+    tx: mpsc::Sender<AudioPacket>,
 }
+
+const RECORDER_QUEUE_CAPACITY: usize = 256;
 
 enum AudioPacket {
     Rx(Vec<i16>),
@@ -74,13 +76,13 @@ enum AudioPacket {
 
 impl Drop for Recorder {
     fn drop(&mut self) {
-        let _ = self.tx.send(AudioPacket::Stop);
+        let _ = self.tx.try_send(AudioPacket::Stop);
     }
 }
 
 impl Recorder {
     pub fn new(username: String, path: PathBuf) -> Self {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(RECORDER_QUEUE_CAPACITY);
 
         tokio::spawn(async move {
             info!("[{}] Recorder started: {:?}", username, path);
@@ -159,11 +161,11 @@ impl Recorder {
     }
 
     pub fn record_rx(&self, samples: &[i16]) {
-        let _ = self.tx.send(AudioPacket::Rx(samples.to_vec()));
+        let _ = self.tx.try_send(AudioPacket::Rx(samples.to_vec()));
     }
 
     pub fn record_tx(&self, samples: &[i16]) {
-        let _ = self.tx.send(AudioPacket::Tx(samples.to_vec()));
+        let _ = self.tx.try_send(AudioPacket::Tx(samples.to_vec()));
     }
 }
 
