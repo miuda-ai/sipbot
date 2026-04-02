@@ -258,10 +258,29 @@ pub struct MediaSession {
     #[cfg(feature = "local-device")]
     local_stop_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>>,
     tracked_mids: Arc<Mutex<std::collections::HashSet<String>>>,
+    echo_tracked_mids: Arc<Mutex<std::collections::HashSet<String>>>,
     cancel_token: CancellationToken,
 }
 
 impl MediaSession {
+    async fn try_track_record_mid(&self, mid: &str) -> bool {
+        let mut mids = self.tracked_mids.lock().await;
+        if mids.contains(mid) {
+            return false;
+        }
+        mids.insert(mid.to_string());
+        true
+    }
+
+    async fn try_track_echo_mid(&self, mid: &str) -> bool {
+        let mut mids = self.echo_tracked_mids.lock().await;
+        if mids.contains(mid) {
+            return false;
+        }
+        mids.insert(mid.to_string());
+        true
+    }
+
     fn spawn_rtcp_rtt_collectors(&self) {
         let transceivers = self.pc.get_transceivers();
         for transceiver in transceivers {
@@ -464,6 +483,7 @@ impl MediaSession {
             #[cfg(feature = "local-device")]
             local_stop_tx: Arc::new(Mutex::new(None)),
             tracked_mids: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            echo_tracked_mids: Arc::new(Mutex::new(std::collections::HashSet::new())),
             cancel_token: cancel_token.clone(),
         };
 
@@ -483,12 +503,8 @@ impl MediaSession {
                                     .mid()
                                     .clone()
                                     .unwrap_or_else(|| "unknown".to_string());
-                                {
-                                    let mut mids = bg_session.tracked_mids.lock().await;
-                                    if mids.contains(&mid) {
-                                        continue;
-                                    }
-                                    mids.insert(mid);
+                                if !bg_session.try_track_record_mid(&mid).await {
+                                    continue;
                                 }
 
                                 if let Some(receiver) = transceiver.receiver().as_ref() {
@@ -514,12 +530,8 @@ impl MediaSession {
                     .mid()
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string());
-                {
-                    let mut mids = session.tracked_mids.lock().await;
-                    if mids.contains(&mid) {
-                        continue;
-                    }
-                    mids.insert(mid);
+                if !session.try_track_record_mid(&mid).await {
+                    continue;
                 }
                 spawn_track_recorder(
                     session.clone(),
@@ -629,6 +641,7 @@ impl MediaSession {
             #[cfg(feature = "local-device")]
             local_stop_tx: Arc::new(Mutex::new(None)),
             tracked_mids: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            echo_tracked_mids: Arc::new(Mutex::new(std::collections::HashSet::new())),
             cancel_token,
         };
 
@@ -703,12 +716,8 @@ impl MediaSession {
                     .mid()
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string());
-                {
-                    let mut mids = self.tracked_mids.lock().await;
-                    if mids.contains(&mid) {
-                        continue;
-                    }
-                    mids.insert(mid);
+                if !self.try_track_record_mid(&mid).await {
+                    continue;
                 }
                 spawn_track_recorder(self.clone(), receiver.track(), child_token.clone());
             }
@@ -739,17 +748,13 @@ impl MediaSession {
                         .mid()
                         .clone()
                         .unwrap_or_else(|| "unknown".to_string());
-                    {
-                        let mut mids = session.tracked_mids.lock().await;
-                        if mids.contains(&mid) {
-                            tracing::debug!(
-                                "[{}] Track {} already being recorded, skipping",
-                                username,
-                                mid
-                            );
-                            continue;
-                        }
-                        mids.insert(mid);
+                    if !session.try_track_record_mid(&mid).await {
+                        tracing::debug!(
+                            "[{}] Track {} already being recorded, skipping",
+                            username,
+                            mid
+                        );
+                        continue;
                     }
 
                     if let Some(receiver) = transceiver.receiver().as_ref() {
@@ -1788,12 +1793,8 @@ impl MediaSession {
                     .mid()
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string());
-                {
-                    let mut mids = self.tracked_mids.lock().await;
-                    if mids.contains(&mid) {
-                        continue;
-                    }
-                    mids.insert(mid);
+                if !self.try_track_echo_mid(&mid).await {
+                    continue;
                 }
                 self.spawn_audio_loop(
                     username.clone(),
@@ -1817,17 +1818,13 @@ impl MediaSession {
                                     .mid()
                                     .clone()
                                     .unwrap_or_else(|| "unknown".to_string());
-                                {
-                                    let mut mids = session_rx.tracked_mids.lock().await;
-                                    if mids.contains(&mid) {
-                                        tracing::debug!(
-                                            "[{}] Track {} already being recorded, skipping",
-                                            username_rx,
-                                            mid
-                                        );
-                                        continue;
-                                    }
-                                    mids.insert(mid);
+                                if !session_rx.try_track_echo_mid(&mid).await {
+                                    tracing::debug!(
+                                        "[{}] Track {} already being echoed, skipping",
+                                        username_rx,
+                                        mid
+                                    );
+                                    continue;
                                 }
                                 if let Some(receiver) = transceiver.receiver().as_ref() {
                                     self.spawn_audio_loop(username_rx.clone(), receiver.track(), cancel_token.child_token());
@@ -2428,5 +2425,21 @@ mod tests {
             "Answer SDP should NOT contain PCMU if not offered. SDP: {}",
             answer_sdp
         );
+    }
+
+    #[tokio::test]
+    async fn test_echo_tracking_independent_from_recorder_tracking() {
+        let stats = Arc::new(CallStats::new());
+        let (session, _sdp) =
+            MediaSession::new_offer(false, false, false, None, None, false, stats)
+                .await
+                .unwrap();
+
+        assert!(session.try_track_record_mid("audio-0").await);
+        assert!(!session.try_track_record_mid("audio-0").await);
+
+        // Echo tracking must be independent from recorder tracking.
+        assert!(session.try_track_echo_mid("audio-0").await);
+        assert!(!session.try_track_echo_mid("audio-0").await);
     }
 }
