@@ -1662,8 +1662,6 @@ impl MediaSession {
             samples.clone()
         };
 
-        let total_chunks = (samples.len() + chunk_size - 1) / chunk_size;
-
         // Recording background task to avoid blocking the main loop
         let recorder_clone = self.recorder.clone();
         let (rec_tx, mut rec_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<i16>>();
@@ -1680,93 +1678,103 @@ impl MediaSession {
         let mut ticker = interval(Duration::from_millis(20));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        let mut chunks_iter = samples.chunks(chunk_size).enumerate().peekable();
         let record_chunk_size = if sample_rate != 16000 {
             // Resample changes sample count: 20ms of samples at sample_rate becomes 20ms at 16000Hz
             (chunk_size as u32 * 16000 / sample_rate) as usize
         } else {
             chunk_size
         };
-        let mut record_chunks_iter = record_samples.chunks(record_chunk_size).peekable();
 
+        let mut chunk_index: usize = 0;
+        let num_chunks = (samples.len() + chunk_size - 1) / chunk_size;
+        let num_record_chunks = (record_samples.len() + record_chunk_size - 1) / record_chunk_size;
         let mut sent_chunks = 0u64;
         let mut rtp_timestamp: u32 = random_u32();
 
         loop {
             ticker.tick().await;
 
-            if let Some((_, chunk)) = chunks_iter.next() {
-                let final_chunk = if chunk.len() == chunk_size {
-                    chunk.to_vec()
-                } else {
-                    let mut v = chunk.to_vec();
-                    v.resize(chunk_size, 0);
-                    v
-                };
-
-                // Send pre-resampled chunk to recorder (non-blocking)
-                if let Some(record_chunk) = record_chunks_iter.next() {
-                    let _ = rec_tx.send(record_chunk.to_vec());
-                }
-
-                // Note: audio-codec's Opus encoder only supports mono, so we always pass mono data
-                // Even if SDP declares opus/48000/2, the encoder works with mono samples
-                let audio_to_encode = final_chunk;
-
-                // Debug: calculate input RMS
-                let input_rms = if !audio_to_encode.is_empty() {
-                    let sum: f64 = audio_to_encode.iter().map(|&s| (s as f64).powi(2)).sum();
-                    (sum / audio_to_encode.len() as f64).sqrt()
-                } else {
-                    0.0
-                };
-
-                // Encode and send
-                let encoded = encoder.encode(&audio_to_encode);
-
-                // Debug log every 50 frames
-                if sent_chunks % 50 == 0 {
-                    info!(
-                        "[{}] Audio encode: input_rms={:.2}, input_len={}, encoded_len={}",
-                        username,
-                        input_rms,
-                        audio_to_encode.len(),
-                        encoded.len()
-                    );
-                }
-
-                if encoded.is_empty() {
-                    continue;
-                }
-
-                self.stats.inc_tx(1, encoded.len() as u64);
-
-                let frame = AudioFrame {
-                    data: Bytes::from(encoded),
-                    clock_rate,
-                    rtp_timestamp,
-                    payload_type: Some(payload_type),
-                    ..Default::default()
-                };
-
-                let ticks = (chunk_size as u64 * clock_rate as u64 / sample_rate as u64) as u32;
-                rtp_timestamp = rtp_timestamp.wrapping_add(ticks);
-
-                if let Err(e) = self.audio_source.send_audio(frame).await {
-                    error!("[{}] Failed to send audio: {:?}", username, e);
-                    break;
-                }
-
-                sent_chunks += 1;
-                if sent_chunks % 100 == 0 {
-                    info!(
-                        "[{}] Sent {}/{} chunks",
-                        username, sent_chunks, total_chunks
-                    );
-                }
-            } else {
-                // No more chunks to send
+            // Loop audio: wrap around when all chunks have been played
+            if num_chunks == 0 {
                 break;
+            }
+            let ci = chunk_index % num_chunks;
+            let start = ci * chunk_size;
+            let end = (start + chunk_size).min(samples.len());
+            let chunk = &samples[start..end];
+
+            let final_chunk = if chunk.len() == chunk_size {
+                chunk.to_vec()
+            } else {
+                let mut v = chunk.to_vec();
+                v.resize(chunk_size, 0);
+                v
+            };
+
+            // Send pre-resampled chunk to recorder (non-blocking, also loops)
+            if num_record_chunks > 0 {
+                let ri = chunk_index % num_record_chunks;
+                let rstart = ri * record_chunk_size;
+                let rend = (rstart + record_chunk_size).min(record_samples.len());
+                let _ = rec_tx.send(record_samples[rstart..rend].to_vec());
+            }
+
+            chunk_index += 1;
+
+            // Note: audio-codec's Opus encoder only supports mono, so we always pass mono data
+            // Even if SDP declares opus/48000/2, the encoder works with mono samples
+            let audio_to_encode = final_chunk;
+
+            // Debug: calculate input RMS
+            let input_rms = if !audio_to_encode.is_empty() {
+                let sum: f64 = audio_to_encode.iter().map(|&s| (s as f64).powi(2)).sum();
+                (sum / audio_to_encode.len() as f64).sqrt()
+            } else {
+                0.0
+            };
+
+            // Encode and send
+            let encoded = encoder.encode(&audio_to_encode);
+
+            // Debug log every 50 frames
+            if sent_chunks % 50 == 0 {
+                info!(
+                    "[{}] Audio encode: input_rms={:.2}, input_len={}, encoded_len={}",
+                    username,
+                    input_rms,
+                    audio_to_encode.len(),
+                    encoded.len()
+                );
+            }
+
+            if encoded.is_empty() {
+                continue;
+            }
+
+            self.stats.inc_tx(1, encoded.len() as u64);
+
+            let frame = AudioFrame {
+                data: Bytes::from(encoded),
+                clock_rate,
+                rtp_timestamp,
+                payload_type: Some(payload_type),
+                ..Default::default()
+            };
+
+            let ticks = (chunk_size as u64 * clock_rate as u64 / sample_rate as u64) as u32;
+            rtp_timestamp = rtp_timestamp.wrapping_add(ticks);
+
+            if let Err(e) = self.audio_source.send_audio(frame).await {
+                error!("[{}] Failed to send audio: {:?}", username, e);
+                break;
+            }
+
+            sent_chunks += 1;
+            if sent_chunks % 500 == 0 {
+                info!(
+                    "[{}] Sent {} chunks (loop #{})",
+                    username, sent_chunks, (chunk_index - 1) / num_chunks
+                );
             }
         }
 
