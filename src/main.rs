@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use futures::future::join_all;
 use sipbot::config::{AccountConfig, Config};
+use sipbot::csv_stats::{write_final_summary, CsvStatsRecorder};
 use sipbot::sip;
 use sipbot::stats::CallStats;
 use std::path::PathBuf;
@@ -84,6 +85,12 @@ enum Commands {
         /// Custom headers (e.g., -H 'X-Custom: value')
         #[arg(short = 'H', long = "header")]
         headers: Option<Vec<String>>,
+        /// Output statistics to CSV file
+        #[arg(long)]
+        csv_output: Option<String>,
+        /// CSV output interval in seconds
+        #[arg(long, default_value = "5")]
+        csv_interval: u64,
     },
     /// Wait for incoming calls
     Wait {
@@ -385,6 +392,8 @@ async fn main() -> Result<()> {
         cancel_prob_override,
         codecs_override,
         headers_override,
+        csv_output_path,
+        csv_interval,
     ) = match &args.command {
         Commands::Call {
             target,
@@ -404,6 +413,8 @@ async fn main() -> Result<()> {
             cancel_prob,
             codecs,
             headers,
+            csv_output,
+            csv_interval,
         } => {
             let is_register = register.is_some() || password.is_some();
             let reg_target = if let Some(r) = register {
@@ -431,6 +442,8 @@ async fn main() -> Result<()> {
                 *cancel_prob,
                 codecs.clone(),
                 headers.clone(),
+                csv_output.clone(),
+                *csv_interval,
             )
         }
         Commands::Wait {
@@ -472,6 +485,8 @@ async fn main() -> Result<()> {
                 0,
                 codecs.clone(),
                 headers.clone(),
+                None,
+                5, // default csv_interval
             )
         }
         Commands::Options { target } => (
@@ -494,6 +509,8 @@ async fn main() -> Result<()> {
             0,
             None,
             None,
+            None,
+            5,
         ),
         Commands::Info { target } => (
             "info",
@@ -515,6 +532,8 @@ async fn main() -> Result<()> {
             0,
             None,
             None,
+            None,
+            5,
         ),
     };
 
@@ -522,6 +541,23 @@ async fn main() -> Result<()> {
     let global_config = config.clone();
     let shared_stats = Arc::new(CallStats::new());
     let cancel_token = CancellationToken::new();
+
+    // Start CSV recorder if requested
+    let _csv_handle = if let Some(ref csv_path) = csv_output_path {
+        if command_name == "call" {
+            let csv_recorder = Arc::new(CsvStatsRecorder::new(
+                shared_stats.clone(),
+                csv_path.clone(),
+                csv_interval,
+            ));
+            println!("[*] CSV Output: {} (interval: {}s)", csv_path, csv_interval);
+            Some(csv_recorder.spawn())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     if command_name == "call" {
         println!(
@@ -564,11 +600,11 @@ async fn main() -> Result<()> {
         }
 
         if let Some(codecs) = &codecs_override {
-            account.codecs = Some(codecs.clone());
+            account.codecs = Some(codecs.clone() as Vec<String>);
         }
 
         if let Some(headers) = &headers_override {
-            account.headers = Some(headers.clone());
+            account.headers = Some(headers.clone() as Vec<String>);
         }
 
         if let Some(play_file) = &play_file_override {
@@ -628,7 +664,7 @@ async fn main() -> Result<()> {
         }
 
         if let Some(proxy) = &proxy_override {
-            account.proxy = Some(proxy.clone());
+            account.proxy = Some(proxy.clone() as String);
         }
 
         let verbose = args.verbose;
@@ -696,6 +732,18 @@ async fn main() -> Result<()> {
     }
 
     shared_stats.print_summary();
+
+    // Write final summary to file if CSV output was requested
+    if let Some(ref csv_path) = csv_output_path {
+        let summary_path = if csv_path.ends_with(".csv") {
+            csv_path.replace(".csv", "_summary.txt")
+        } else {
+            format!("{}_summary.txt", csv_path)
+        };
+        if let Err(e) = write_final_summary(&shared_stats, &summary_path).await {
+            error!("Failed to write final summary: {}", e);
+        }
+    }
 
     Ok(())
 }
