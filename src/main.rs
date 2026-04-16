@@ -49,6 +49,9 @@ enum Commands {
         /// Register to SIP server before calling (optional domain)
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
         register: Option<String>,
+        /// From URI user part for outbound calls (e.g., anonymous)
+        #[arg(long)]
+        from: Option<String>,
         /// Hangup after seconds
         #[arg(long)]
         hangup: Option<u64>,
@@ -91,6 +94,9 @@ enum Commands {
         /// CSV output interval in seconds
         #[arg(long, default_value = "5")]
         csv_interval: u64,
+        /// Bind address (e.g., 0.0.0.0:5060)
+        #[arg(short, long)]
+        addr: Option<String>,
     },
     /// Wait for incoming calls
     Wait {
@@ -210,6 +216,7 @@ async fn main() -> Result<()> {
                         password: None,
                         proxy: None,
                         register: Some(false),
+                        from_user: None,
                         target: None,
                         record: None,
                         srtp_enabled: None,
@@ -230,13 +237,14 @@ async fn main() -> Result<()> {
             Commands::Call {
                 target: Some(_),
                 codecs,
+                addr,
                 ..
             } => {
                 info!(
                     "Configuration file not found, using default configuration for standalone command"
                 );
                 Config {
-                    addr: Some("0.0.0.0:0".to_string()),
+                    addr: Some(addr.clone().unwrap_or_else(|| "0.0.0.0:0".to_string())),
                     external_ip: None,
                     recorders: None,
                     accounts: vec![AccountConfig {
@@ -246,6 +254,7 @@ async fn main() -> Result<()> {
                         password: None,
                         proxy: None,
                         register: Some(false),
+                        from_user: None,
                         target: None,
                         record: None,
                         srtp_enabled: None,
@@ -344,6 +353,7 @@ async fn main() -> Result<()> {
                         password: password.clone(),
                         proxy: reg_target,
                         register: Some(is_register),
+                        from_user: None,
                         target: None,
                         record: None,
                         srtp_enabled: Some(*srtp),
@@ -394,6 +404,8 @@ async fn main() -> Result<()> {
         headers_override,
         csv_output_path,
         csv_interval,
+        from_override,
+        addr_override,
     ) = match &args.command {
         Commands::Call {
             target,
@@ -401,6 +413,7 @@ async fn main() -> Result<()> {
             auth_user,
             password,
             register,
+            from,
             hangup,
             play,
             local,
@@ -415,6 +428,7 @@ async fn main() -> Result<()> {
             headers,
             csv_output,
             csv_interval,
+            addr,
         } => {
             let is_register = register.is_some() || password.is_some();
             let reg_target = if let Some(r) = register {
@@ -444,6 +458,8 @@ async fn main() -> Result<()> {
                 headers.clone(),
                 csv_output.clone(),
                 *csv_interval,
+                from.clone(),
+                addr.clone(),
             )
         }
         Commands::Wait {
@@ -487,6 +503,7 @@ async fn main() -> Result<()> {
                 headers.clone(),
                 None,
                 5, // default csv_interval
+                None,
             )
         }
         Commands::Options { target } => (
@@ -511,6 +528,7 @@ async fn main() -> Result<()> {
             None,
             None,
             5,
+            None,
         ),
         Commands::Info { target } => (
             "info",
@@ -534,8 +552,13 @@ async fn main() -> Result<()> {
             None,
             None,
             5,
+            None,
         ),
     };
+
+    if let Some(addr) = &addr_override {
+        config.addr = Some(addr.clone());
+    }
 
     let mut handles = vec![];
     let global_config = config.clone();
@@ -644,6 +667,10 @@ async fn main() -> Result<()> {
             } else {
                 account.username = caller.clone();
             }
+        }
+
+        if let Some(from) = &from_override {
+            account.from_user = Some(from.clone());
         }
 
         if let Some(auth_user) = &auth_user_override {

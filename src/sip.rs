@@ -4,9 +4,7 @@ use crate::stats::CallStats;
 use anyhow::{Context, Result};
 use chrono::Local;
 use rand::RngExt;
-use rsipstack::rsip::headers::{
-    CallId, From as UntypedFrom, To as UntypedTo, Via as UntypedVia,
-};
+use rsipstack::rsip::headers::{CallId, From as UntypedFrom, To as UntypedTo};
 use rsipstack::rsip::headers::ToTypedHeader;
 use rsipstack::rsip::message::HeadersExt;
 use rsipstack::rsip::{Header, Method, StatusCode, Uri};
@@ -219,8 +217,22 @@ impl CallRunner {
         );
 
         let dialog_layer = &self.dialog_layer;
-        let from: rsipstack::rsip::Uri =
-            format!("sip:{}@{}", self.account.username, self.account.domain).try_into()?;
+        let from: rsipstack::rsip::Uri = if let Some(from_str) = &self.account.from_user {
+            if from_str.starts_with("sip:") {
+                let mut uri: rsipstack::rsip::Uri = from_str.as_str().try_into()?;
+                if uri.auth.as_ref().map_or(true, |a| a.user.is_empty()) {
+                    uri.auth = Some(rsipstack::rsip::Auth {
+                        user: self.account.username.clone(),
+                        password: None,
+                    });
+                }
+                uri
+            } else {
+                format!("sip:{}@{}", from_str, self.account.domain).try_into()?
+            }
+        } else {
+            format!("sip:{}@{}", self.account.username, self.account.domain).try_into()?
+        };
         let to: rsipstack::rsip::Uri = target_uri.as_str().try_into()?;
         let contact =
             dialog_layer.build_local_contact(Some(self.account.username.clone()), None)?;
@@ -551,9 +563,20 @@ impl SipBot {
             .addr
             .as_deref()
             .unwrap_or("0.0.0.0:35060");
-        let addr = addr_str.parse().context("Invalid bind address")?;
+        let addr: std::net::SocketAddr = addr_str.parse().context("Invalid bind address")?;
 
-        let udp_conn = UdpConnection::create_connection(addr, None, None).await?;
+        let mut udp_conn = UdpConnection::create_connection(addr, None, None).await?;
+        if let Some(ip) = &self.global_config.external_ip {
+            if let Ok(sock) = udp_conn.get_addr().get_socketaddr() {
+                let external: std::net::SocketAddr = format!("{}:{}", ip, sock.port())
+                    .parse()
+                    .context("Invalid external address")?;
+                udp_conn.external = Some(rsipstack::transport::SipAddr {
+                    r#type: Some(rsipstack::rsip::Transport::Udp),
+                    addr: external.into(),
+                });
+            }
+        }
         let local_addr = udp_conn.get_addr();
         info!("[{}] Listening on {}", self.account.username, local_addr);
 
@@ -813,23 +836,35 @@ impl SipBot {
         let local_sip_addr = addrs.first().context("No local address found")?;
         let local_socket = local_sip_addr.get_socketaddr()?;
         let local_ip = local_socket.ip();
-        let local_port = local_socket.port();
 
-        let via_str = format!(
-            "SIP/2.0/UDP {}:{};branch=z9hG4bK{}",
-            local_ip,
-            local_port,
-            generate_random_string()
-        );
-        let untyped_via = UntypedVia::try_from(via_str.as_str())?;
-        let via = untyped_via.typed()?;
+        let via = endpoint.inner.get_via(None, None)?;
 
-        let from_str = format!(
-            "sip:{}@{};tag={}",
-            self.account.username,
-            self.account.domain,
-            generate_random_string()
-        );
+        let from_str = if let Some(from_val) = &self.account.from_user {
+            if from_val.starts_with("sip:") {
+                let mut uri: rsipstack::rsip::Uri = from_val.as_str().try_into()?;
+                if uri.auth.as_ref().map_or(true, |a| a.user.is_empty()) {
+                    uri.auth = Some(rsipstack::rsip::Auth {
+                        user: self.account.username.clone(),
+                        password: None,
+                    });
+                }
+                format!("{};tag={}", uri, generate_random_string())
+            } else {
+                format!(
+                    "sip:{}@{};tag={}",
+                    from_val,
+                    self.account.domain,
+                    generate_random_string()
+                )
+            }
+        } else {
+            format!(
+                "sip:{}@{};tag={}",
+                self.account.username,
+                self.account.domain,
+                generate_random_string()
+            )
+        };
         let untyped_from = UntypedFrom::try_from(from_str.as_str())?;
         let from = untyped_from.typed()?;
 

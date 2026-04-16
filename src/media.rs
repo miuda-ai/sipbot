@@ -2146,6 +2146,7 @@ async fn process_recorded_sample(
     #[cfg(feature = "local-device")] output_sample_rate: &std::sync::atomic::AtomicU32,
     #[cfg(feature = "local-device")] output_resampler: &mut Option<audio_codec::Resampler>,
     rtp_clock_rate: u32,
+    #[allow(unused_variables)]
     channels: u16,
     actual_sample_rate: u32,
 ) {
