@@ -504,6 +504,7 @@ async fn main() -> Result<()> {
                 None,
                 5, // default csv_interval
                 None,
+                None,
             )
         }
         Commands::Options { target } => (
@@ -529,6 +530,7 @@ async fn main() -> Result<()> {
             None,
             5,
             None,
+            None,
         ),
         Commands::Info { target } => (
             "info",
@@ -552,6 +554,7 @@ async fn main() -> Result<()> {
             None,
             None,
             5,
+            None,
             None,
         ),
     };
