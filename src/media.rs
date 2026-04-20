@@ -2380,35 +2380,21 @@ mod tests {
     #[test]
     fn test_get_audio_caps_multiple() {
         let codecs = Some(vec![
-            #[cfg(feature = "opus")]
             "opus".to_string(),
             "g722".to_string(),
             "pcmu".to_string(),
         ]);
         let caps = get_audio_caps(&codecs, false);
-        #[cfg(feature = "opus")]
-        {
-            assert_eq!(caps.len(), 3);
-            assert_eq!(caps[0].codec_name, "opus");
-            assert_eq!(caps[1].codec_name, "G722");
-            assert_eq!(caps[2].codec_name, "PCMU");
-        }
-        #[cfg(not(feature = "opus"))]
-        {
-            assert_eq!(caps.len(), 2);
-            assert_eq!(caps[0].codec_name, "G722");
-            assert_eq!(caps[1].codec_name, "PCMU");
-        }
+        assert_eq!(caps.len(), 3);
+        assert_eq!(caps[0].codec_name, "opus");
+        assert_eq!(caps[1].codec_name, "G722");
+        assert_eq!(caps[2].codec_name, "PCMU");
     }
 
     #[tokio::test]
     async fn test_media_session_offer() {
         let stats = Arc::new(CallStats::new());
-        let codecs = Some(vec![
-            #[cfg(feature = "opus")]
-            "opus".to_string(),
-            "pcmu".to_string(),
-        ]);
+        let codecs = Some(vec!["opus".to_string(), "pcmu".to_string()]);
         let (_session, sdp) = MediaSession::new_offer(
             false,
             false,
@@ -2422,7 +2408,6 @@ mod tests {
         .unwrap();
         assert!(sdp.contains("m=audio"));
         assert!(sdp.contains("a=sendrecv")); // We set direction to SendRecv
-        #[cfg(feature = "opus")]
         assert!(sdp.to_lowercase().contains("opus"));
         assert!(sdp.to_lowercase().contains("pcmu"));
 
