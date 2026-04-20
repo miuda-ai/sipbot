@@ -2,11 +2,11 @@ use crate::stats::CallStats;
 use anyhow::Result;
 use chrono::Local;
 use std::path::Path;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
-use tokio::time::{interval, Duration};
+use tokio::time::{Duration, interval};
 use tracing::{error, info};
 
 /// CSV Statistics Recorder for load testing
@@ -18,11 +18,7 @@ pub struct CsvStatsRecorder {
 }
 
 impl CsvStatsRecorder {
-    pub fn new(
-        stats: Arc<CallStats>,
-        file_path: impl Into<String>,
-        interval_secs: u64,
-    ) -> Self {
+    pub fn new(stats: Arc<CallStats>, file_path: impl Into<String>, interval_secs: u64) -> Self {
         Self {
             stats,
             file_path: file_path.into(),
@@ -196,10 +192,7 @@ impl CsvStatsRecorder {
 }
 
 /// Write final summary to a separate file
-pub async fn write_final_summary(
-    stats: &CallStats,
-    file_path: impl AsRef<Path>,
-) -> Result<()> {
+pub async fn write_final_summary(stats: &CallStats, file_path: impl AsRef<Path>) -> Result<()> {
     let path = file_path.as_ref();
     let mut file = OpenOptions::new()
         .create(true)

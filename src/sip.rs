@@ -4,12 +4,11 @@ use crate::stats::CallStats;
 use anyhow::{Context, Result};
 use chrono::Local;
 use rand::RngExt;
-use rsipstack::rsip::headers::{CallId, From as UntypedFrom, To as UntypedTo};
+use rsipstack::dialog::DialogId;
+use rsipstack::dialog::dialog::{Dialog, DialogState};
 use rsipstack::rsip::headers::ToTypedHeader;
 use rsipstack::rsip::message::HeadersExt;
 use rsipstack::rsip::{Header, Method, StatusCode, Uri};
-use rsipstack::dialog::DialogId;
-use rsipstack::dialog::dialog::{Dialog, DialogState};
 use rsipstack::{
     EndpointBuilder,
     dialog::authenticate::Credential,
@@ -865,15 +864,15 @@ impl SipBot {
                 generate_random_string()
             )
         };
-        let untyped_from = UntypedFrom::try_from(from_str.as_str())?;
+        let untyped_from = rsipstack::rsip::From::try_from(from_str.as_str())?;
         let from = untyped_from.typed()?;
 
         let to_str = target_uri;
-        let untyped_to = UntypedTo::try_from(to_str)?;
+        let untyped_to = rsipstack::rsip::To::try_from(to_str)?;
         let to = untyped_to.typed()?;
 
         let call_id_str = format!("{}@{}", generate_random_string(), local_ip);
-        let call_id = CallId::try_from(call_id_str.as_str())?;
+        let call_id = rsipstack::rsip::CallId::try_from(call_id_str.as_str())?;
 
         let request = endpoint.inner.make_request(
             method,
@@ -910,9 +909,7 @@ impl SipBot {
                     }
 
                     if res.status_code().code() >= 200 {
-                        self.stats
-                            .add_status(res.status_code().clone().into())
-                            ;
+                        self.stats.add_status(res.status_code().clone().into());
                         break;
                     }
                 }
@@ -1024,35 +1021,28 @@ impl SipBot {
     }
 
     /// Handle REFER request (RFC 3515)
-    /// 
+    ///
     /// For testing transfer scenarios, this implementation:
     /// 1. Accepts the REFER with 202 Accepted (default)
     /// 2. Or rejects with configured status code (e.g., 405 for 3PCC fallback testing)
     /// 3. Sends NOTIFY with 100 Trying
     /// 4. Sends NOTIFY with 200 OK (simulated success)
     async fn handle_refer(&self, mut transaction: Transaction) -> Result<()> {
-        let refer_to = transaction
-            .original
-            .headers
-            .iter()
-            .find_map(|h| {
-                if let Header::Other(name, value) = h {
-                    if name.to_string().eq_ignore_ascii_case("refer-to") {
-                        return Some(value.to_string());
-                    }
+        let refer_to = transaction.original.headers.iter().find_map(|h| {
+            if let Header::Other(name, value) = h {
+                if name.to_string().eq_ignore_ascii_case("refer-to") {
+                    return Some(value.to_string());
                 }
-                None
-            });
+            }
+            None
+        });
 
-        info!(
-            "[{}] REFER target: {:?}",
-            self.account.username, refer_to
-        );
+        info!("[{}] REFER target: {:?}", self.account.username, refer_to);
 
         // Check if we should reject REFER (for testing 3PCC fallback)
         if let Some(reject_code) = self.account.refer_reject {
-            let status_code = StatusCode::try_from(reject_code)
-                .unwrap_or(StatusCode::MethodNotAllowed);
+            let status_code =
+                StatusCode::try_from(reject_code).unwrap_or(StatusCode::MethodNotAllowed);
             info!(
                 "[{}] Rejecting REFER with {}",
                 self.account.username, status_code
@@ -1070,18 +1060,18 @@ impl SipBot {
             .dialog_layer
             .as_ref()
             .context("DialogLayer not initialized")?;
-        
+
         let dialog_id = DialogId::try_from((&transaction.original, TransactionRole::Server))?;
-        
+
         // Spawn task to send NOTIFY sequence
         let dialog_layer_clone = dialog_layer.clone();
         let username = self.account.username.clone();
         let cancel_token = self.cancel_token.clone();
-        
+
         tokio::spawn(async move {
             // Wait a bit for REFER to be processed
             tokio::time::sleep(Duration::from_millis(100)).await;
-            
+
             if let Some(dialog) = dialog_layer_clone.get_dialog(&dialog_id) {
                 if let Dialog::ServerInvite(server_dialog) = dialog {
                     // Send NOTIFY 100 Trying
@@ -1371,9 +1361,7 @@ impl SipBot {
                                 {
                                     error!("Reject error: {:?}", e);
                                 }
-                                stats_clone
-                                    .add_status(StatusCode::TemporarilyUnavailable.into())
-                                    ;
+                                stats_clone.add_status(StatusCode::TemporarilyUnavailable.into());
                                 return;
                             }
                         }

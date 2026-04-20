@@ -29,6 +29,25 @@ use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
+fn create_encoder_for(ct: CodecType, channels: u16) -> Box<dyn audio_codec::Encoder> {
+    if ct == CodecType::Opus {
+        let app = if channels == 2 {
+            audio_codec::opus::OpusApplication::Audio
+        } else {
+            audio_codec::opus::OpusApplication::Voip
+        };
+        let mut enc =
+            audio_codec::opus::OpusEncoder::new_with_application(ct.samplerate(), channels, app);
+        if channels == 2 {
+            enc.set_bitrate(64000);
+        } else {
+            enc.set_bitrate(48000);
+        }
+        return Box::new(enc);
+    }
+    audio_codec::create_encoder(ct)
+}
+
 pub trait AudioSource: Send + Sync {
     fn next_chunk(&mut self, chunk_size: usize) -> Option<Vec<i16>>;
     fn sample_rate(&self) -> u32;
@@ -116,7 +135,6 @@ fn get_codec_type(pt: Option<u8>, caps: &Option<MediaCapabilities>) -> CodecType
             .and_then(|a| {
                 let name = a.codec_name.to_lowercase();
                 match name.as_str() {
-                    #[cfg(feature = "opus")]
                     "opus" => Some(CodecType::Opus),
                     "pcmu" => Some(CodecType::PCMU),
                     "pcma" => Some(CodecType::PCMA),
@@ -161,6 +179,15 @@ fn get_codec_type(pt: Option<u8>, caps: &Option<MediaCapabilities>) -> CodecType
     CodecType::PCMU
 }
 
+fn get_codec_channels(pt: Option<u8>, caps: &Option<MediaCapabilities>, ct: CodecType) -> u16 {
+    if let (Some(p), Some(c)) = (pt, caps.as_ref())
+        && let Some(cap) = c.audio.iter().find(|a| a.payload_type == p)
+    {
+        return (cap.channels as u16).max(1);
+    }
+    ct.channels()
+}
+
 fn get_audio_caps(codecs: &Option<Vec<String>>, nack_enabled: bool) -> Vec<AudioCapability> {
     let mut caps = Vec::new();
     let codec_list = if let Some(list) = codecs {
@@ -171,7 +198,6 @@ fn get_audio_caps(codecs: &Option<Vec<String>>, nack_enabled: bool) -> Vec<Audio
             "pcma".to_string(),
             "g722".to_string(),
             "g729".to_string(),
-            #[cfg(feature = "opus")]
             "opus".to_string(),
         ]
     };
@@ -180,8 +206,12 @@ fn get_audio_caps(codecs: &Option<Vec<String>>, nack_enabled: bool) -> Vec<Audio
         let mut cap = match codec.to_lowercase().as_str() {
             "pcmu" => AudioCapability::pcmu(),
             "pcma" => AudioCapability::pcma(),
-            #[cfg(feature = "opus")]
-            "opus" => AudioCapability::opus(),
+            "opus" => {
+                let mut c = AudioCapability::opus();
+                // Keep Opus mono for now to avoid unstable stereo encode artifacts.
+                c.channels = 1;
+                c
+            }
             _ => {
                 if let Ok(ct) = CodecType::try_from(codec.as_str()) {
                     AudioCapability {
@@ -1304,9 +1334,10 @@ impl MediaSession {
             let ct = get_codec_type(pt, &session_input_clone.pc.config().media_capabilities);
 
             let target_sample_rate = ct.samplerate();
-            let target_channels = ct.channels();
+            let target_channels =
+                get_codec_channels(pt, &session_input_clone.pc.config().media_capabilities, ct);
 
-            let mut encoder = audio_codec::create_encoder(ct);
+            let mut encoder = create_encoder_for(ct, target_channels);
 
             let mut resampler = if input_sample_rate != target_sample_rate || input_channels != 1 {
                 Some(audio_codec::Resampler::new(
@@ -1627,19 +1658,11 @@ impl MediaSession {
 
         let sample_rate = ct.samplerate();
         let clock_rate = ct.clock_rate();
-        // audio-codec's Opus encoder only supports mono despite SDP declaring stereo
-        #[cfg(feature = "opus")]
-        let channels = if ct == CodecType::Opus {
-            1
-        } else {
-            ct.channels()
-        };
-        #[cfg(not(feature = "opus"))]
-        let channels = ct.channels();
-        let mut encoder = audio_codec::create_encoder(ct);
+        let channels = get_codec_channels(pt, &self.pc.config().media_capabilities, ct);
+        let mut encoder = create_encoder_for(ct, channels);
         let payload_type = pt.unwrap_or(ct.payload_type());
 
-        // chunk_size is always in mono samples since we never expand to stereo
+        // 20ms frame size in samples per channel
         let chunk_size = (sample_rate / 50) as usize; // 20ms
 
         info!(
@@ -1721,9 +1744,17 @@ impl MediaSession {
 
             chunk_index += 1;
 
-            // Note: audio-codec's Opus encoder only supports mono, so we always pass mono data
-            // Even if SDP declares opus/48000/2, the encoder works with mono samples
-            let audio_to_encode = final_chunk;
+            // Expand mono source to interleaved stereo when negotiated codec uses 2 channels.
+            let audio_to_encode = if channels == 2 {
+                let mut stereo = Vec::with_capacity(final_chunk.len() * 2);
+                for &s in &final_chunk {
+                    stereo.push(s);
+                    stereo.push(s);
+                }
+                stereo
+            } else {
+                final_chunk
+            };
 
             // Debug: calculate input RMS
             let input_rms = if !audio_to_encode.is_empty() {
@@ -1773,7 +1804,9 @@ impl MediaSession {
             if sent_chunks % 500 == 0 {
                 info!(
                     "[{}] Sent {} chunks (loop #{})",
-                    username, sent_chunks, (chunk_index - 1) / num_chunks
+                    username,
+                    sent_chunks,
+                    (chunk_index - 1) / num_chunks
                 );
             }
         }
@@ -2146,8 +2179,7 @@ async fn process_recorded_sample(
     #[cfg(feature = "local-device")] output_sample_rate: &std::sync::atomic::AtomicU32,
     #[cfg(feature = "local-device")] output_resampler: &mut Option<audio_codec::Resampler>,
     rtp_clock_rate: u32,
-    #[allow(unused_variables)]
-    channels: u16,
+    #[allow(unused_variables)] channels: u16,
     actual_sample_rate: u32,
 ) {
     let decoded = if let MediaSample::Audio(ref frame) = sample {

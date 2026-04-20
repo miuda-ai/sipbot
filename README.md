@@ -34,7 +34,7 @@ cargo install sipbot
 
 Linux users can build a static binary with musl for maximum compatibility:
 ```bash
-cargo build -r --target x86_64-unknown-linux-musl --no-default-features --features opus
+cargo build -r --target x86_64-unknown-linux-musl --no-default-features
 ```
 
 ### CLI Usage

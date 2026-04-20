@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use futures::future::join_all;
 use sipbot::config::{AccountConfig, Config};
-use sipbot::csv_stats::{write_final_summary, CsvStatsRecorder};
+use sipbot::csv_stats::{CsvStatsRecorder, write_final_summary};
 use sipbot::sip;
 use sipbot::stats::CallStats;
 use std::path::PathBuf;
