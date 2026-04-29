@@ -85,6 +85,9 @@ enum Commands {
         /// Codecs to use (e.g., opus,g722,pcmu)
         #[arg(long, value_delimiter = ',')]
         codecs: Option<Vec<String>>,
+        /// Enable audio quality analysis for this call
+        #[arg(long)]
+        audio_quality: bool,
         /// Custom headers (e.g., -H 'X-Custom: value')
         #[arg(short = 'H', long = "header")]
         headers: Option<Vec<String>>,
@@ -154,6 +157,9 @@ enum Commands {
         /// Codecs to use (e.g., opus,g722,pcmu)
         #[arg(long, value_delimiter = ',')]
         codecs: Option<Vec<String>>,
+        /// Enable audio quality analysis for this call
+        #[arg(long)]
+        audio_quality: bool,
         /// Custom headers (e.g., -H 'X-Custom: value')
         #[arg(short = 'H', long = "header")]
         headers: Option<Vec<String>>,
@@ -231,6 +237,7 @@ async fn main() -> Result<()> {
                         codecs: None,
                         headers: None,
                         refer_reject: None,
+                        audio_quality: None,
                     }],
                 }
             }
@@ -238,6 +245,7 @@ async fn main() -> Result<()> {
                 target: Some(_),
                 codecs,
                 addr,
+                audio_quality: _,
                 ..
             } => {
                 info!(
@@ -269,6 +277,7 @@ async fn main() -> Result<()> {
                         codecs: codecs.clone(),
                         headers: None,
                         refer_reject: None,
+                        audio_quality: None,
                     }],
                 }
             }
@@ -291,7 +300,9 @@ async fn main() -> Result<()> {
                 nack,
                 jitter,
                 codecs,
+                audio_quality: _,
                 headers,
+                ..
             } => {
                 info!("Configuration file not found, using default configuration for wait command");
 
@@ -368,6 +379,7 @@ async fn main() -> Result<()> {
                         codecs: codecs.clone(),
                         headers: headers.clone(),
                         refer_reject: None,
+                        audio_quality: None,
                     }],
                 }
             }
@@ -406,6 +418,7 @@ async fn main() -> Result<()> {
         csv_interval,
         from_override,
         addr_override,
+        _audio_quality_flag,
     ) = match &args.command {
         Commands::Call {
             target,
@@ -425,6 +438,7 @@ async fn main() -> Result<()> {
             cps,
             cancel_prob,
             codecs,
+            audio_quality,
             headers,
             csv_output,
             csv_interval,
@@ -460,6 +474,7 @@ async fn main() -> Result<()> {
                 *csv_interval,
                 from.clone(),
                 addr.clone(),
+                *audio_quality,
             )
         }
         Commands::Wait {
@@ -472,6 +487,7 @@ async fn main() -> Result<()> {
             auth_user,
             local,
             codecs,
+            audio_quality,
             headers,
             ..
         } => {
@@ -505,6 +521,7 @@ async fn main() -> Result<()> {
                 5, // default csv_interval
                 None,
                 None,
+                *audio_quality,
             )
         }
         Commands::Options { target } => (
@@ -531,6 +548,7 @@ async fn main() -> Result<()> {
             5,
             None,
             None,
+            false,
         ),
         Commands::Info { target } => (
             "info",
@@ -556,12 +574,19 @@ async fn main() -> Result<()> {
             5,
             None,
             None,
+            false,
         ),
     };
 
     if let Some(addr) = &addr_override {
         config.addr = Some(addr.clone());
     }
+
+    let audio_quality_enabled = match &args.command {
+        Commands::Call { audio_quality, .. } => *audio_quality,
+        Commands::Wait { audio_quality, .. } => *audio_quality,
+        _ => false,
+    };
 
     let mut handles = vec![];
     let global_config = config.clone();
@@ -633,6 +658,13 @@ async fn main() -> Result<()> {
             account.headers = Some(headers.clone() as Vec<String>);
         }
 
+        if audio_quality_enabled {
+            account.audio_quality = Some(sipbot::audio_quality::AudioQualityConfig {
+                enabled: true,
+                ..Default::default()
+            });
+        }
+
         if let Some(play_file) = &play_file_override {
             account.answer = Some(sipbot::config::AnswerConfig::Play {
                 wav_file: play_file.clone(),
@@ -699,8 +731,13 @@ async fn main() -> Result<()> {
 
         let verbose = args.verbose;
         let token = cancel_token.clone();
+        let mut bot = sip::SipBot::new(account, global_config, stats, verbose, token);
+        let dtmf_session = if command_name == "call" && total_calls == 1 {
+            Some(bot.current_media_session.clone())
+        } else {
+            None
+        };
         let handle = tokio::spawn(async move {
-            let mut bot = sip::SipBot::new(account, global_config, stats, verbose, token);
             match command_name {
                 "call" => {
                     if let Err(e) = bot.run_call(total_calls, cps).await {
@@ -725,6 +762,26 @@ async fn main() -> Result<()> {
                 _ => {}
             }
         });
+
+        if let Some(session) = dtmf_session {
+            tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
+                let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+                info!("[DTMF] Single call mode: type digits (0-9,*,#,A-D) to send DTMF, 'q' to quit");
+                while let Ok(Some(line)) = stdin.next_line().await {
+                    for ch in line.chars() {
+                        if ch == 'q' || ch == 'Q' {
+                            return;
+                        }
+                        let guard = session.lock().await;
+                        if let Some(ref media) = *guard {
+                            let _: Result<(), anyhow::Error> = media.send_dtmf(ch).await;
+                        }
+                    }
+                }
+            });
+        }
+
         handles.push(handle);
     }
 

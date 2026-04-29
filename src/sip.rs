@@ -39,6 +39,7 @@ struct CallRunner {
     global_config: Config,
     stats: Arc<CallStats>,
     cancel_token: CancellationToken,
+    current_media_session: Arc<tokio::sync::Mutex<Option<MediaSession>>>,
 }
 
 struct CallGuard {
@@ -252,9 +253,14 @@ impl CallRunner {
             self.account.codecs.clone(),
             true,
             self.stats.clone(),
+            self.account.audio_quality.clone(),
         )
         .await?;
         _guard.media_session = Some(media_session.clone());
+        {
+            let mut guard = self.current_media_session.lock().await;
+            *guard = Some(media_session.clone());
+        }
 
         if local_sdp.is_empty() {
             anyhow::bail!("[{}] Generated empty Offer SDP", self.account.username);
@@ -509,6 +515,7 @@ pub struct SipBot {
     pub is_wait: bool,
     pub cancel_token: CancellationToken,
     transport_token: CancellationToken,
+    pub current_media_session: Arc<tokio::sync::Mutex<Option<MediaSession>>>,
 }
 
 impl SipBot {
@@ -530,6 +537,7 @@ impl SipBot {
             is_wait: false,
             transport_token: CancellationToken::new(),
             cancel_token,
+            current_media_session: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -737,6 +745,7 @@ impl SipBot {
                 global_config: self.global_config.clone(),
                 stats: self.stats.clone(),
                 cancel_token: self.cancel_token.clone(),
+                current_media_session: self.current_media_session.clone(),
             };
 
             let mut handles = vec![];
@@ -793,6 +802,13 @@ impl SipBot {
         }
 
         Ok(())
+    }
+
+    pub async fn send_dtmf(&self, digit: char) {
+        let session = self.current_media_session.lock().await;
+        if let Some(ref media) = *session {
+            let _: Result<()> = media.send_dtmf(digit).await;
+        }
     }
 
     pub async fn run_options(&mut self, target_override: Option<String>) -> Result<()> {
@@ -1212,6 +1228,7 @@ impl SipBot {
         self.stats.add_total_planned(1);
         self.stats.inc_current();
         let username_log = self.account.username.clone();
+        let bot_media_session = self.current_media_session.clone();
         tokio::spawn(async move {
             info!("[{}] Call task started", username_log);
             let mut _call_guard = CallGuard {
@@ -1335,12 +1352,17 @@ impl SipBot {
                             global_config.external_ip.clone(),
                             account.codecs.clone(),
                             stats_clone.clone(),
+                            account.audio_quality.clone(),
                         )
                         .await
                         {
                             Ok((session, sdp, codec_name)) => {
                                 {
                                     let mut m = shared_media_session.lock().await;
+                                    *m = Some(session.clone());
+                                }
+                                {
+                                    let mut m = bot_media_session.lock().await;
                                     *m = Some(session.clone());
                                 }
                                 media_session = Some(session.clone());

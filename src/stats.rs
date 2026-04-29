@@ -24,6 +24,14 @@ pub struct CallStats {
     pub nack_recovered: AtomicU64,
     pub total_rtcp_rtt_us: AtomicU64,
     pub rtcp_rtt_samples: AtomicU32,
+    pub rx_dtmf_events: AtomicU64,
+    pub tx_dtmf_events: AtomicU64,
+    pub audio_quality_sample_rate_mismatches: AtomicU64,
+    pub audio_quality_shrill_count: AtomicU64,
+    pub audio_quality_muffled_count: AtomicU64,
+    pub audio_quality_clipping_frames: AtomicU64,
+    pub audio_quality_silence_frames: AtomicU64,
+    pub audio_quality_total_frames: AtomicU64,
 }
 
 impl Default for CallStats {
@@ -47,6 +55,14 @@ impl Default for CallStats {
             nack_recovered: AtomicU64::new(0),
             total_rtcp_rtt_us: AtomicU64::new(0),
             rtcp_rtt_samples: AtomicU32::new(0),
+            rx_dtmf_events: AtomicU64::new(0),
+            tx_dtmf_events: AtomicU64::new(0),
+            audio_quality_sample_rate_mismatches: AtomicU64::new(0),
+            audio_quality_shrill_count: AtomicU64::new(0),
+            audio_quality_muffled_count: AtomicU64::new(0),
+            audio_quality_clipping_frames: AtomicU64::new(0),
+            audio_quality_silence_frames: AtomicU64::new(0),
+            audio_quality_total_frames: AtomicU64::new(0),
         }
     }
 }
@@ -257,5 +273,36 @@ impl CallStats {
         }
         let total_us = self.total_rtcp_rtt_us.load(Ordering::Relaxed);
         (total_us as f64 / samples as f64) / 1000.0
+    }
+
+    pub fn inc_rx_dtmf(&self) {
+        self.rx_dtmf_events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_tx_dtmf(&self) {
+        self.tx_dtmf_events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn add_audio_quality_stats(
+        &self,
+        mismatch: u64,
+        shrill: u64,
+        muffled: u64,
+        clipping: u64,
+        silence: u64,
+        frames: u64,
+    ) {
+        self.audio_quality_sample_rate_mismatches
+            .fetch_add(mismatch, Ordering::Relaxed);
+        self.audio_quality_shrill_count
+            .fetch_add(shrill, Ordering::Relaxed);
+        self.audio_quality_muffled_count
+            .fetch_add(muffled, Ordering::Relaxed);
+        self.audio_quality_clipping_frames
+            .fetch_add(clipping, Ordering::Relaxed);
+        self.audio_quality_silence_frames
+            .fetch_add(silence, Ordering::Relaxed);
+        self.audio_quality_total_frames
+            .fetch_add(frames, Ordering::Relaxed);
     }
 }

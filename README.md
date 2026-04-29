@@ -20,6 +20,8 @@ The media transport uses [rustrtc](https://github.com/restsend/rustrtc).
   - **Hangup (Stage 3)**: Automatically hang up after a configurable duration or reject calls with specific SIP codes.
 - **Outbound Calls**: Ability to initiate calls to a target URI.
 - **Call Recording**: (Experimental) Record call audio to WAV files. (Requires configuration)
+- **DTMF (RFC 2833)**: Send DTMF digits via keyboard during single calls; receive and log DTMF events from remote endpoints.
+- **Audio Quality Analysis**: Per-call audio quality monitoring with RMS, clipping, DC offset, zero-crossing rate, spectral tilt, shrill/muffled classification, and sample-rate mismatch detection.
 - **Registration**: Supports SIP registration with authentication (WIP).
 
 ## Quick start
@@ -69,9 +71,13 @@ cargo run -- call -t sip:user@domain -u sipbot --play audio.wav --hangup 10 --to
 - `--cps <COUNT>`: Calls per second (default: 1).
 - `--cancel-prob <PROB>`: Cancel probability (0-99%) (default: 0).
 - `--codecs <LIST>`: Codecs to use (e.g., opus,g722,pcmu).
+- `--audio-quality`: Enable per-call audio quality analysis (RMS, clipping, DC offset, spectral tilt, shrill/muffled detection).
+- `--csv-output <FILE>`: Output periodic statistics to CSV file.
+- `--csv-interval <SECONDS>`: CSV output interval in seconds (default: 5).
+- `--from <USER>`: From URI user part for outbound calls (e.g., anonymous).
 - `-H, --header <HEADER>`: Add custom SIP header (e.g., `-H 'X-Custom: value'`). Can be used multiple times.
 
-#### Wait for Calls
+> **Tip**: When making a single call (`--total 1`), you can send DTMF digits by typing them in the terminal. Supported: `0-9`, `*`, `#`, `A-D`. Press `q` to quit the DTMF reader.
 
 ```bash
 cargo run -- wait --addr 0.0.0.0:5060 -u sipbot --answer welcome.wav
@@ -95,6 +101,7 @@ cargo run -- wait --addr 0.0.0.0:5060 -u sipbot --answer welcome.wav
 - `--nack`: Enable NACK.
 - `--jitter`: Enable Jitter Buffer.
 - `--codecs <LIST>`: Codecs to use (e.g., opus,g722,pcmu).
+- `--audio-quality`: Enable per-call audio quality analysis.
 - `-H, --header <HEADER>`: Add custom SIP header (e.g., `-H 'X-Custom: value'`). Can be used multiple times.
 
 > **Note**: By default, `wait` mode does not record calls. To enable recording, you must use a configuration file and specify the `recorders` directory.
@@ -174,6 +181,28 @@ Record all incoming calls to a specific directory. (Requires `recorders` path in
 sipbot wait --username recorder-bot
 ```
 
+### 7. Send DTMF Digits During a Call
+
+Make a single call and send DTMF digits interactively from the terminal:
+
+```bash
+sipbot call -t sip:user@domain -u sipbot --hangup 30
+# Type digits (0-9, *, #, A-D) and press Enter to send DTMF
+# Press 'q' to quit the DTMF reader
+```
+
+### 8. Audio Quality Analysis
+
+Enable per-call audio quality analysis to detect clipping, silence, shrill/muffled audio, and sample rate mismatches:
+
+```bash
+# Outbound call with audio quality monitoring
+sipbot call -t sip:user@domain -u sipbot --hangup 30 --audio-quality
+
+# Wait for calls with audio quality monitoring
+sipbot wait --username quality-bot --echo --audio-quality
+```
+
 ## Configuration
 
 Create a `config.toml` file in the root directory. The configuration allows you to define the behavior for each account.
@@ -249,6 +278,17 @@ after_secs = 10                 # Send BYE after 10 seconds
     - `jitter_buffer_enabled`: (Bool) Enable Jitter Buffer.
     - `codecs`: (Array) List of preferred codecs (e.g., `["opus", "g722", "pcmu"]`).
     - `headers`: (Array) List of custom SIP headers to include in INVITE requests and 200 OK responses (e.g., `["X-Custom-Header: value", "X-Call-ID: 12345"]`).
+    - `audio_quality`: (Optional) Enable per-call audio quality analysis. Example:
+        ```toml
+        [accounts.audio_quality]
+        enabled = true
+        sample_rate_check = true
+        clipping_threshold = 0.95
+        shrill_threshold = 0.65
+        muffled_threshold = 0.15
+        silence_threshold_rms = 50.0
+        report_interval = 100
+        ```
     - `codecs`: (Optional) List of preferred codecs (e.g., `["opus", "g722", "pcmu"]`).
     - **`early_media`**: Configuration for the early media phase (183).
         - `wav_file`: (Optional) Path to WAV file.

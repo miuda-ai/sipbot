@@ -1,3 +1,4 @@
+use crate::audio_quality::AudioQualityConfig;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::Path;
@@ -56,6 +57,9 @@ pub struct AccountConfig {
 
     // REFER handling (for transfer testing)
     pub refer_reject: Option<u16>, // If set, reject REFER with this status code (e.g., 405)
+
+    // Audio quality analysis configuration
+    pub audio_quality: Option<AudioQualityConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
