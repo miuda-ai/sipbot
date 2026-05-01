@@ -562,7 +562,7 @@ impl SipBot {
             }
         }
 
-        let transport_layer = TransportLayer::new(CancellationToken::new());
+        let transport_layer = TransportLayer::new(self.transport_token.clone());
 
         // Bind to configured address or default
         let addr_str = self
@@ -572,7 +572,9 @@ impl SipBot {
             .unwrap_or("0.0.0.0:35060");
         let addr: std::net::SocketAddr = addr_str.parse().context("Invalid bind address")?;
 
-        let mut udp_conn = UdpConnection::create_connection(addr, None, None).await?;
+        let mut udp_conn =
+            UdpConnection::create_connection(addr, None, Some(self.transport_token.clone()))
+                .await?;
         if let Some(ip) = &self.global_config.external_ip {
             if let Ok(sock) = udp_conn.get_addr().get_socketaddr() {
                 let external: std::net::SocketAddr = format!("{}:{}", ip, sock.port())
@@ -592,6 +594,7 @@ impl SipBot {
         let endpoint = EndpointBuilder::new()
             .with_user_agent(&format!("SipBot/{}", env!("CARGO_PKG_VERSION")))
             .with_transport_layer(transport_layer)
+            .with_cancel_token(self.transport_token.clone())
             .build();
 
         let endpoint = Arc::new(endpoint);
@@ -645,12 +648,16 @@ impl SipBot {
         }
 
         let monitor_stats = self.stats.clone();
+        let monitor_token = self.cancel_token.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             let mut last_was_zero = false;
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = monitor_token.cancelled() => break,
+                    _ = interval.tick() => {}
+                }
                 let current = monitor_stats.current();
                 if current > 0 {
                     monitor_stats.print_summary();
@@ -726,11 +733,15 @@ impl SipBot {
 
         if let Some(target) = &self.account.target {
             let monitor_stats = self.stats.clone();
+            let monitor_token = self.cancel_token.clone();
 
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_millis(100));
                 loop {
-                    interval.tick().await;
+                    tokio::select! {
+                        _ = monitor_token.cancelled() => break,
+                        _ = interval.tick() => {}
+                    }
                     monitor_stats.print_progress();
                 }
             });
@@ -946,6 +957,7 @@ impl SipBot {
         let proxy = self.account.proxy.clone();
         let verbose = self.verbose;
         let is_wait = self.is_wait;
+        let cancel_token = self.cancel_token.clone();
 
         tokio::spawn(async move {
             info!("[{}] Starting registration loop", username);
@@ -960,13 +972,20 @@ impl SipBot {
             };
 
             loop {
+                if cancel_token.is_cancelled() {
+                    break;
+                }
                 if is_wait && !verbose {
                     println!("[{}] Registering...", username);
                 } else {
                     info!("[{}] Registering...", username);
                 }
                 // Default expire 30s
-                match registration.register(server_uri.clone(), Some(30)).await {
+                let register_result = tokio::select! {
+                    r = registration.register(server_uri.clone(), Some(30)) => r,
+                    _ = cancel_token.cancelled() => break,
+                };
+                match register_result {
                     Ok(response) => {
                         if *response.status_code() == StatusCode::OK {
                             let expires = registration.expires();
@@ -983,22 +1002,32 @@ impl SipBot {
                             }
                             // Refresh before expiration (e.g., 5 seconds before)
                             let sleep_time = if expires > 5 { expires - 5 } else { expires };
-                            tokio::time::sleep(Duration::from_secs(sleep_time as u64)).await;
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_secs(sleep_time as u64)) => {}
+                                _ = cancel_token.cancelled() => break,
+                            }
                         } else {
                             warn!(
                                 "[{}] Registration failed: {}",
                                 username,
                                 response.status_code()
                             );
-                            tokio::time::sleep(Duration::from_secs(30)).await;
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                                _ = cancel_token.cancelled() => break,
+                            }
                         }
                     }
                     Err(e) => {
                         error!("[{}] Registration error: {:?}", username, e);
-                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                            _ = cancel_token.cancelled() => break,
+                        }
                     }
                 }
             }
+            info!("[{}] Registration loop stopped", username);
         });
 
         Ok(())

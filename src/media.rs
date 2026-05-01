@@ -209,12 +209,7 @@ fn get_audio_caps(codecs: &Option<Vec<String>>, nack_enabled: bool) -> Vec<Audio
         let mut cap = match codec.to_lowercase().as_str() {
             "pcmu" => AudioCapability::pcmu(),
             "pcma" => AudioCapability::pcma(),
-            "opus" => {
-                let mut c = AudioCapability::opus();
-                // Keep Opus mono for now to avoid unstable stereo encode artifacts.
-                c.channels = 1;
-                c
-            }
+            "opus" => AudioCapability::opus(),
             _ => {
                 if let Ok(ct) = CodecType::try_from(codec.as_str()) {
                     AudioCapability {
@@ -501,8 +496,8 @@ impl MediaSession {
             anyhow::bail!("Failed to generate valid audio answer SDP: {}", local_sdp);
         }
 
-        let telephone_event_pt = dtmf::parse_telephone_event_pt(remote_sdp)
-            .unwrap_or(dtmf::DTMF_TELEPHONE_EVENT_PT);
+        let telephone_event_pt =
+            dtmf::parse_telephone_event_pt(remote_sdp).unwrap_or(dtmf::DTMF_TELEPHONE_EVENT_PT);
         let local_sdp = inject_telephone_event_sdp(&local_sdp, telephone_event_pt);
 
         let cancel_token = CancellationToken::new();
@@ -527,7 +522,10 @@ impl MediaSession {
             echo_tracked_mids: Arc::new(Mutex::new(std::collections::HashSet::new())),
             cancel_token: cancel_token.clone(),
             telephone_event_pt: Arc::new(std::sync::atomic::AtomicU8::new(telephone_event_pt)),
-            audio_quality_enabled: _audio_quality_config.as_ref().map(|c| c.enabled).unwrap_or(false),
+            audio_quality_enabled: _audio_quality_config
+                .as_ref()
+                .map(|c| c.enabled)
+                .unwrap_or(false),
             audio_quality_config: _audio_quality_config.clone(),
         };
 
@@ -692,7 +690,10 @@ impl MediaSession {
             echo_tracked_mids: Arc::new(Mutex::new(std::collections::HashSet::new())),
             cancel_token,
             telephone_event_pt: Arc::new(std::sync::atomic::AtomicU8::new(telephone_event_pt)),
-            audio_quality_enabled: _audio_quality_config.as_ref().map(|c| c.enabled).unwrap_or(false),
+            audio_quality_enabled: _audio_quality_config
+                .as_ref()
+                .map(|c| c.enabled)
+                .unwrap_or(false),
             audio_quality_config: _audio_quality_config.clone(),
         };
 
@@ -709,7 +710,12 @@ impl MediaSession {
         let Some(event) = dtmf::digit_to_event(digit) else {
             return Ok(());
         };
-        let start_ev = dtmf::DtmfEvent { event, end: false, volume: 10, duration: 0 };
+        let start_ev = dtmf::DtmfEvent {
+            event,
+            end: false,
+            volume: 10,
+            duration: 0,
+        };
         let start_frame = MediaSample::Audio(AudioFrame {
             rtp_timestamp: random_u32(),
             data: Bytes::copy_from_slice(&dtmf::encode_dtmf(start_ev)),
@@ -719,7 +725,12 @@ impl MediaSession {
             ..Default::default()
         });
         self.audio_source.send(start_frame).await?;
-        let end_ev = dtmf::DtmfEvent { event, end: true, volume: 10, duration: 480 };
+        let end_ev = dtmf::DtmfEvent {
+            event,
+            end: true,
+            volume: 10,
+            duration: 480,
+        };
         let end_frame = MediaSample::Audio(AudioFrame {
             rtp_timestamp: random_u32(),
             data: Bytes::copy_from_slice(&dtmf::encode_dtmf(end_ev)),
@@ -1098,7 +1109,10 @@ impl MediaSession {
                 if frame.payload_type == Some(te_pt) && frame.data.len() >= 4 {
                     if let Some(ev) = dtmf::decode_dtmf(&frame.data) {
                         if let Some(digit) = dtmf::event_to_digit(ev.event) {
-                            info!("[{}] RX DTMF: digit='{}' event={} end={}", username, digit, ev.event, ev.end);
+                            info!(
+                                "[{}] RX DTMF: digit='{}' event={} end={}",
+                                username, digit, ev.event, ev.end
+                            );
                             stats.inc_rx_dtmf();
                         }
                     }
@@ -2151,15 +2165,25 @@ fn inject_telephone_event_sdp(sdp: &str, pt: u8) -> String {
             if parts.len() >= 4 {
                 let mut new = parts[..3].join(" ");
                 new.push_str(&format!(" {}", pt_str));
-                for p in &parts[3..] { new.push_str(&format!(" {}", p)); }
-                out.push_str(&new); out.push('\n');
-            } else { out.push_str(line); out.push('\n'); }
+                for p in &parts[3..] {
+                    new.push_str(&format!(" {}", p));
+                }
+                out.push_str(&new);
+                out.push('\n');
+            } else {
+                out.push_str(line);
+                out.push('\n');
+            }
         } else if line.starts_with("a=rtpmap:") {
-            out.push_str(line); out.push('\n');
-            out.push_str(&dtmf::build_rtpmap_line(pt)); out.push('\n');
-            out.push_str(&dtmf::build_fmtp_line(pt)); out.push('\n');
+            out.push_str(line);
+            out.push('\n');
+            out.push_str(&dtmf::build_rtpmap_line(pt));
+            out.push('\n');
+            out.push_str(&dtmf::build_fmtp_line(pt));
+            out.push('\n');
         } else {
-            out.push_str(line); out.push('\n');
+            out.push_str(line);
+            out.push('\n');
         }
     }
     out
@@ -2668,10 +2692,10 @@ mod tests {
         assert!(sdp.to_lowercase().contains("pcmu"));
 
         // Check if we can create an answer session
-            let (_answer_session, answer_sdp, _) =
-                MediaSession::new(&sdp, false, false, false, None, codecs, stats, None)
-                    .await
-                    .unwrap();
+        let (_answer_session, answer_sdp, _) =
+            MediaSession::new(&sdp, false, false, false, None, codecs, stats, None)
+                .await
+                .unwrap();
         assert!(answer_sdp.contains("m=audio"));
         assert!(answer_sdp.contains("a=sendrecv"));
     }
@@ -2682,18 +2706,34 @@ mod tests {
 
         // Create an offer with G.729
         let offer_codecs = Some(vec!["g729".to_string()]);
-        let (_offerer, offer_sdp) =
-            MediaSession::new_offer(false, false, false, None, offer_codecs, true, stats.clone(), None)
-                .await
-                .unwrap();
+        let (_offerer, offer_sdp) = MediaSession::new_offer(
+            false,
+            false,
+            false,
+            None,
+            offer_codecs,
+            true,
+            stats.clone(),
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(offer_sdp.contains("G729"));
 
         // Answer without specifying codecs (should support all by default now)
-        let (_answerer, answer_sdp, _) =
-            MediaSession::new(&offer_sdp, false, false, false, None, None, stats.clone(), None)
-                .await
-                .unwrap();
+        let (_answerer, answer_sdp, _) = MediaSession::new(
+            &offer_sdp,
+            false,
+            false,
+            false,
+            None,
+            None,
+            stats.clone(),
+            None,
+        )
+        .await
+        .unwrap();
 
         // The answer should contain G729 because it was in the offer and we support it by default
         assert!(
@@ -2740,21 +2780,27 @@ mod tests {
         let result = inject_telephone_event_sdp(sdp, 101);
         // Count occurrences of telephone-event in result (should be exactly 1)
         let count = result.matches("telephone-event").count();
-        assert_eq!(count, 1, "telephone-event should not be duplicated: {}", result);
+        assert_eq!(
+            count, 1,
+            "telephone-event should not be duplicated: {}",
+            result
+        );
     }
 
     #[tokio::test]
     async fn test_media_session_offer_contains_telephone_event() {
         let stats = Arc::new(CallStats::new());
         let codecs = Some(vec!["pcmu".to_string()]);
-        let (_session, sdp) = MediaSession::new_offer(
-            false, false, false, None, codecs, true, stats, None,
-        )
-        .await
-        .unwrap();
+        let (_session, sdp) =
+            MediaSession::new_offer(false, false, false, None, codecs, true, stats, None)
+                .await
+                .unwrap();
         // The SDP should contain telephone-event capability
-        assert!(sdp.to_lowercase().contains("telephone-event"),
-            "Offer SDP should contain telephone-event. SDP: {}", sdp);
+        assert!(
+            sdp.to_lowercase().contains("telephone-event"),
+            "Offer SDP should contain telephone-event. SDP: {}",
+            sdp
+        );
     }
 
     #[tokio::test]
@@ -2762,17 +2808,26 @@ mod tests {
         let stats = Arc::new(CallStats::new());
         let offer_codecs = Some(vec!["pcmu".to_string()]);
         let (_offerer, offer_sdp) = MediaSession::new_offer(
-            false, false, false, None, offer_codecs, true, stats.clone(), None,
+            false,
+            false,
+            false,
+            None,
+            offer_codecs,
+            true,
+            stats.clone(),
+            None,
         )
         .await
         .unwrap();
-        let (_answerer, answer_sdp, _) = MediaSession::new(
-            &offer_sdp, false, false, false, None, None, stats, None,
-        )
-        .await
-        .unwrap();
-        assert!(answer_sdp.to_lowercase().contains("telephone-event"),
-            "Answer SDP should contain telephone-event. SDP: {}", answer_sdp);
+        let (_answerer, answer_sdp, _) =
+            MediaSession::new(&offer_sdp, false, false, false, None, None, stats, None)
+                .await
+                .unwrap();
+        assert!(
+            answer_sdp.to_lowercase().contains("telephone-event"),
+            "Answer SDP should contain telephone-event. SDP: {}",
+            answer_sdp
+        );
     }
 
     #[test]
@@ -2787,10 +2842,14 @@ mod tests {
             report_interval: 100,
         });
         // Analyze a frame with a simple sine wave
-        let pcm: Vec<i16> = (0..160).map(|i| {
-            let t = i as f64 / 8000.0;
-            (std::f64::consts::TAU * 440.0 * t).sin().mul_add(8000.0, 0.0) as i16
-        }).collect();
+        let pcm: Vec<i16> = (0..160)
+            .map(|i| {
+                let t = i as f64 / 8000.0;
+                (std::f64::consts::TAU * 440.0 * t)
+                    .sin()
+                    .mul_add(8000.0, 0.0) as i16
+            })
+            .collect();
         let r = aq.analyze_frame(&pcm, 0, 8000, 8000, 20);
         assert!(!r.is_silence);
         assert!(r.rms > 100.0);
@@ -2804,27 +2863,39 @@ mod tests {
         let stats = CallStats::new();
         stats.add_audio_quality_stats(1, 2, 3, 4, 5, 100);
         assert_eq!(
-            stats.audio_quality_sample_rate_mismatches.load(std::sync::atomic::Ordering::Relaxed),
+            stats
+                .audio_quality_sample_rate_mismatches
+                .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
         assert_eq!(
-            stats.audio_quality_shrill_count.load(std::sync::atomic::Ordering::Relaxed),
+            stats
+                .audio_quality_shrill_count
+                .load(std::sync::atomic::Ordering::Relaxed),
             2
         );
         assert_eq!(
-            stats.audio_quality_muffled_count.load(std::sync::atomic::Ordering::Relaxed),
+            stats
+                .audio_quality_muffled_count
+                .load(std::sync::atomic::Ordering::Relaxed),
             3
         );
         assert_eq!(
-            stats.audio_quality_clipping_frames.load(std::sync::atomic::Ordering::Relaxed),
+            stats
+                .audio_quality_clipping_frames
+                .load(std::sync::atomic::Ordering::Relaxed),
             4
         );
         assert_eq!(
-            stats.audio_quality_silence_frames.load(std::sync::atomic::Ordering::Relaxed),
+            stats
+                .audio_quality_silence_frames
+                .load(std::sync::atomic::Ordering::Relaxed),
             5
         );
         assert_eq!(
-            stats.audio_quality_total_frames.load(std::sync::atomic::Ordering::Relaxed),
+            stats
+                .audio_quality_total_frames
+                .load(std::sync::atomic::Ordering::Relaxed),
             100
         );
     }
@@ -2836,11 +2907,15 @@ mod tests {
         stats.inc_rx_dtmf();
         stats.inc_tx_dtmf();
         assert_eq!(
-            stats.rx_dtmf_events.load(std::sync::atomic::Ordering::Relaxed),
+            stats
+                .rx_dtmf_events
+                .load(std::sync::atomic::Ordering::Relaxed),
             2
         );
         assert_eq!(
-            stats.tx_dtmf_events.load(std::sync::atomic::Ordering::Relaxed),
+            stats
+                .tx_dtmf_events
+                .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
     }

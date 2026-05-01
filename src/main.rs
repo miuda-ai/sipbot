@@ -8,7 +8,7 @@ use sipbot::stats::CallStats;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time::ChronoLocal;
 
@@ -589,6 +589,7 @@ async fn main() -> Result<()> {
     };
 
     let mut handles = vec![];
+    let mut abort_handles = vec![];
     let global_config = config.clone();
     let shared_stats = Arc::new(CallStats::new());
     let cancel_token = CancellationToken::new();
@@ -762,6 +763,7 @@ async fn main() -> Result<()> {
                 _ => {}
             }
         });
+        abort_handles.push(handle.abort_handle());
 
         if let Some(session) = dtmf_session {
             tokio::spawn(async move {
@@ -798,14 +800,11 @@ async fn main() -> Result<()> {
         Err(_) => {
             info!("Cancelled, hanging up active calls...");
             cancel_token.cancel();
-            // Wait for bots to finish cleanup
-            tokio::select! {
-                _ = tokio::time::sleep(tokio::time::Duration::from_secs(10)) => {
-                    error!("Timeout waiting for bots to finish cleanup.");
-                }
-                _ = &mut all_bots => {}
-                _ = tokio::signal::ctrl_c() => {}
+            // Force-stop bot tasks immediately so single Ctrl+C returns to shell.
+            for handle in &abort_handles {
+                handle.abort();
             }
+            warn!("Forced shutdown: aborted running bot tasks.");
 
             if shared_stats.current() > 0 {
                 tracing::warn!(
@@ -815,6 +814,9 @@ async fn main() -> Result<()> {
             } else {
                 info!("All active calls cleared.");
             }
+
+            shared_stats.print_summary();
+            std::process::exit(130);
         }
     }
 
