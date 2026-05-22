@@ -444,6 +444,7 @@ impl MediaSession {
             audio: audio_caps,
             video: vec![],
             application: None,
+            ..Default::default()
         });
 
         let pc = Arc::new(PeerConnection::new(config.clone()));
@@ -616,6 +617,7 @@ impl MediaSession {
             audio: audio_caps,
             video: vec![],
             application: None,
+            ..Default::default()
         });
 
         let pc = Arc::new(PeerConnection::new(config));
