@@ -457,6 +457,38 @@ impl CallRunner {
             }
         };
 
+        let dtmf_flows = self
+            .account
+            .dtmf_flows
+            .as_deref()
+            .and_then(|s| crate::config::parse_dtmf_flows(s).ok());
+        let dtmf_media = media_session.clone();
+        let dtmf_username = self.account.username.clone();
+        let dtmf_cancel = self.cancel_token.clone();
+        let dtmf_future = async move {
+            if let Some(ref flows) = dtmf_flows {
+                info!(
+                    "[{}] DTMF flow: {} entries scheduled",
+                    dtmf_username,
+                    flows.len()
+                );
+                for entry in flows {
+                    tokio::select! {
+                        _ = tokio::time::sleep(entry.delay) => {}
+                        _ = dtmf_cancel.cancelled() => return,
+                    }
+                    info!(
+                        "[{}] Sending DTMF '{}' (after {:.1}s)",
+                        dtmf_username,
+                        entry.digit,
+                        entry.delay.as_secs_f64()
+                    );
+                    let _: Result<(), anyhow::Error> = dtmf_media.send_dtmf(entry.digit).await;
+                    info!("[{}] DTMF '{}' sent", dtmf_username, entry.digit);
+                }
+            }
+        };
+
         if let Some(secs) = hangup_secs {
             info!(
                 "[{}] Call established. Waiting for {} seconds (or Ctrl-C) before hanging up...",
@@ -464,6 +496,7 @@ impl CallRunner {
             );
 
             let play_handle = tokio::spawn(play_future);
+            let dtmf_handle = tokio::spawn(dtmf_future);
 
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(secs)) => {
@@ -471,6 +504,7 @@ impl CallRunner {
                 }
                 _ = monitor_future => {
                     play_handle.abort();
+                    dtmf_handle.abort();
                     return Ok(());
                 }
                 _ = self.cancel_token.cancelled() => {
@@ -478,22 +512,26 @@ impl CallRunner {
                 }
             }
             play_handle.abort();
+            dtmf_handle.abort();
         } else {
             info!(
                 "[{}] Call established. Waiting for playback to hang up...",
                 self.account.username
             );
+            let dtmf_handle = tokio::spawn(dtmf_future);
             tokio::select! {
                 _ = play_future => {
                     info!("[{}] Playback finished.", self.account.username);
                 }
                 _ = monitor_future => {
+                    dtmf_handle.abort();
                     return Ok(());
                 }
                 _ = self.cancel_token.cancelled() => {
                     info!("[{}] Cancellation requested.", self.account.username);
                 }
             }
+            dtmf_handle.abort();
         }
 
         info!("[{}] Sending BYE...", self.account.username);

@@ -60,6 +60,102 @@ pub struct AccountConfig {
 
     // Audio quality analysis configuration
     pub audio_quality: Option<AudioQualityConfig>,
+
+    /// DTMF flow after answer: "1s:2,1.5s:#" means send '2' after 1s, then '#' after 1.5s
+    pub dtmf_flows: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DtmfFlowEntry {
+    pub delay: std::time::Duration,
+    pub digit: char,
+}
+
+pub fn parse_dtmf_flows(input: &str) -> Result<Vec<DtmfFlowEntry>> {
+    let mut entries = Vec::new();
+    for part in input.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let Some((delay_str, digit_str)) = part.split_once(':') else {
+            anyhow::bail!("Invalid dtmf_flow entry '{}': expected <delay>:<digit>", part);
+        };
+        let delay_str = delay_str.trim();
+        let digit_str = digit_str.trim();
+        let delay = if delay_str.ends_with('s') {
+            let num: f64 = delay_str[..delay_str.len() - 1]
+                .parse()
+                .with_context(|| format!("Invalid delay '{}'", delay_str))?;
+            std::time::Duration::from_secs_f64(num)
+        } else {
+            let num: f64 = delay_str
+                .parse()
+                .with_context(|| format!("Invalid delay '{}'", delay_str))?;
+            std::time::Duration::from_secs_f64(num)
+        };
+        let digit = digit_str
+            .chars()
+            .next()
+            .with_context(|| format!("Missing digit in '{}'", part))?;
+        anyhow::ensure!(
+            digit.is_ascii_digit() || digit == '*' || digit == '#'
+                || ('A'..='D').contains(&digit)
+                || ('a'..='d').contains(&digit),
+            "Invalid DTMF digit '{}'",
+            digit
+        );
+        entries.push(DtmfFlowEntry { delay, digit });
+    }
+    Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_dtmf_flows_basic() {
+        let entries = parse_dtmf_flows("1s:2,1.5s:#").unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].digit, '2');
+        assert_eq!(entries[0].delay, std::time::Duration::from_millis(1000));
+        assert_eq!(entries[1].digit, '#');
+        assert_eq!(entries[1].delay, std::time::Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn test_parse_dtmf_flows_no_suffix() {
+        let entries = parse_dtmf_flows("0.5:1,2:0").unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].digit, '1');
+        assert_eq!(entries[0].delay, std::time::Duration::from_millis(500));
+        assert_eq!(entries[1].digit, '0');
+        assert_eq!(entries[1].delay, std::time::Duration::from_millis(2000));
+    }
+
+    #[test]
+    fn test_parse_dtmf_flows_star() {
+        let entries = parse_dtmf_flows("1s:*").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].digit, '*');
+    }
+
+    #[test]
+    fn test_parse_dtmf_flows_empty() {
+        let entries = parse_dtmf_flows("").unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_parse_dtmf_flows_invalid_digit() {
+        assert!(parse_dtmf_flows("1s:X").is_err());
+    }
+
+    #[test]
+    fn test_parse_dtmf_flows_missing_colon() {
+        assert!(parse_dtmf_flows("1s2").is_err());
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]

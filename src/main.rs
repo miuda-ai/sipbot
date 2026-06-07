@@ -100,6 +100,9 @@ enum Commands {
         /// Bind address (e.g., 0.0.0.0:5060)
         #[arg(short, long)]
         addr: Option<String>,
+        /// DTMF flow after answer: "1s:2,1.5s:#" means send '2' after 1s, then '#' after 1.5s
+        #[arg(long)]
+        dtmf_flows: Option<String>,
     },
     /// Wait for incoming calls
     Wait {
@@ -238,6 +241,7 @@ async fn main() -> Result<()> {
                         headers: None,
                         refer_reject: None,
                         audio_quality: None,
+                        dtmf_flows: None,
                     }],
                 }
             }
@@ -278,6 +282,7 @@ async fn main() -> Result<()> {
                         headers: None,
                         refer_reject: None,
                         audio_quality: None,
+                        dtmf_flows: None,
                     }],
                 }
             }
@@ -380,6 +385,7 @@ async fn main() -> Result<()> {
                         headers: headers.clone(),
                         refer_reject: None,
                         audio_quality: None,
+                        dtmf_flows: None,
                     }],
                 }
             }
@@ -419,63 +425,66 @@ async fn main() -> Result<()> {
         from_override,
         addr_override,
         _audio_quality_flag,
+        dtmf_flows_override,
     ) = match &args.command {
-        Commands::Call {
-            target,
-            username,
-            auth_user,
-            password,
-            register,
-            from,
-            hangup,
-            play,
-            local,
-            record,
-            srtp,
-            nack,
-            jitter,
-            total,
-            cps,
-            cancel_prob,
-            codecs,
-            audio_quality,
-            headers,
-            csv_output,
-            csv_interval,
-            addr,
-        } => {
-            let is_register = register.is_some() || password.is_some();
-            let reg_target = if let Some(r) = register {
-                if r.is_empty() { None } else { Some(r.clone()) }
-            } else {
-                None
-            };
-            (
-                "call",
-                target.clone(),
-                username.clone(),
-                auth_user.clone(),
-                password.clone(),
-                *hangup,
-                play.clone(),
-                record.clone(),
-                *srtp,
-                Some(*nack),
-                Some(*jitter),
-                *local,
-                *total,
-                *cps,
-                is_register,
-                reg_target,
-                *cancel_prob,
-                codecs.clone(),
-                headers.clone(),
-                csv_output.clone(),
-                *csv_interval,
-                from.clone(),
-                addr.clone(),
-                *audio_quality,
-            )
+            Commands::Call {
+                target,
+                username,
+                auth_user,
+                password,
+                register,
+                from,
+                hangup,
+                play,
+                local,
+                record,
+                srtp,
+                nack,
+                jitter,
+                total,
+                cps,
+                cancel_prob,
+                codecs,
+                audio_quality,
+                headers,
+                csv_output,
+                csv_interval,
+                addr,
+                dtmf_flows,
+            } => {
+                let is_register = register.is_some() || password.is_some();
+                let reg_target = if let Some(r) = register {
+                    if r.is_empty() { None } else { Some(r.clone()) }
+                } else {
+                    None
+                };
+                (
+                    "call",
+                    target.clone(),
+                    username.clone(),
+                    auth_user.clone(),
+                    password.clone(),
+                    *hangup,
+                    play.clone(),
+                    record.clone(),
+                    *srtp,
+                    Some(*nack),
+                    Some(*jitter),
+                    *local,
+                    *total,
+                    *cps,
+                    is_register,
+                    reg_target,
+                    *cancel_prob,
+                    codecs.clone(),
+                    headers.clone(),
+                    csv_output.clone(),
+                    *csv_interval,
+                    from.clone(),
+                    addr.clone(),
+                    *audio_quality,
+                    dtmf_flows.clone(),
+                )
         }
         Commands::Wait {
             srtp,
@@ -518,10 +527,11 @@ async fn main() -> Result<()> {
                 codecs.clone(),
                 headers.clone(),
                 None,
-                5, // default csv_interval
+                5,
                 None,
                 None,
                 *audio_quality,
+                None,
             )
         }
         Commands::Options { target } => (
@@ -549,6 +559,7 @@ async fn main() -> Result<()> {
             None,
             None,
             false,
+            None,
         ),
         Commands::Info { target } => (
             "info",
@@ -575,6 +586,7 @@ async fn main() -> Result<()> {
             None,
             None,
             false,
+            None,
         ),
     };
 
@@ -728,6 +740,10 @@ async fn main() -> Result<()> {
 
         if let Some(proxy) = &proxy_override {
             account.proxy = Some(proxy.clone() as String);
+        }
+
+        if let Some(dtmf_flows) = &dtmf_flows_override {
+            account.dtmf_flows = Some(dtmf_flows.clone());
         }
 
         let verbose = args.verbose;
