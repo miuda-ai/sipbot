@@ -1193,9 +1193,74 @@ impl SipBot {
         Ok(())
     }
 
+    /// Check if an INVITE is a re-INVITE within an existing dialog
+    /// by looking for a `tag` parameter in the To header.
+    fn is_reinvite(transaction: &Transaction) -> bool {
+        transaction
+            .original
+            .to_header()
+            .ok()
+            .is_some_and(|to| to.value().to_string().contains("tag="))
+    }
+
+    /// Handle a re-INVITE (e.g., for hold/resume scenarios from B2BUA).
+    ///
+    /// The B2BUA sends a re-INVITE with:
+    /// - `a=sendonly` / `a=inactive` → put us on hold (mute echo/audio)
+    /// - `a=sendrecv` → resume (unmute echo/audio)
+    ///
+    /// We toggle `audio_silent` on the media session so that RTP sending
+    /// stops/resumes accordingly. The 200 OK is sent without SDP body;
+    /// the B2BUA detects the hold state from the actual RTP flow.
+    async fn handle_reinvite(&self, mut transaction: Transaction) -> Result<()> {
+        let offer_body = String::from_utf8_lossy(transaction.original.body()).to_string();
+        let offer_lower = offer_body.to_lowercase();
+
+        let is_hold =
+            offer_lower.contains("a=sendonly") || offer_lower.contains("a=inactive");
+
+        info!(
+            "[{}] Received re-INVITE: {}",
+            self.account.username,
+            if is_hold { "HOLD (a=sendonly/inactive)" } else { "RESUME (a=sendrecv)" }
+        );
+
+        // Toggle audio_silent flag on the current MediaSession
+        {
+            let guard = self.current_media_session.lock().await;
+            if let Some(ref media) = *guard {
+                if is_hold {
+                    media.set_audio_silent(true).await;
+                } else {
+                    media.set_audio_silent(false).await;
+                }
+                // Attempt SDP renegotiation (best-effort)
+                if !offer_body.is_empty() {
+                    if let Err(e) = media.renegotiate(&offer_body).await {
+                        warn!("[{}] SDP renegotiation failed: {:?}", self.account.username, e);
+                    }
+                }
+            } else {
+                warn!("[{}] No active media session for re-INVITE", self.account.username);
+            }
+        }
+
+        // Reply 200 OK directly on the transaction.
+        // The B2BUA detects hold/resume from actual RTP flow.
+        transaction.reply(StatusCode::OK).await?;
+        info!("[{}] Re-INVITE replied 200 OK", self.account.username);
+        Ok(())
+    }
+
     async fn handle_incoming_transaction(&self, mut transaction: Transaction) -> Result<()> {
         match transaction.original.method {
-            Method::Invite => self.handle_invite(transaction).await?,
+            Method::Invite => {
+                if Self::is_reinvite(&transaction) {
+                    self.handle_reinvite(transaction).await?
+                } else {
+                    self.handle_invite(transaction).await?
+                }
+            }
             Method::Ack => info!("[{}] Received ACK", self.account.username),
             Method::Bye => {
                 info!("[{}] Received BYE", self.account.username);

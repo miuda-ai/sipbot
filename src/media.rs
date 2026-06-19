@@ -291,6 +291,7 @@ pub struct MediaSession {
     telephone_event_pt: Arc<std::sync::atomic::AtomicU8>,
     audio_quality_enabled: bool,
     audio_quality_config: Option<AudioQualityConfig>,
+    audio_silent: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl MediaSession {
@@ -528,6 +529,7 @@ impl MediaSession {
                 .map(|c| c.enabled)
                 .unwrap_or(false),
             audio_quality_config: _audio_quality_config.clone(),
+            audio_silent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         // Spawn a background task to listen for incoming track events so there is
@@ -697,6 +699,7 @@ impl MediaSession {
                 .map(|c| c.enabled)
                 .unwrap_or(false),
             audio_quality_config: _audio_quality_config.clone(),
+            audio_silent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         session.spawn_rtcp_rtt_collectors();
@@ -749,6 +752,42 @@ impl MediaSession {
 
     pub fn get_telephone_event_pt(&self) -> u8 {
         self.telephone_event_pt.load(Ordering::Relaxed)
+    }
+
+    pub fn get_local_sdp(&self) -> Option<String> {
+        self.pc.local_description().map(|d| d.to_sdp_string())
+    }
+
+    /// Set whether audio sending is silent (muted).
+    /// When true, echo/playback is stopped; when false, it resumes.
+    pub async fn set_audio_silent(&self, silent: bool) {
+        self.audio_silent.store(silent, Ordering::Relaxed);
+        info!(
+            "[MediaSession] Audio silent set to {}",
+            if silent { "true (muted)" } else { "false (unmuted)" }
+        );
+    }
+
+    /// Renegotiate SDP with a remote re-INVITE offer.
+    /// Returns the new local answer SDP string.
+    pub async fn renegotiate(&self, remote_sdp: &str) -> Result<String> {
+        info!("[MediaSession] Renegotiating SDP with remote offer");
+        let remote_desc = SessionDescription::parse(SdpType::Offer, remote_sdp)?;
+        self.pc.set_remote_description(remote_desc).await?;
+
+        let answer = self.pc.create_answer().await?;
+        let sdp_str = answer.to_sdp_string();
+        let answer_desc = SessionDescription::parse(SdpType::Answer, &sdp_str)?;
+        self.pc.set_local_description(answer_desc)?;
+
+        let local = self
+            .pc
+            .local_description()
+            .context("Failed to get local description after renegotiation")?
+            .to_sdp_string();
+
+        let pt = self.telephone_event_pt.load(Ordering::Relaxed);
+        Ok(inject_telephone_event_sdp(&local, pt))
     }
 
     pub async fn set_remote_answer(&self, remote_sdp: &str) -> Result<String> {
@@ -889,6 +928,7 @@ impl MediaSession {
         let telephone_event_pt = self.telephone_event_pt.load(Ordering::Relaxed);
         let audio_quality_enabled = self.audio_quality_enabled;
         let audio_quality_config = self.audio_quality_config.clone();
+        let audio_silent = self.audio_silent.clone();
 
         tokio::spawn(async move {
             let mut decoder: Option<Box<dyn Decoder + Send>> = None;
@@ -995,6 +1035,7 @@ impl MediaSession {
                                         ct.samplerate(),
                                         te_pt,
                                         aq.as_mut(),
+                                        &audio_silent,
                                     )
                                     .await;
                                 }
@@ -1072,6 +1113,7 @@ impl MediaSession {
                                             ct.samplerate(),
                                             te_pt,
                                             aq.as_mut(),
+                                            &audio_silent,
                                         )
                                         .await;
                                     }
@@ -1104,6 +1146,7 @@ impl MediaSession {
         actual_sample_rate: u32,
         telephone_event_pt: Option<u8>,
         audio_quality: Option<&mut AudioQualityAnalyzer>,
+        audio_silent: &Arc<std::sync::atomic::AtomicBool>,
     ) {
         // Check for DTMF telephone-event packets
         if let MediaSample::Audio(ref frame) = sample {
@@ -1267,8 +1310,10 @@ impl MediaSession {
             }
         }
 
-        // Echo
-        if let Err(e) = audio_source.send(sample).await {
+        // Echo (skip if audio is silenced due to hold)
+        if audio_silent.load(std::sync::atomic::Ordering::Relaxed) {
+            tracing::debug!("[{}] Audio silent, skipping echo", username);
+        } else if let Err(e) = audio_source.send(sample).await {
             tracing::error!("[{}] Failed to send echo sample: {:?}", username, e);
         }
     }
