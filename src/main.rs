@@ -806,17 +806,31 @@ async fn main() -> Result<()> {
     let all_bots = join_all(handles);
     tokio::pin!(all_bots);
 
-    match tokio::select! {
-        _ = &mut all_bots => { Ok(()) }
+    tokio::select! {
+        _ = &mut all_bots => {
+            info!("All bots finished.");
+            shared_stats.print_summary();
+
+            if let Some(ref csv_path) = csv_output_path {
+                let summary_path = if csv_path.ends_with(".csv") {
+                    csv_path.replace(".csv", "_summary.txt")
+                } else {
+                    format!("{}_summary.txt", csv_path)
+                };
+                if let Err(e) = write_final_summary(&shared_stats, &summary_path).await {
+                    error!("Failed to write final summary: {}", e);
+                }
+            }
+
+            // Force exit to avoid lingering spawned tasks (e.g. DTMF stdin reader)
+            // blocking runtime shutdown and the orphaned tokio SIGINT handler
+            // swallowing subsequent Ctrl-C presses.
+            std::process::exit(0);
+        }
         _ = tokio::signal::ctrl_c() => {
             println!("\n[!] Ctrl+C received, shutting down...");
-            Err(()) }
-    } {
-        Ok(_) => info!("All bots finished."),
-        Err(_) => {
             info!("Cancelled, hanging up active calls...");
             cancel_token.cancel();
-            // Force-stop bot tasks immediately so single Ctrl+C returns to shell.
             for handle in &abort_handles {
                 handle.abort();
             }
@@ -835,20 +849,4 @@ async fn main() -> Result<()> {
             std::process::exit(130);
         }
     }
-
-    shared_stats.print_summary();
-
-    // Write final summary to file if CSV output was requested
-    if let Some(ref csv_path) = csv_output_path {
-        let summary_path = if csv_path.ends_with(".csv") {
-            csv_path.replace(".csv", "_summary.txt")
-        } else {
-            format!("{}_summary.txt", csv_path)
-        };
-        if let Err(e) = write_final_summary(&shared_stats, &summary_path).await {
-            error!("Failed to write final summary: {}", e);
-        }
-    }
-
-    Ok(())
 }
