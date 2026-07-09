@@ -1018,9 +1018,9 @@ impl SipBot {
                 } else {
                     info!("[{}] Registering...", username);
                 }
-                // Default expire 30s
+                // Default expire 600s
                 let register_result = tokio::select! {
-                    r = registration.register(server_uri.clone(), Some(30)) => r,
+                    r = registration.register(server_uri.clone(), Some(600)) => r,
                     _ = cancel_token.cancelled() => break,
                 };
                 match register_result {
