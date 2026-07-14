@@ -729,7 +729,7 @@ impl MediaSession {
             marker: true,
             ..Default::default()
         });
-        self.audio_source.send(start_frame).await?;
+        self.audio_source.send(start_frame)?;
         let end_ev = dtmf::DtmfEvent {
             event,
             end: true,
@@ -744,7 +744,7 @@ impl MediaSession {
             marker: false,
             ..Default::default()
         });
-        self.audio_source.send(end_frame).await?;
+        self.audio_source.send(end_frame)?;
         self.stats.inc_tx_dtmf();
         info!("[DTMF] Sent digit '{}' (event={})", digit, event);
         Ok(())
@@ -1313,7 +1313,7 @@ impl MediaSession {
         // Echo (skip if audio is silenced due to hold)
         if audio_silent.load(std::sync::atomic::Ordering::Relaxed) {
             tracing::debug!("[{}] Audio silent, skipping echo", username);
-        } else if let Err(e) = audio_source.send(sample).await {
+        } else if let Err(e) = audio_source.send(sample) {
             tracing::error!("[{}] Failed to send echo sample: {:?}", username, e);
         }
     }
@@ -1620,7 +1620,7 @@ impl MediaSession {
                         clock_rate: ct.clock_rate(),
                         ..Default::default()
                     });
-                    if let Err(e) = audio_source.send(sample).await {
+                    if let Err(e) = audio_source.send(sample) {
                         error!("[{}] Failed to send mic sample: {:?}", username_input, e);
                         return;
                     }
@@ -2011,7 +2011,7 @@ impl MediaSession {
             let ticks = (chunk_size as u64 * clock_rate as u64 / sample_rate as u64) as u32;
             rtp_timestamp = rtp_timestamp.wrapping_add(ticks);
 
-            if let Err(e) = self.audio_source.send_audio(frame).await {
+            if let Err(e) = self.audio_source.send_audio(frame) {
                 error!("[{}] Failed to send audio: {:?}", username, e);
                 break;
             }
