@@ -1,4 +1,4 @@
-use crate::config::{AccountConfig, AnswerConfig, Config};
+use crate::config::{AccountConfig, AnswerConfig, Config, ReinviteAction};
 use crate::media::MediaSession;
 use crate::stats::CallStats;
 use anyhow::{Context, Result};
@@ -288,7 +288,7 @@ impl CallRunner {
         };
 
         let destination = if let Some(proxy) = &self.account.proxy {
-            let proxy_uri = Uri::try_from(format!("sip:{}", proxy).as_str())?;
+            let proxy_uri = Uri::try_from(normalize_sip_addr(proxy).as_str())?;
             proxy_uri.host_with_port.clone().into()
         } else {
             to.host_with_port.clone().into()
@@ -489,6 +489,85 @@ impl CallRunner {
             }
         };
 
+        let reinvite_flows = self
+            .account
+            .reinvite_flows
+            .as_deref()
+            .and_then(|s| crate::config::parse_reinvite_flows(s).ok());
+        let reinvite_media = media_session.clone();
+        let reinvite_dialog = dialog.clone();
+        let reinvite_username = self.account.username.clone();
+        let reinvite_cancel = self.cancel_token.clone();
+        let reinvite_future = async move {
+            if let Some(ref flows) = reinvite_flows {
+                info!(
+                    "[{}] Re-INVITE flow: {} entries scheduled",
+                    reinvite_username,
+                    flows.len()
+                );
+                for entry in flows {
+                    tokio::select! {
+                        _ = tokio::time::sleep(entry.delay) => {}
+                        _ = reinvite_cancel.cancelled() => {
+                            info!("[{}] Re-INVITE flow cancelled", reinvite_username);
+                            return;
+                        }
+                    }
+
+                    let is_hold = matches!(entry.action, ReinviteAction::Hold);
+                    info!(
+                        "[{}] Sending re-INVITE {} (after {:.1}s)",
+                        reinvite_username,
+                        if is_hold { "HOLD" } else { "RESUME" },
+                        entry.delay.as_secs_f64()
+                    );
+
+                    let offer_sdp = match reinvite_media.create_reinvite_offer(is_hold).await {
+                        Ok(sdp) => sdp,
+                        Err(e) => {
+                            warn!("[{}] Failed to create re-INVITE offer: {:?}", reinvite_username, e);
+                            continue;
+                        }
+                    };
+
+                    let headers = vec![Header::ContentType("application/sdp".into())];
+                    let body = offer_sdp.into_bytes();
+
+                    let response = reinvite_dialog.reinvite(Some(headers), Some(body)).await;
+
+                    match response {
+                        Ok(Some(resp)) if matches!(resp.status_code().kind(), rsipstack::rsip::status_code::StatusCodeKind::Successful) => {
+                            let answer_sdp = String::from_utf8_lossy(&resp.body).to_string();
+                            if !answer_sdp.is_empty() {
+                                if let Err(e) = reinvite_media.set_remote_answer(&answer_sdp).await {
+                                    warn!("[{}] Failed to set remote answer for re-INVITE: {:?}", reinvite_username, e);
+                                }
+                            }
+                            reinvite_media.set_audio_silent(is_hold).await;
+                            info!(
+                                "[{}] Re-INVITE {} completed successfully",
+                                reinvite_username,
+                                if is_hold { "HOLD" } else { "RESUME" }
+                            );
+                        }
+                        Ok(Some(resp)) => {
+                            warn!(
+                                "[{}] Re-INVITE rejected: {}",
+                                reinvite_username,
+                                resp.status_code()
+                            );
+                        }
+                        Ok(None) => {
+                            warn!("[{}] Re-INVITE got no response", reinvite_username);
+                        }
+                        Err(e) => {
+                            warn!("[{}] Re-INVITE failed: {:?}", reinvite_username, e);
+                        }
+                    }
+                }
+            }
+        };
+
         if let Some(secs) = hangup_secs {
             info!(
                 "[{}] Call established. Waiting for {} seconds (or Ctrl-C) before hanging up...",
@@ -497,6 +576,7 @@ impl CallRunner {
 
             let play_handle = tokio::spawn(play_future);
             let dtmf_handle = tokio::spawn(dtmf_future);
+            let reinvite_handle = tokio::spawn(reinvite_future);
 
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(secs)) => {
@@ -505,6 +585,7 @@ impl CallRunner {
                 _ = monitor_future => {
                     play_handle.abort();
                     dtmf_handle.abort();
+                    reinvite_handle.abort();
                     return Ok(());
                 }
                 _ = self.cancel_token.cancelled() => {
@@ -513,18 +594,21 @@ impl CallRunner {
             }
             play_handle.abort();
             dtmf_handle.abort();
+            reinvite_handle.abort();
         } else {
             info!(
                 "[{}] Call established. Waiting for playback to hang up...",
                 self.account.username
             );
             let dtmf_handle = tokio::spawn(dtmf_future);
+            let reinvite_handle = tokio::spawn(reinvite_future);
             tokio::select! {
                 _ = play_future => {
                     info!("[{}] Playback finished.", self.account.username);
                 }
                 _ = monitor_future => {
                     dtmf_handle.abort();
+                    reinvite_handle.abort();
                     return Ok(());
                 }
                 _ = self.cancel_token.cancelled() => {
@@ -532,6 +616,7 @@ impl CallRunner {
                 }
             }
             dtmf_handle.abort();
+            reinvite_handle.abort();
         }
 
         info!("[{}] Sending BYE...", self.account.username);
@@ -1000,8 +1085,7 @@ impl SipBot {
         tokio::spawn(async move {
             info!("[{}] Starting registration loop", username);
             let target = proxy.unwrap_or(domain);
-            let uri_str = format!("sip:{}", target);
-            let server_uri = match Uri::try_from(uri_str.as_str()) {
+            let server_uri = match Uri::try_from(normalize_sip_addr(&target).as_str()) {
                 Ok(u) => u,
                 Err(e) => {
                     error!("[{}] Invalid domain URI: {}", username, e);
@@ -1203,15 +1287,13 @@ impl SipBot {
             .is_some_and(|to| to.value().to_string().contains("tag="))
     }
 
-    /// Handle a re-INVITE (e.g., for hold/resume scenarios from B2BUA).
+    /// Handle a re-INVITE (e.g., for hold/resume scenarios).
     ///
-    /// The B2BUA sends a re-INVITE with:
-    /// - `a=sendonly` / `a=inactive` → put us on hold (mute echo/audio)
+    /// Parses the offer for direction attribute:
+    /// - `a=sendonly` / `a=inactive` → hold (mute echo/audio)
     /// - `a=sendrecv` → resume (unmute echo/audio)
     ///
-    /// We toggle `audio_silent` on the media session so that RTP sending
-    /// stops/resumes accordingly. The 200 OK is sent without SDP body;
-    /// the B2BUA detects the hold state from the actual RTP flow.
+    /// Renegotiates SDP and replies 200 OK with the answer SDP body.
     async fn handle_reinvite(&self, mut transaction: Transaction) -> Result<()> {
         let offer_body = String::from_utf8_lossy(transaction.original.body()).to_string();
         let offer_lower = offer_body.to_lowercase();
@@ -1225,29 +1307,42 @@ impl SipBot {
             if is_hold { "HOLD (a=sendonly/inactive)" } else { "RESUME (a=sendrecv)" }
         );
 
-        // Toggle audio_silent flag on the current MediaSession
-        {
+        // Renegotiate SDP and get answer, toggle audio_silent
+        let answer_sdp = {
             let guard = self.current_media_session.lock().await;
-            if let Some(ref media) = *guard {
-                if is_hold {
-                    media.set_audio_silent(true).await;
-                } else {
-                    media.set_audio_silent(false).await;
-                }
-                // Attempt SDP renegotiation (best-effort)
-                if !offer_body.is_empty() {
-                    if let Err(e) = media.renegotiate(&offer_body).await {
-                        warn!("[{}] SDP renegotiation failed: {:?}", self.account.username, e);
+            match guard.as_ref() {
+                Some(media) => {
+                    if is_hold {
+                        media.set_audio_silent(true).await;
+                    } else {
+                        media.set_audio_silent(false).await;
+                    }
+                    if !offer_body.is_empty() {
+                        match media.renegotiate(&offer_body).await {
+                            Ok(answer) => Some(answer),
+                            Err(e) => {
+                                warn!("[{}] SDP renegotiation failed: {:?}", self.account.username, e);
+                                None
+                            }
+                        }
+                    } else {
+                        None
                     }
                 }
-            } else {
-                warn!("[{}] No active media session for re-INVITE", self.account.username);
+                None => {
+                    warn!("[{}] No active media session for re-INVITE", self.account.username);
+                    None
+                }
             }
-        }
+        };
 
-        // Reply 200 OK directly on the transaction.
-        // The B2BUA detects hold/resume from actual RTP flow.
-        transaction.reply(StatusCode::OK).await?;
+        // Reply 200 OK with answer SDP body for proper re-INVITE negotiation
+        if let Some(sdp) = answer_sdp {
+            let headers = vec![Header::ContentType("application/sdp".into())];
+            transaction.reply_with(StatusCode::OK, headers, Some(sdp.into_bytes())).await?;
+        } else {
+            transaction.reply(StatusCode::OK).await?;
+        }
         info!("[{}] Re-INVITE replied 200 OK", self.account.username);
         Ok(())
     }
@@ -1896,6 +1991,13 @@ impl SipBot {
     }
 }
 
+/// Normalize a server address: strip `sip:` prefix if present, then add it back.
+/// Allows users to provide addresses as `sip:192.168.1.1:5060` or `192.168.1.1:5060`.
+fn normalize_sip_addr(addr: &str) -> String {
+    let stripped = addr.strip_prefix("sip:").unwrap_or(addr);
+    format!("sip:{}", stripped)
+}
+
 fn generate_random_string() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let start = SystemTime::now();
@@ -1903,4 +2005,18 @@ fn generate_random_string() -> String {
         .duration_since(UNIX_EPOCH)
         .expect("Time went backwards");
     format!("{:x}", since_the_epoch.as_nanos())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_sip_addr() {
+        assert_eq!(normalize_sip_addr("192.168.1.1:5060"), "sip:192.168.1.1:5060");
+        assert_eq!(normalize_sip_addr("sip:192.168.1.1:5060"), "sip:192.168.1.1:5060");
+        assert_eq!(normalize_sip_addr("example.com"), "sip:example.com");
+        assert_eq!(normalize_sip_addr("sip:example.com"), "sip:example.com");
+        assert_eq!(normalize_sip_addr(""), "sip:");
+    }
 }

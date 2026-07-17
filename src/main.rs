@@ -103,6 +103,9 @@ enum Commands {
         /// DTMF flow after answer: "1s:2,1.5s:#" means send '2' after 1s, then '#' after 1.5s
         #[arg(long)]
         dtmf_flows: Option<String>,
+        /// Re-INVITE flow after answer: "5s:hold,10s:resume" means send hold after 5s, resume after 10s
+        #[arg(long)]
+        reinvite_flows: Option<String>,
     },
     /// Wait for incoming calls
     Wait {
@@ -242,6 +245,7 @@ async fn main() -> Result<()> {
                         refer_reject: None,
                         audio_quality: None,
                         dtmf_flows: None,
+                        reinvite_flows: None,
                     }],
                 }
             }
@@ -283,6 +287,7 @@ async fn main() -> Result<()> {
                         refer_reject: None,
                         audio_quality: None,
                         dtmf_flows: None,
+                        reinvite_flows: None,
                     }],
                 }
             }
@@ -350,7 +355,7 @@ async fn main() -> Result<()> {
                 let is_register = register.is_some() || password.is_some();
                 info!("Parsed config: nack={}, jitter={}", *nack, *jitter);
                 let reg_target = if let Some(r) = register {
-                    if r.is_empty() { None } else { Some(r.clone()) }
+                    if r.is_empty() { None } else { Some(r.trim_start_matches("sip:").to_string()) }
                 } else {
                     None
                 };
@@ -386,6 +391,7 @@ async fn main() -> Result<()> {
                         refer_reject: None,
                         audio_quality: None,
                         dtmf_flows: None,
+                        reinvite_flows: None,
                     }],
                 }
             }
@@ -426,6 +432,7 @@ async fn main() -> Result<()> {
         addr_override,
         _audio_quality_flag,
         dtmf_flows_override,
+        reinvite_flows_override,
     ) = match &args.command {
             Commands::Call {
                 target,
@@ -451,10 +458,11 @@ async fn main() -> Result<()> {
                 csv_interval,
                 addr,
                 dtmf_flows,
+                reinvite_flows,
             } => {
                 let is_register = register.is_some() || password.is_some();
                 let reg_target = if let Some(r) = register {
-                    if r.is_empty() { None } else { Some(r.clone()) }
+                    if r.is_empty() { None } else { Some(r.trim_start_matches("sip:").to_string()) }
                 } else {
                     None
                 };
@@ -484,6 +492,7 @@ async fn main() -> Result<()> {
                     addr.clone(),
                     *audio_quality,
                     dtmf_flows.clone(),
+                    reinvite_flows.clone(),
                 )
         }
         Commands::Wait {
@@ -502,7 +511,7 @@ async fn main() -> Result<()> {
         } => {
             let is_register = register.is_some() || password.is_some();
             let reg_target = if let Some(r) = register {
-                if r.is_empty() { None } else { Some(r.clone()) }
+                if r.is_empty() { None } else { Some(r.trim_start_matches("sip:").to_string()) }
             } else {
                 None
             };
@@ -532,6 +541,7 @@ async fn main() -> Result<()> {
                 None,
                 *audio_quality,
                 None,
+                None,
             )
         }
         Commands::Options { target } => (
@@ -560,6 +570,7 @@ async fn main() -> Result<()> {
             None,
             false,
             None,
+            None,
         ),
         Commands::Info { target } => (
             "info",
@@ -586,6 +597,7 @@ async fn main() -> Result<()> {
             None,
             None,
             false,
+            None,
             None,
         ),
     };
@@ -739,11 +751,23 @@ async fn main() -> Result<()> {
         }
 
         if let Some(proxy) = &proxy_override {
-            account.proxy = Some(proxy.clone() as String);
+            let stripped = proxy.strip_prefix("sip:").unwrap_or(proxy);
+            account.proxy = Some(stripped.to_string());
         }
+
+        // Strip sip: prefix from domain if present
+        account.domain = account
+            .domain
+            .strip_prefix("sip:")
+            .unwrap_or(&account.domain)
+            .to_string();
 
         if let Some(dtmf_flows) = &dtmf_flows_override {
             account.dtmf_flows = Some(dtmf_flows.clone());
+        }
+
+        if let Some(reinvite_flows) = &reinvite_flows_override {
+            account.reinvite_flows = Some(reinvite_flows.clone());
         }
 
         let verbose = args.verbose;

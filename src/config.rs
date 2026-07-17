@@ -63,6 +63,9 @@ pub struct AccountConfig {
 
     /// DTMF flow after answer: "1s:2,1.5s:#" means send '2' after 1s, then '#' after 1.5s
     pub dtmf_flows: Option<String>,
+
+    /// Re-INVITE flow after answer: "5s:hold,10s:resume" means send hold after 5s, resume after 10s
+    pub reinvite_flows: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +109,58 @@ pub fn parse_dtmf_flows(input: &str) -> Result<Vec<DtmfFlowEntry>> {
             digit
         );
         entries.push(DtmfFlowEntry { delay, digit });
+    }
+    Ok(entries)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReinviteAction {
+    Hold,
+    Resume,
+}
+
+impl std::str::FromStr for ReinviteAction {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "hold" => Ok(ReinviteAction::Hold),
+            "resume" => Ok(ReinviteAction::Resume),
+            _ => anyhow::bail!("Invalid reinvite action '{}': expected 'hold' or 'resume'", s),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReinviteFlowEntry {
+    pub delay: std::time::Duration,
+    pub action: ReinviteAction,
+}
+
+pub fn parse_reinvite_flows(input: &str) -> Result<Vec<ReinviteFlowEntry>> {
+    let mut entries = Vec::new();
+    for part in input.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let Some((delay_str, action_str)) = part.split_once(':') else {
+            anyhow::bail!("Invalid reinvite_flow entry '{}': expected <delay>:<action>", part);
+        };
+        let delay_str = delay_str.trim();
+        let action_str = action_str.trim();
+        let delay = if delay_str.ends_with('s') {
+            let num: f64 = delay_str[..delay_str.len() - 1]
+                .parse()
+                .with_context(|| format!("Invalid delay '{}'", delay_str))?;
+            std::time::Duration::from_secs_f64(num)
+        } else {
+            let num: f64 = delay_str
+                .parse()
+                .with_context(|| format!("Invalid delay '{}'", delay_str))?;
+            std::time::Duration::from_secs_f64(num)
+        };
+        let action: ReinviteAction = action_str.parse()?;
+        entries.push(ReinviteFlowEntry { delay, action });
     }
     Ok(entries)
 }
@@ -155,6 +210,43 @@ mod tests {
     #[test]
     fn test_parse_dtmf_flows_missing_colon() {
         assert!(parse_dtmf_flows("1s2").is_err());
+    }
+
+    #[test]
+    fn test_parse_reinvite_flows_basic() {
+        let entries = parse_reinvite_flows("5s:hold,10s:resume").unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].action, ReinviteAction::Hold);
+        assert_eq!(entries[0].delay, std::time::Duration::from_millis(5000));
+        assert_eq!(entries[1].action, ReinviteAction::Resume);
+        assert_eq!(entries[1].delay, std::time::Duration::from_millis(10000));
+    }
+
+    #[test]
+    fn test_parse_reinvite_flows_no_suffix() {
+        let entries = parse_reinvite_flows("2.5:hold,15:resume").unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].delay, std::time::Duration::from_secs_f64(2.5));
+        assert_eq!(entries[0].action, ReinviteAction::Hold);
+        assert_eq!(entries[1].delay, std::time::Duration::from_secs(15));
+        assert_eq!(entries[1].action, ReinviteAction::Resume);
+    }
+
+    #[test]
+    fn test_parse_reinvite_flows_empty() {
+        let entries = parse_reinvite_flows("").unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_parse_reinvite_flows_invalid_action() {
+        assert!(parse_reinvite_flows("5s:invalid").is_err());
+    }
+
+    #[test]
+    fn test_parse_reinvite_flows_missing_colon() {
+        assert!(parse_reinvite_flows("5s:hold").is_ok());
+        assert!(parse_reinvite_flows("5s").is_err());
     }
 }
 

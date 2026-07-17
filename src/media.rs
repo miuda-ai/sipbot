@@ -816,6 +816,40 @@ impl MediaSession {
         Ok(self.get_codec_name_from_sdp(remote_sdp))
     }
 
+    /// Create a new SDP offer for re-INVITE with specified direction.
+    /// Used for hold (SendOnly) and resume (SendRecv).
+    pub async fn create_reinvite_offer(&self, hold: bool) -> Result<String> {
+        let direction = if hold {
+            TransceiverDirection::SendOnly
+        } else {
+            TransceiverDirection::SendRecv
+        };
+
+        for t in self.pc.get_transceivers() {
+            t.set_direction(direction);
+        }
+
+        self.pc.wait_for_gathering_complete().await;
+
+        let offer = self.pc.create_offer().await?;
+        let sdp_str = offer.to_sdp_string();
+        let offer = SessionDescription::parse(SdpType::Offer, &sdp_str)?;
+        self.pc.set_local_description(offer)?;
+
+        let local_sdp = self
+            .pc
+            .local_description()
+            .context("Failed to get local description after re-INVITE offer")?
+            .to_sdp_string();
+
+        if local_sdp.is_empty() || !local_sdp.contains("m=audio") {
+            anyhow::bail!("Failed to generate valid re-INVITE offer SDP");
+        }
+
+        let pt = self.telephone_event_pt.load(Ordering::Relaxed);
+        Ok(inject_telephone_event_sdp(&local_sdp, pt))
+    }
+
     pub fn get_negotiated_codec(&self) -> String {
         let pt = self
             .pc
@@ -1605,6 +1639,15 @@ impl MediaSession {
                 }
 
                 while input_buffer.len() >= samples_per_frame * target_channels as usize {
+                    // Skip sending during hold
+                    if session_input_clone.audio_silent.load(Ordering::Relaxed) {
+                        let ticks = (samples_per_frame as u64 * ct.clock_rate() as u64
+                            / target_sample_rate as u64) as u32;
+                        rtp_timestamp = rtp_timestamp.wrapping_add(ticks);
+                        input_buffer.drain(0..samples_per_frame * target_channels as usize);
+                        continue;
+                    }
+
                     let frame: Vec<i16> = input_buffer
                         .drain(0..samples_per_frame * target_channels as usize)
                         .collect();
@@ -1979,6 +2022,13 @@ impl MediaSession {
             } else {
                 0.0
             };
+
+            // Check hold/resume state: skip sending when audio is silenced
+            if self.audio_silent.load(Ordering::Relaxed) {
+                let ticks = (chunk_size as u64 * clock_rate as u64 / sample_rate as u64) as u32;
+                rtp_timestamp = rtp_timestamp.wrapping_add(ticks);
+                continue;
+            }
 
             // Encode and send
             let encoded = encoder.encode(&audio_to_encode);

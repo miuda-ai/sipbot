@@ -20,7 +20,8 @@ The media transport uses [rustrtc](https://github.com/restsend/rustrtc).
   - **Hangup (Stage 3)**: Automatically hang up after a configurable duration or reject calls with specific SIP codes.
 - **Outbound Calls**: Ability to initiate calls to a target URI.
 - **Call Recording**: (Experimental) Record call audio to WAV files. (Requires configuration)
-- **DTMF (RFC 2833)**: Send DTMF digits via keyboard during single calls; receive and log DTMF events from remote endpoints.
+- **DTMF (RFC 2833)**: Send DTMF digits via keyboard during single calls; receive and log DTMF events from remote endpoints. Supports scheduled DTMF flows: `--dtmf-flows "1s:2,1.5s:#"`.
+- **Hold/Resume (Re-INVITE)**: Automatically send hold/resume re-INVITEs at scheduled times. Supports `--reinvite-flows "5s:hold,10s:resume"` — ideal for testing RFC 3264 SDP direction negotiation and RTP silence during hold.
 - **Audio Quality Analysis**: Per-call audio quality monitoring with RMS, clipping, DC offset, zero-crossing rate, spectral tilt, shrill/muffled classification, and sample-rate mismatch detection.
 - **Registration**: Supports SIP registration with authentication (WIP).
 
@@ -76,6 +77,8 @@ cargo run -- call -t sip:user@domain -u sipbot --play audio.wav --hangup 10 --to
 - `--csv-interval <SECONDS>`: CSV output interval in seconds (default: 5).
 - `--from <USER>`: From URI user part for outbound calls (e.g., anonymous).
 - `-H, --header <HEADER>`: Add custom SIP header (e.g., `-H 'X-Custom: value'`). Can be used multiple times.
+- `--dtmf-flows <FLOW>`: Scheduled DTMF flow after answer (e.g., `"1s:2,1.5s:#"` sends `2` after 1s, `#` after 1.5s).
+- `--reinvite-flows <FLOW>`: Scheduled re-INVITE flow after answer (e.g., `"5s:hold,10s:resume"` sends hold after 5s, resume after 10s).
 
 > **Tip**: When making a single call (`--total 1`), you can send DTMF digits by typing them in the terminal. Supported: `0-9`, `*`, `#`, `A-D`. Press `q` to quit the DTMF reader.
 
@@ -191,7 +194,20 @@ sipbot call -t sip:user@domain -u sipbot --hangup 30
 # Press 'q' to quit the DTMF reader
 ```
 
-### 8. Audio Quality Analysis
+### 8. Hold/Resume (Re-INVITE) Testing
+
+Test hold/resume re-INVITE flows between two sipbot instances. The caller sends a hold re-INVITE after 4s, then resume after 12s.
+
+```bash
+# Terminal 1 — Callee (echo mode)
+sipbot wait --addr 0.0.0.0:5061 --username bob --echo
+
+# Terminal 2 — Caller (auto hold at 4s, resume at 12s, hangup at 25s)
+sipbot call --target sip:bob@127.0.0.1:5061 --username alice \
+  --reinvite-flows "4s:hold,12s:resume" --hangup 25
+```
+
+### 9. Audio Quality Analysis
 
 Enable per-call audio quality analysis to detect clipping, silence, shrill/muffled audio, and sample rate mismatches:
 
@@ -276,6 +292,8 @@ after_secs = 10                 # Send BYE after 10 seconds
     - `srtp_enabled`: (Bool) Enable SRTP/SDES.
     - `nack_enabled`: (Bool) Enable RTP NACK.
     - `jitter_buffer_enabled`: (Bool) Enable Jitter Buffer.
+    - `dtmf_flows`: (String) Scheduled DTMF digits after answer (e.g., `"1s:2,1.5s:#"`).
+    - `reinvite_flows`: (String) Scheduled hold/resume re-INVITEs after answer (e.g., `"5s:hold,10s:resume"`).
     - `codecs`: (Array) List of preferred codecs (e.g., `["opus", "g722", "pcmu"]`).
     - `headers`: (Array) List of custom SIP headers to include in INVITE requests and 200 OK responses (e.g., `["X-Custom-Header: value", "X-Call-ID: 12345"]`).
     - `audio_quality`: (Optional) Enable per-call audio quality analysis. Example:
