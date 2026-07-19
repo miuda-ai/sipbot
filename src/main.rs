@@ -67,6 +67,9 @@ enum Commands {
         /// Enable SRTP/SDES
         #[arg(long)]
         srtp: bool,
+        /// Enable WebRTC (ICE+DTLS) and +sip.ice in Contact
+        #[arg(long)]
+        webrtc: bool,
         /// Enable NACK
         #[arg(long)]
         nack: bool,
@@ -154,6 +157,9 @@ enum Commands {
         /// Enable SRTP/SDES
         #[arg(long)]
         srtp: bool,
+        /// Enable WebRTC (ICE+DTLS) and +sip.ice in Contact
+        #[arg(long)]
+        webrtc: bool,
         /// Enable NACK
         #[arg(long)]
         nack: bool,
@@ -419,6 +425,7 @@ async fn main() -> Result<()> {
         play_file_override,
         record_override,
         srtp_override,
+        webrtc_override,
         nack_override,
         jitter_buffer_override,
         local_override,
@@ -449,6 +456,7 @@ async fn main() -> Result<()> {
                 local,
                 record,
                 srtp,
+                webrtc,
                 nack,
                 jitter,
                 total,
@@ -479,6 +487,7 @@ async fn main() -> Result<()> {
                     play.clone(),
                     record.clone(),
                     *srtp,
+                    *webrtc,
                     Some(*nack),
                     Some(*jitter),
                     *local,
@@ -500,6 +509,7 @@ async fn main() -> Result<()> {
         }
         Commands::Wait {
             srtp,
+            webrtc,
             nack,
             jitter,
             password,
@@ -528,6 +538,7 @@ async fn main() -> Result<()> {
                 None,
                 None,
                 *srtp,
+                *webrtc,
                 Some(*nack),
                 Some(*jitter),
                 *local,
@@ -557,6 +568,7 @@ async fn main() -> Result<()> {
             None,
             None,
             false,
+            false,
             None,
             None,
             false,
@@ -584,6 +596,7 @@ async fn main() -> Result<()> {
             None,
             None,
             None,
+            false,
             false,
             None,
             None,
@@ -668,6 +681,10 @@ async fn main() -> Result<()> {
 
         if srtp_override {
             account.srtp_enabled = Some(true);
+        }
+
+        if webrtc_override {
+            account.webrtc_enabled = Some(true);
         }
 
         if let Some(nack) = nack_override {
