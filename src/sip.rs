@@ -243,10 +243,12 @@ impl CallRunner {
         );
         // Create MediaSession and Offer
         let srtp_enabled = self.account.srtp_enabled.unwrap_or(false);
+        let webrtc_enabled = self.account.webrtc_enabled.unwrap_or(false);
         let nack_enabled = self.account.nack_enabled.unwrap_or(false);
         let jitter_buffer_enabled = self.account.jitter_buffer_enabled.unwrap_or(false);
         let (media_session, local_sdp) = MediaSession::new_offer(
             srtp_enabled,
+            webrtc_enabled,
             nack_enabled,
             jitter_buffer_enabled,
             self.global_config.external_ip.clone(),
@@ -740,6 +742,31 @@ impl SipBot {
             None
         };
         self.registration = Some(Registration::new(endpoint.inner.clone(), credential));
+
+        // Add +sip.ice Contact param (RFC 5656) when WebRTC is enabled so
+        // rustpbx registrar flags the location as supports_webrtc=true.
+        if self.account.webrtc_enabled.unwrap_or(false) {
+            if let Some(ref mut reg) = self.registration {
+                let username = self.account.username.clone();
+                let contact_uri: rsipstack::sip::Uri = format!(
+                    "sip:{}@{}",
+                    username,
+                    addr
+                )
+                .try_into()?;
+                use rsipstack::sip::Param;
+                use rsipstack::sip::uri::OtherParam;
+                reg.contact = Some(rsipstack::sip::typed::Contact {
+                    display_name: None,
+                    uri: contact_uri,
+                    params: vec![Param::Other(
+                        OtherParam::new("+sip.ice"),
+                        None,
+                    )],
+                });
+                info!("[{}] WebRTC enabled, set +sip.ice in registration contact", username);
+            }
+        }
 
         // Start serving
         let endpoint_inner = endpoint.inner.clone();
@@ -1569,11 +1596,13 @@ impl SipBot {
                 if !offer_body.is_empty() {
                     if let Ok(body_str) = std::str::from_utf8(&offer_body) {
                         let srtp_enabled = account.srtp_enabled.unwrap_or(false);
+                        let webrtc_enabled = account.webrtc_enabled.unwrap_or(false);
                         let nack_enabled = account.nack_enabled.unwrap_or(false);
                         let jitter_buffer_enabled = account.jitter_buffer_enabled.unwrap_or(false);
                         match MediaSession::new(
                             body_str,
                             srtp_enabled,
+                            webrtc_enabled,
                             nack_enabled,
                             jitter_buffer_enabled,
                             global_config.external_ip.clone(),

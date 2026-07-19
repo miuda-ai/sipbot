@@ -35,6 +35,7 @@ pub struct AccountConfig {
     pub target: Option<String>,              // Target URI for outbound calls
     pub record: Option<String>,              // Recording file path
     pub srtp_enabled: Option<bool>,          // Enable SRTP/SDES
+    pub webrtc_enabled: Option<bool>,        // Enable WebRTC media (ICE+DTLS) + +sip.ice contact
     pub nack_enabled: Option<bool>,          // Enable NACK
     pub jitter_buffer_enabled: Option<bool>, // Enable Jitter Buffer
     pub reject_prob: Option<u8>,             // Reject probability (1-99%)

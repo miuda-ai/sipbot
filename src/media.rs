@@ -355,6 +355,7 @@ impl MediaSession {
     pub async fn new(
         remote_sdp: &str,
         srtp_enabled: bool,
+        webrtc_enabled: bool,
         nack_enabled: bool,
         jitter_buffer_enabled: bool,
         external_ip: Option<String>,
@@ -366,7 +367,9 @@ impl MediaSession {
         if let Some(ip) = external_ip {
             config.external_ip = Some(ip);
         }
-        config.transport_mode = if srtp_enabled {
+        config.transport_mode = if webrtc_enabled {
+            TransportMode::WebRtc
+        } else if srtp_enabled {
             TransportMode::Srtp
         } else {
             config.certificates = vec![];
@@ -593,6 +596,7 @@ impl MediaSession {
 
     pub async fn new_offer(
         srtp_enabled: bool,
+        webrtc_enabled: bool,
         nack_enabled: bool,
         jitter_buffer_enabled: bool,
         external_ip: Option<String>,
@@ -605,7 +609,9 @@ impl MediaSession {
         if let Some(ip) = external_ip {
             config.external_ip = Some(ip);
         }
-        config.transport_mode = if srtp_enabled {
+        config.transport_mode = if webrtc_enabled {
+            TransportMode::WebRtc
+        } else if srtp_enabled {
             TransportMode::Srtp
         } else {
             config.certificates = vec![];
@@ -2775,6 +2781,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             None,
             codecs.clone(),
             true,
@@ -2790,7 +2797,7 @@ mod tests {
 
         // Check if we can create an answer session
         let (_answer_session, answer_sdp, _) =
-            MediaSession::new(&sdp, false, false, false, None, codecs, stats, None)
+            MediaSession::new(&sdp, false, false, false, false, None, codecs, stats, None)
                 .await
                 .unwrap();
         assert!(answer_sdp.contains("m=audio"));
@@ -2804,6 +2811,7 @@ mod tests {
         // Create an offer with G.729
         let offer_codecs = Some(vec!["g729".to_string()]);
         let (_offerer, offer_sdp) = MediaSession::new_offer(
+            false,
             false,
             false,
             false,
@@ -2821,6 +2829,7 @@ mod tests {
         // Answer without specifying codecs (should support all by default now)
         let (_answerer, answer_sdp, _) = MediaSession::new(
             &offer_sdp,
+            false,
             false,
             false,
             false,
@@ -2850,7 +2859,8 @@ mod tests {
     async fn test_echo_tracking_independent_from_recorder_tracking() {
         let stats = Arc::new(CallStats::new());
         let (session, _sdp) =
-            MediaSession::new_offer(false, false, false, None, None, false, stats, None)
+            MediaSession::new_offer(false, 
+            false, false, false, None, None, false, stats, None)
                 .await
                 .unwrap();
 
@@ -2889,7 +2899,8 @@ mod tests {
         let stats = Arc::new(CallStats::new());
         let codecs = Some(vec!["pcmu".to_string()]);
         let (_session, sdp) =
-            MediaSession::new_offer(false, false, false, None, codecs, true, stats, None)
+            MediaSession::new_offer(false, 
+            false, false, false, None, codecs, true, stats, None)
                 .await
                 .unwrap();
         // The SDP should contain telephone-event capability
@@ -2908,6 +2919,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             None,
             offer_codecs,
             true,
@@ -2917,7 +2929,7 @@ mod tests {
         .await
         .unwrap();
         let (_answerer, answer_sdp, _) =
-            MediaSession::new(&offer_sdp, false, false, false, None, None, stats, None)
+            MediaSession::new(&offer_sdp, false, false, false, false, None, None, stats, None)
                 .await
                 .unwrap();
         assert!(
