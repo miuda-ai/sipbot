@@ -793,7 +793,7 @@ impl SipBot {
         self.init_endpoint().await?;
 
         // Register
-        if self.account.register.unwrap_or(true) {
+        if self.account.register.unwrap_or(false) {
             self.start_registration_loop().await?;
         }
 
@@ -877,7 +877,7 @@ impl SipBot {
         self.init_endpoint().await?;
 
         // Register
-        if self.account.register.unwrap_or(true) {
+        if self.account.register.unwrap_or(false) {
             self.start_registration_loop().await?;
         }
 
