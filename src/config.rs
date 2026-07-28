@@ -9,6 +9,7 @@ pub struct Config {
     pub addr: Option<String>,
     pub external_ip: Option<String>,
     pub recorders: Option<String>,
+    pub ws_url: Option<String>,
     pub accounts: Vec<AccountConfig>,
 }
 

@@ -8,7 +8,7 @@ use rsipstack::dialog::DialogId;
 use rsipstack::dialog::dialog::{Dialog, DialogState};
 use rsipstack::rsip::headers::ToTypedHeader;
 use rsipstack::rsip::message::HeadersExt;
-use rsipstack::rsip::{Header, Method, StatusCode, Uri};
+use rsipstack::rsip::{Header, Method, StatusCode, Transport, Uri};
 use rsipstack::{
     EndpointBuilder,
     dialog::authenticate::Credential,
@@ -20,8 +20,9 @@ use rsipstack::{
         key::{TransactionKey, TransactionRole},
         transaction::Transaction,
     },
-    transport::{TransportLayer, udp::UdpConnection},
+    transport::{SipAddr, TransportLayer, udp::UdpConnection},
 };
+use rsipstack::sip::{Host, HostWithPort};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -291,9 +292,9 @@ impl CallRunner {
 
         let destination = if let Some(proxy) = &self.account.proxy {
             let proxy_uri = Uri::try_from(normalize_sip_addr(proxy).as_str())?;
-            proxy_uri.host_with_port.clone().into()
+            SipAddr::try_from(&proxy_uri)?
         } else {
-            to.host_with_port.clone().into()
+            SipAddr::try_from(&to)?
         };
 
         let mut custom_headers = vec![];
@@ -688,33 +689,73 @@ impl SipBot {
         }
 
         let transport_layer = TransportLayer::new(self.transport_token.clone());
+        let uses_ws = self.global_config.ws_url.is_some();
 
-        // Bind to configured address or default
-        let addr_str = self
-            .global_config
-            .addr
-            .as_deref()
-            .unwrap_or("0.0.0.0:35060");
-        let addr: std::net::SocketAddr = addr_str.parse().context("Invalid bind address")?;
+        if uses_ws {
+            // ── WebSocket transport mode ──
+            let ws_url = self.global_config.ws_url.as_ref().unwrap();
+            let (transport, host, port, path) = parse_ws_url(ws_url)?;
 
-        let mut udp_conn =
-            UdpConnection::create_connection(addr, None, Some(self.transport_token.clone()))
-                .await?;
-        if let Some(ip) = &self.global_config.external_ip {
-            if let Ok(sock) = udp_conn.get_addr().get_socketaddr() {
-                let external: std::net::SocketAddr = format!("{}:{}", ip, sock.port())
-                    .parse()
-                    .context("Invalid external address")?;
-                udp_conn.external = Some(rsipstack::transport::SipAddr {
-                    r#type: Some(rsipstack::rsip::Transport::Udp),
-                    addr: external.into(),
-                });
+            transport_layer.set_ws_path(&path);
+
+            let host_parsed: Host = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                Host::IpAddr(ip)
+            } else {
+                Host::Domain(host.clone().into())
+            };
+
+            let target = SipAddr {
+                r#type: Some(transport),
+                addr: HostWithPort {
+                    host: host_parsed,
+                    port: Some(port.into()),
+                },
+            };
+
+            // Pre-establish WS connection so its local addr appears in get_addrs
+            // ensuring Via/Contact carry WS transport type.
+            let (_conn, _addr) = transport_layer.lookup(&target, None).await?;
+            info!(
+                "[{}] WebSocket connected to {}",
+                self.account.username, ws_url
+            );
+
+            // Set proxy so registration & invites use WebSocket transport
+            let transport_param = if transport == Transport::Wss { "wss" } else { "ws" };
+            self.account.proxy = Some(format!("{}:{};transport={}", host, port, transport_param));
+
+            // WS transport implies WebRTC mode
+            self.account.webrtc_enabled = Some(true);
+        } else {
+            // ── UDP transport mode (original) ──
+            let addr_str = self
+                .global_config
+                .addr
+                .as_deref()
+                .unwrap_or("0.0.0.0:35060");
+            let addr: std::net::SocketAddr = addr_str.parse().context("Invalid bind address")?;
+
+            let mut udp_conn =
+                UdpConnection::create_connection(addr, None, Some(self.transport_token.clone()))
+                    .await?;
+            if let Some(ip) = &self.global_config.external_ip {
+                if let Ok(sock) = udp_conn.get_addr().get_socketaddr() {
+                    let external: std::net::SocketAddr = format!("{}:{}", ip, sock.port())
+                        .parse()
+                        .context("Invalid external address")?;
+                    udp_conn.external = Some(SipAddr {
+                        r#type: Some(Transport::Udp),
+                        addr: external.into(),
+                    });
+                }
             }
-        }
-        let local_addr = udp_conn.get_addr();
-        info!("[{}] Listening on {}", self.account.username, local_addr);
+            let local_addr = udp_conn.get_addr();
+            info!("[{}] Listening on {}", self.account.username, local_addr);
 
-        transport_layer.add_transport(udp_conn.into());
+            transport_layer.add_transport(udp_conn.into());
+
+            // Store local addr for WebRTC contact later
+        }
 
         let endpoint = EndpointBuilder::new()
             .with_user_agent(&format!("SipBot/{}", env!("CARGO_PKG_VERSION")))
@@ -743,28 +784,30 @@ impl SipBot {
         };
         self.registration = Some(Registration::new(endpoint.inner.clone(), credential));
 
-        // Add +sip.ice Contact param (RFC 5656) when WebRTC is enabled so
-        // rustpbx registrar flags the location as supports_webrtc=true.
-        if self.account.webrtc_enabled.unwrap_or(false) {
+        // Add +sip.ice Contact param (RFC 5656) when WebRTC is enabled over UDP.
+        // For WS transport the server auto-detects WebRTC from the Via/Contact transport.
+        if !uses_ws && self.account.webrtc_enabled.unwrap_or(false) {
             if let Some(ref mut reg) = self.registration {
                 let username = self.account.username.clone();
-                let contact_uri: rsipstack::sip::Uri = format!(
-                    "sip:{}@{}",
-                    username,
-                    addr
-                )
-                .try_into()?;
-                use rsipstack::sip::Param;
-                use rsipstack::sip::uri::OtherParam;
-                reg.contact = Some(rsipstack::sip::typed::Contact {
-                    display_name: None,
-                    uri: contact_uri,
-                    params: vec![Param::Other(
-                        OtherParam::new("+sip.ice"),
-                        None,
-                    )],
-                });
-                info!("[{}] WebRTC enabled, set +sip.ice in registration contact", username);
+                let addrs = endpoint.inner.transport_layer.get_addrs();
+                if let Some(first_addr) = addrs.first() {
+                    if let Ok(sock) = first_addr.get_socketaddr() {
+                        let local_str = format!("sip:{}@{}:{}", username, sock.ip(), sock.port());
+                        if let Ok(contact_uri) = rsipstack::rsip::Uri::try_from(local_str.as_str()) {
+                            use rsipstack::rsip::Param;
+                            use rsipstack::rsip::uri::OtherParam;
+                            reg.contact = Some(rsipstack::rsip::typed::Contact {
+                                display_name: None,
+                                uri: contact_uri,
+                                params: vec![Param::Other(
+                                    OtherParam::new("+sip.ice"),
+                                    None,
+                                )],
+                            });
+                            info!("[{}] WebRTC enabled, set +sip.ice in registration contact", username);
+                        }
+                    }
+                }
             }
         }
 
@@ -2034,6 +2077,51 @@ fn generate_random_string() -> String {
         .duration_since(UNIX_EPOCH)
         .expect("Time went backwards");
     format!("{:x}", since_the_epoch.as_nanos())
+}
+
+/// Parse a WebSocket URL into (Transport, host, port, path).
+///
+/// Supported formats:
+///   wss://host:8443/ws   → (Wss, "host", 8443, "/ws")
+///   ws://host:8080/ws    → (Ws,  "host", 8080, "/ws")
+///   wss://host:8443      → (Wss, "host", 8443, "/ws")   (default path)
+///
+/// Default port: 443 for wss, 80 for ws.
+/// Default path: "/ws".
+fn parse_ws_url(url: &str) -> Result<(Transport, String, u16, String)> {
+    let url = url.trim();
+    let (scheme, rest) = url
+        .split_once("://")
+        .context("Invalid ws-url: missing :// (expected: wss://host:port/path)")?;
+
+    let transport = match scheme {
+        "wss" => Transport::Wss,
+        "ws" => Transport::Ws,
+        _ => anyhow::bail!(
+            "Invalid ws-url scheme '{}': expected 'ws' or 'wss'",
+            scheme
+        ),
+    };
+
+    let (host_port, path) = match rest.find('/') {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, "/ws"),
+    };
+
+    let path = if path.is_empty() { "/ws" } else { path };
+
+    let (host, port) = match host_port.rfind(':') {
+        Some(idx) => (
+            host_port[..idx].to_string(),
+            host_port[idx + 1..].parse::<u16>()?,
+        ),
+        None => (
+            host_port.to_string(),
+            if transport == Transport::Wss { 443u16 } else { 80u16 },
+        ),
+    };
+
+    Ok((transport, host, port, path.to_string()))
 }
 
 #[cfg(test)]

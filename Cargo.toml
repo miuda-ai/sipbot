@@ -16,7 +16,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "1.1.2"
 tracing = "0.1"
 anyhow = "1.0"
-rsipstack = "0.5.22"
+rsipstack = "0.5.23"
 tokio-util = "0.7.18"
 rustrtc = "0.3.102"
 audio-codec = "0.3.40"

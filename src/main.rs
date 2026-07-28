@@ -28,6 +28,11 @@ struct Args {
 
     #[arg(short, long, global = true)]
     verbose: bool,
+
+    /// WebSocket URL for SIP-over-WebSocket (e.g. wss://host:8443/ws).
+    /// Implicitly enables WebRTC mode.
+    #[arg(long, global = true)]
+    ws_url: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -44,10 +49,10 @@ enum Commands {
         #[arg(long)]
         auth_user: Option<String>,
         /// Auth password
-        #[arg(long)]
+        #[arg(short = 'p', long)]
         password: Option<String>,
         /// Register to SIP server before calling (optional domain)
-        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        #[arg(short = 'r', long, num_args = 0..=1, default_missing_value = "")]
         register: Option<String>,
         /// From URI user part for outbound calls (e.g., anonymous)
         #[arg(long)]
@@ -128,7 +133,7 @@ enum Commands {
         #[arg(short, long)]
         password: Option<String>,
         /// Register to SIP server (optional domain)
-        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        #[arg(short = 'r', long, num_args = 0..=1, default_missing_value = "")]
         register: Option<String>,
         /// Ringback file (wav)
         #[arg(long)]
@@ -227,6 +232,7 @@ async fn main() -> Result<()> {
                     addr: Some("0.0.0.0:0".to_string()),
                     external_ip: None,
                     recorders: None,
+                    ws_url: None,
                     accounts: vec![AccountConfig {
                         username: "sipbot".to_string(),
                         auth_username: None,
@@ -270,6 +276,7 @@ async fn main() -> Result<()> {
                     addr: Some(addr.clone().unwrap_or_else(|| "0.0.0.0:0".to_string())),
                     external_ip: None,
                     recorders: None,
+                    ws_url: None,
                     accounts: vec![AccountConfig {
                         username: "sipbot".to_string(),
                         auth_username: None,
@@ -372,6 +379,7 @@ async fn main() -> Result<()> {
                     addr: Some(addr.clone()),
                     external_ip: None,
                     recorders: None,
+                    ws_url: None,
                     accounts: vec![AccountConfig {
                         username: username.clone().unwrap_or("sipbot".to_string()),
                         auth_username: auth_user.clone(),
@@ -683,8 +691,14 @@ async fn main() -> Result<()> {
             account.srtp_enabled = Some(true);
         }
 
-        if webrtc_override {
+        if webrtc_override || args.ws_url.is_some() {
             account.webrtc_enabled = Some(true);
+        }
+
+        if let Some(ws_url) = &args.ws_url {
+            if config.ws_url.as_deref() != Some(ws_url.as_str()) {
+                config.ws_url = Some(ws_url.clone());
+            }
         }
 
         if let Some(nack) = nack_override {

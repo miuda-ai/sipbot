@@ -19,6 +19,7 @@ async fn test_call_flow() -> Result<()> {
         addr: Some(server_addr.to_string()),
         external_ip: None,
         recorders: Some("/tmp/recorders_test".to_string()),
+        ws_url: None,
         accounts: vec![AccountConfig {
             username: "server".to_string(),
             domain: "127.0.0.1".to_string(),
@@ -34,6 +35,7 @@ async fn test_call_flow() -> Result<()> {
         addr: Some(client_addr.to_string()),
         external_ip: None,
         recorders: None,
+        ws_url: None,
         accounts: vec![AccountConfig {
             username: "client".to_string(),
             domain: "127.0.0.1".to_string(),
@@ -114,6 +116,7 @@ async fn test_options_flow() -> Result<()> {
         addr: Some(server_addr.to_string()),
         external_ip: None,
         recorders: None,
+        ws_url: None,
         accounts: vec![AccountConfig {
             username: "server".to_string(),
             domain: "127.0.0.1".to_string(),
@@ -128,6 +131,7 @@ async fn test_options_flow() -> Result<()> {
         addr: Some(client_addr.to_string()),
         external_ip: None,
         recorders: None,
+        ws_url: None,
         accounts: vec![AccountConfig {
             username: "client".to_string(),
             domain: "127.0.0.1".to_string(),
@@ -198,6 +202,7 @@ async fn test_wait_echo_tx_rx_stats() -> Result<()> {
         addr: Some(server_addr.to_string()),
         external_ip: None,
         recorders: None,
+        ws_url: None,
         accounts: vec![AccountConfig {
             username: "server-echo".to_string(),
             domain: "127.0.0.1".to_string(),
@@ -213,6 +218,7 @@ async fn test_wait_echo_tx_rx_stats() -> Result<()> {
         addr: Some(client_addr.to_string()),
         external_ip: None,
         recorders: None,
+        ws_url: None,
         accounts: vec![AccountConfig {
             username: "client-echo".to_string(),
             domain: "127.0.0.1".to_string(),
