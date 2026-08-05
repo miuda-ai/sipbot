@@ -29,7 +29,7 @@ impl CsvStatsRecorder {
 
     /// Write CSV header
     async fn write_header(&self, file: &mut tokio::fs::File) -> Result<()> {
-        let header = "timestamp,elapsed_time_ms,total_planned,total_calls,current_calls,finished_calls,c200_count,c180_count,c183_count,c3xx_count,c4xx_count,c5xx_count,c6xx_count,avg_duration_ms,avg_setup_latency_ms,avg_rtcp_rtt_ms,tx_packets,rx_packets,tx_bytes,rx_bytes,rx_lost_packets,packet_loss_rate_pct,nack_sent,nack_recv,nack_recovered\n";
+        let header = "timestamp,elapsed_time_ms,total_planned,total_calls,current_calls,finished_calls,c200_count,c180_count,c183_count,c3xx_count,c4xx_count,c5xx_count,c6xx_count,avg_duration_ms,avg_setup_latency_ms,avg_rtcp_rtt_ms,tx_packets,rx_packets,tx_bytes,rx_bytes,rx_lost_packets,packet_loss_rate_pct,nack_sent,nack_recv,nack_recovered,audio_quality_silence_frames,audio_quality_clipping_frames,audio_quality_total_frames,audio_quality_shrill_count,audio_quality_muffled_count,rx_dtmf_events,tx_dtmf_events,seq_gap_events,seq_gap_total,seq_gap_max,seq_reorder_events,ts_jump_events,ts_jump_ms_total,ts_jump_ms_max,stream_switch_events\n";
         file.write_all(header.as_bytes()).await?;
         file.flush().await?;
         Ok(())
@@ -106,8 +106,27 @@ impl CsvStatsRecorder {
         let nack_recv = self.stats.nack_recv.load(Ordering::Relaxed);
         let nack_recovered = self.stats.nack_recovered.load(Ordering::Relaxed);
 
+        // Audio quality + DTMF stats
+        let aq_silence = self.stats.audio_quality_silence_frames.load(Ordering::Relaxed);
+        let aq_clipping = self.stats.audio_quality_clipping_frames.load(Ordering::Relaxed);
+        let aq_total = self.stats.audio_quality_total_frames.load(Ordering::Relaxed);
+        let aq_shrill = self.stats.audio_quality_shrill_count.load(Ordering::Relaxed);
+        let aq_muffled = self.stats.audio_quality_muffled_count.load(Ordering::Relaxed);
+        let rx_dtmf = self.stats.rx_dtmf_events.load(Ordering::Relaxed);
+        let tx_dtmf = self.stats.tx_dtmf_events.load(Ordering::Relaxed);
+
+        // Media-continuity (seq/ts jump) stats
+        let seq_gap_events = self.stats.seq_gap_events.load(Ordering::Relaxed);
+        let seq_gap_total = self.stats.seq_gap_total.load(Ordering::Relaxed);
+        let seq_gap_max = self.stats.seq_gap_max.load(Ordering::Relaxed);
+        let seq_reorder = self.stats.seq_reorder_events.load(Ordering::Relaxed);
+        let ts_jump_events = self.stats.ts_jump_events.load(Ordering::Relaxed);
+        let ts_jump_ms_total = self.stats.ts_jump_ms_total.load(Ordering::Relaxed);
+        let ts_jump_ms_max = self.stats.ts_jump_ms_max.load(Ordering::Relaxed);
+        let stream_switch = self.stats.stream_switch_events.load(Ordering::Relaxed);
+
         format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{:.2},{:.2},{:.2},{},{},{},{},{},{:.2},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{:.2},{:.2},{:.2},{},{},{},{},{},{:.2},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             timestamp,
             elapsed_ms,
             total_planned,
@@ -132,7 +151,22 @@ impl CsvStatsRecorder {
             loss_rate,
             nack_sent,
             nack_recv,
-            nack_recovered
+            nack_recovered,
+            aq_silence,
+            aq_clipping,
+            aq_total,
+            aq_shrill,
+            aq_muffled,
+            rx_dtmf,
+            tx_dtmf,
+            seq_gap_events,
+            seq_gap_total,
+            seq_gap_max,
+            seq_reorder,
+            ts_jump_events,
+            ts_jump_ms_total,
+            ts_jump_ms_max,
+            stream_switch
         )
     }
 
@@ -292,6 +326,30 @@ NACK Statistics
 NACK Sent: {}
 NACK Received: {}
 NACK Recovered: {}
+
+Audio Quality
+-------------
+Total Frames: {}
+Silence Frames: {}
+Clipping Frames: {}
+Shrill Count: {}
+Muffled Count: {}
+
+DTMF Events
+-----------
+RX DTMF Events: {}
+TX DTMF Events: {}
+
+Media Continuity (seq/ts jumps — audio-glitch warnings)
+-------------------------------------------------------
+Seq Gap Events: {}
+Seq Gap Total (lost pkts): {}
+Seq Gap Max: {}
+Seq Reorder Events: {}
+TS Jump Events: {}
+TS Jump Total (ms): {}
+TS Jump Max (ms): {}
+Stream Switch Events: {}
 "#,
         tx_packets,
         rx_packets,
@@ -301,7 +359,22 @@ NACK Recovered: {}
         loss_rate,
         stats.nack_sent.load(Ordering::Relaxed),
         stats.nack_recv.load(Ordering::Relaxed),
-        stats.nack_recovered.load(Ordering::Relaxed)
+        stats.nack_recovered.load(Ordering::Relaxed),
+        stats.audio_quality_total_frames.load(Ordering::Relaxed),
+        stats.audio_quality_silence_frames.load(Ordering::Relaxed),
+        stats.audio_quality_clipping_frames.load(Ordering::Relaxed),
+        stats.audio_quality_shrill_count.load(Ordering::Relaxed),
+        stats.audio_quality_muffled_count.load(Ordering::Relaxed),
+        stats.rx_dtmf_events.load(Ordering::Relaxed),
+        stats.tx_dtmf_events.load(Ordering::Relaxed),
+        stats.seq_gap_events.load(Ordering::Relaxed),
+        stats.seq_gap_total.load(Ordering::Relaxed),
+        stats.seq_gap_max.load(Ordering::Relaxed),
+        stats.seq_reorder_events.load(Ordering::Relaxed),
+        stats.ts_jump_events.load(Ordering::Relaxed),
+        stats.ts_jump_ms_total.load(Ordering::Relaxed),
+        stats.ts_jump_ms_max.load(Ordering::Relaxed),
+        stats.stream_switch_events.load(Ordering::Relaxed)
     );
 
     file.write_all(rtp_summary.as_bytes()).await?;

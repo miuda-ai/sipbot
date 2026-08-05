@@ -244,6 +244,15 @@ impl AudioQualityAnalyzer {
             avg_rms, avg_tilt, avg_clip * 100.0
         )
     }
+
+    /// Emit the accumulated summary (with the given media-continuity jump
+    /// string) once per report interval, at info level, so external tools can
+    /// grep `mismatch=N` and the seq/ts jump counters from the logs.
+    pub fn maybe_log_summary(&self, jumps: &str) {
+        if self.config.enabled && self.frame_count % self.config.report_interval == 0 {
+            tracing::info!("[AudioQuality] {} jumps=[{}]", self.summary(), jumps);
+        }
+    }
 }
 
 fn report_periodic(enabled: bool, frame_count: usize, interval: usize, report: &AudioQualityReport) {

@@ -1,4 +1,5 @@
 use crate::audio_quality::{AudioQualityAnalyzer, AudioQualityConfig};
+use crate::config::DEFAULT_TS_JUMP_TOLERANCE_MS;
 use crate::dtmf;
 use crate::recorder::Recorder;
 use crate::stats::CallStats;
@@ -30,7 +31,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 fn create_encoder_for(ct: CodecType, channels: u16) -> Box<dyn audio_codec::Encoder> {
     if ct == CodecType::Opus {
@@ -289,9 +290,13 @@ pub struct MediaSession {
     echo_tracked_mids: Arc<Mutex<std::collections::HashSet<String>>>,
     cancel_token: CancellationToken,
     telephone_event_pt: Arc<std::sync::atomic::AtomicU8>,
+    telephone_event_clock_rate: Arc<std::sync::atomic::AtomicU32>,
     audio_quality_enabled: bool,
     audio_quality_config: Option<AudioQualityConfig>,
     audio_silent: Arc<std::sync::atomic::AtomicBool>,
+    /// RTP timestamp-jump tolerance in milliseconds. Any forward/backward
+    /// deviation beyond this counts as a `ts_jump` (audio-glitch warning).
+    ts_jump_tolerance_ms: u32,
 }
 
 impl MediaSession {
@@ -362,6 +367,7 @@ impl MediaSession {
         codecs: Option<Vec<String>>,
         stats: Arc<CallStats>,
         _audio_quality_config: Option<AudioQualityConfig>,
+        ts_jump_tolerance_ms: u32,
     ) -> Result<(Self, String, String)> {
         let mut config = RtcConfiguration::default();
         if let Some(ip) = external_ip {
@@ -501,9 +507,12 @@ impl MediaSession {
             anyhow::bail!("Failed to generate valid audio answer SDP: {}", local_sdp);
         }
 
-        let telephone_event_pt =
-            dtmf::parse_telephone_event_pt(remote_sdp).unwrap_or(dtmf::DTMF_TELEPHONE_EVENT_PT);
-        let local_sdp = inject_telephone_event_sdp(&local_sdp, telephone_event_pt);
+        let audio_clock = match chosen_codec_name.to_lowercase().as_str() {
+            "opus" => 48000,
+            _ => 8000,
+        };
+        let telephone_event = pick_telephone_event(remote_sdp, audio_clock);
+        let local_sdp = inject_telephone_event_sdp(&local_sdp, telephone_event);
 
         let cancel_token = CancellationToken::new();
         let session = Self {
@@ -526,13 +535,17 @@ impl MediaSession {
             tracked_mids: Arc::new(Mutex::new(std::collections::HashSet::new())),
             echo_tracked_mids: Arc::new(Mutex::new(std::collections::HashSet::new())),
             cancel_token: cancel_token.clone(),
-            telephone_event_pt: Arc::new(std::sync::atomic::AtomicU8::new(telephone_event_pt)),
+            telephone_event_pt: Arc::new(std::sync::atomic::AtomicU8::new(telephone_event.pt)),
+            telephone_event_clock_rate: Arc::new(std::sync::atomic::AtomicU32::new(
+                telephone_event.clock_rate,
+            )),
             audio_quality_enabled: _audio_quality_config
                 .as_ref()
                 .map(|c| c.enabled)
                 .unwrap_or(false),
             audio_quality_config: _audio_quality_config.clone(),
             audio_silent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ts_jump_tolerance_ms,
         };
 
         // Spawn a background task to listen for incoming track events so there is
@@ -604,6 +617,7 @@ impl MediaSession {
         send_audio: bool,
         stats: Arc<CallStats>,
         _audio_quality_config: Option<AudioQualityConfig>,
+        ts_jump_tolerance_ms: u32,
     ) -> Result<(Self, String)> {
         let mut config = RtcConfiguration::default();
         if let Some(ip) = external_ip {
@@ -618,6 +632,14 @@ impl MediaSession {
             TransportMode::Rtp
         };
         let audio_caps = get_audio_caps(&codecs, nack_enabled);
+        let audio_clock = match audio_caps
+            .first()
+            .map(|a| a.codec_name.to_lowercase())
+            .as_deref()
+        {
+            Some("opus") => 48000,
+            _ => 8000,
+        };
         config.rtcp_mux_policy = RtcpMuxPolicy::Negotiate;
         // config.bundle_policy = BundlePolicy::MaxBundle;
         config.ice_servers = vec![];
@@ -675,8 +697,11 @@ impl MediaSession {
             anyhow::bail!("Failed to generate valid audio offer SDP: {}", local_sdp);
         }
 
-        let telephone_event_pt = dtmf::DTMF_TELEPHONE_EVENT_PT;
-        let local_sdp = inject_telephone_event_sdp(&local_sdp, telephone_event_pt);
+        let telephone_event = dtmf::TelephoneEventInfo {
+            pt: dtmf::DTMF_TELEPHONE_EVENT_PT,
+            clock_rate: audio_clock,
+        };
+        let local_sdp = inject_telephone_event_sdp(&local_sdp, telephone_event);
 
         let cancel_token = CancellationToken::new();
         let session = Self {
@@ -699,13 +724,17 @@ impl MediaSession {
             tracked_mids: Arc::new(Mutex::new(std::collections::HashSet::new())),
             echo_tracked_mids: Arc::new(Mutex::new(std::collections::HashSet::new())),
             cancel_token,
-            telephone_event_pt: Arc::new(std::sync::atomic::AtomicU8::new(telephone_event_pt)),
+            telephone_event_pt: Arc::new(std::sync::atomic::AtomicU8::new(telephone_event.pt)),
+            telephone_event_clock_rate: Arc::new(std::sync::atomic::AtomicU32::new(
+                telephone_event.clock_rate,
+            )),
             audio_quality_enabled: _audio_quality_config
                 .as_ref()
                 .map(|c| c.enabled)
                 .unwrap_or(false),
             audio_quality_config: _audio_quality_config.clone(),
             audio_silent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ts_jump_tolerance_ms,
         };
 
         session.spawn_rtcp_rtt_collectors();
@@ -793,7 +822,11 @@ impl MediaSession {
             .to_sdp_string();
 
         let pt = self.telephone_event_pt.load(Ordering::Relaxed);
-        Ok(inject_telephone_event_sdp(&local, pt))
+        let clock_rate = self.telephone_event_clock_rate.load(Ordering::Relaxed);
+        Ok(inject_telephone_event_sdp(
+            &local,
+            dtmf::TelephoneEventInfo { pt, clock_rate },
+        ))
     }
 
     pub async fn set_remote_answer(&self, remote_sdp: &str) -> Result<String> {
@@ -814,9 +847,14 @@ impl MediaSession {
 
         self.pc.set_remote_description(remote_desc).await?;
 
-        if let Some(pt) = dtmf::parse_telephone_event_pt(remote_sdp) {
-            self.telephone_event_pt.store(pt, Ordering::Relaxed);
-            info!("[DTMF] Remote supports telephone-event at PT {}", pt);
+        if let Some(info) = dtmf::parse_telephone_events(remote_sdp).first() {
+            self.telephone_event_pt.store(info.pt, Ordering::Relaxed);
+            self.telephone_event_clock_rate
+                .store(info.clock_rate, Ordering::Relaxed);
+            info!(
+                "[DTMF] Remote supports telephone-event at PT {} ({} Hz)",
+                info.pt, info.clock_rate
+            );
         }
 
         Ok(self.get_codec_name_from_sdp(remote_sdp))
@@ -853,7 +891,11 @@ impl MediaSession {
         }
 
         let pt = self.telephone_event_pt.load(Ordering::Relaxed);
-        Ok(inject_telephone_event_sdp(&local_sdp, pt))
+        let clock_rate = self.telephone_event_clock_rate.load(Ordering::Relaxed);
+        Ok(inject_telephone_event_sdp(
+            &local_sdp,
+            dtmf::TelephoneEventInfo { pt, clock_rate },
+        ))
     }
 
     pub fn get_negotiated_codec(&self) -> String {
@@ -907,6 +949,21 @@ impl MediaSession {
                 spawn_track_recorder(self.clone(), receiver.track(), child_token.clone());
             }
         }
+    }
+
+    /// Start observing inbound RTP on existing transceivers so that RX packet
+    /// stats accumulate even during early media (183 Session Progress), before
+    /// the call is answered with a 200 OK. This lets callers observe audio that
+    /// the remote plays as early media (ringback, busy, reject, ... tones).
+    ///
+    /// Idempotent: transceivers already tracked for recording are skipped.
+    pub async fn start_rx_observer(
+        &self,
+        username: String,
+    ) -> tokio::task::JoinHandle<()> {
+        let child_token = self.cancel_token.child_token();
+        self.setup_transceivers_for_recording(child_token.clone()).await;
+        self.spawn_track_event_handler(username, child_token)
     }
 
     /// Initialize recording if path is provided
@@ -969,6 +1026,7 @@ impl MediaSession {
         let audio_quality_enabled = self.audio_quality_enabled;
         let audio_quality_config = self.audio_quality_config.clone();
         let audio_silent = self.audio_silent.clone();
+        let ts_jump_tolerance_ms = self.ts_jump_tolerance_ms;
 
         tokio::spawn(async move {
             let mut decoder: Option<Box<dyn Decoder + Send>> = None;
@@ -1026,6 +1084,9 @@ impl MediaSession {
                                             if let Some(ev) = dtmf::decode_dtmf(&frame.data) {
                                                 if let Some(digit) = dtmf::event_to_digit(ev.event) {
                                                     info!("[{}] RX DTMF (jb): digit='{}' event={} end={}", username, digit, ev.event, ev.end);
+                                                    if ev.end {
+                                                        println!("RX_DTMF_DIGIT: {}", digit);
+                                                    }
                                                     stats.inc_rx_dtmf();
                                                 }
                                             }
@@ -1076,6 +1137,7 @@ impl MediaSession {
                                         te_pt,
                                         aq.as_mut(),
                                         &audio_silent,
+                                        ts_jump_tolerance_ms,
                                     )
                                     .await;
                                 }
@@ -1104,6 +1166,9 @@ impl MediaSession {
                                                 if let Some(ev) = dtmf::decode_dtmf(&frame.data) {
                                                     if let Some(digit) = dtmf::event_to_digit(ev.event) {
                                                         info!("[{}] RX DTMF: digit='{}' event={} end={}", username, digit, ev.event, ev.end);
+                                                        if ev.end {
+                                                            println!("RX_DTMF_DIGIT: {}", digit);
+                                                        }
                                                         stats.inc_rx_dtmf();
                                                     }
                                                 }
@@ -1154,6 +1219,7 @@ impl MediaSession {
                                             te_pt,
                                             aq.as_mut(),
                                             &audio_silent,
+                                            ts_jump_tolerance_ms,
                                         )
                                         .await;
                                     }
@@ -1172,6 +1238,88 @@ impl MediaSession {
         });
     }
 
+    /// Record a forward sequence gap (loss burst) or out-of-order packet and
+    /// surface a WARN — the raw signal for choppy audio. Preserves the original
+    /// `last_seq` update semantics (out-of-order packets do not move it).
+    fn record_seq_gap(stats: &CallStats, last_seq: &mut Option<u16>, seq: u16, username: &str) {
+        if let Some(last) = *last_seq {
+            let expected = last.wrapping_add(1);
+            if seq != expected {
+                let diff = seq.wrapping_sub(last) as i16;
+                if diff > 1 {
+                    let gap = (diff - 1) as u64;
+                    warn!(
+                        "[{}] Sequence gap detected: last={} current={} gap={}",
+                        username, last, seq, gap
+                    );
+                    stats.inc_rx_lost(gap);
+                    stats.inc_seq_gap(gap);
+                    *last_seq = Some(seq);
+                } else if diff < 0 {
+                    // Out of order packet; don't advance last_seq.
+                    stats.inc_seq_reorder();
+                }
+            } else {
+                *last_seq = Some(seq);
+            }
+        } else {
+            *last_seq = Some(seq);
+        }
+    }
+
+    /// Detect and record an RTP timestamp discontinuity relative to the
+    /// expected (`last + ticks`) value. Jumps within `tolerance` are normal;
+    /// larger jumps up to 10s are glitch warnings (`ts_jump`); anything beyond
+    /// 10s is a stream switch that resets the receiver's jitter buffer.
+    fn record_ts_jump(
+        stats: &CallStats,
+        last_ts: u32,
+        frame_ts: u32,
+        expected_ts: u32,
+        rtp_clock_rate: u32,
+        tolerance_ms: u32,
+        username: &str,
+    ) {
+        let max_reasonable_jump: u32 = rtp_clock_rate * 10;
+        let tolerance_ticks = (rtp_clock_rate * tolerance_ms) / 1000;
+        let ts_diff = frame_ts.wrapping_sub(expected_ts);
+
+        if ts_diff > max_reasonable_jump && ts_diff < (u32::MAX / 2) {
+            // Huge forward jump → stream switch.
+            stats.inc_stream_switch();
+            warn!(
+                "[{}] Stream switch (forward ts jump {}s), jitter buffer resets",
+                username,
+                ts_diff / rtp_clock_rate
+            );
+        } else if ts_diff > (u32::MAX / 2) {
+            // Backward jump.
+            let backward = last_ts.wrapping_sub(frame_ts);
+            if backward > max_reasonable_jump {
+                stats.inc_stream_switch();
+                warn!(
+                    "[{}] Stream switch (backward ts jump -{}s), jitter buffer resets",
+                    username,
+                    backward / rtp_clock_rate
+                );
+            } else if backward > tolerance_ticks {
+                let ms = (backward as u64 * 1000) / rtp_clock_rate as u64;
+                stats.inc_ts_jump(ms);
+                warn!(
+                    "[{}] Timestamp backward jump: {}ms (tolerance {}ms) — possible audio glitch",
+                    username, ms, tolerance_ms
+                );
+            }
+        } else if ts_diff > tolerance_ticks {
+            let ms = (ts_diff as u64 * 1000) / rtp_clock_rate as u64;
+            stats.inc_ts_jump(ms);
+            warn!(
+                "[{}] Timestamp forward jump: {}ms (tolerance {}ms) — possible audio glitch",
+                username, ms, tolerance_ms
+            );
+        }
+    }
+
     async fn process_sample(
         username: &str,
         mut sample: MediaSample,
@@ -1187,6 +1335,7 @@ impl MediaSession {
         telephone_event_pt: Option<u8>,
         audio_quality: Option<&mut AudioQualityAnalyzer>,
         audio_silent: &Arc<std::sync::atomic::AtomicBool>,
+        tolerance_ms: u32,
     ) {
         // Check for DTMF telephone-event packets
         if let MediaSample::Audio(ref frame) = sample {
@@ -1198,6 +1347,9 @@ impl MediaSession {
                                 "[{}] RX DTMF: digit='{}' event={} end={}",
                                 username, digit, ev.event, ev.end
                             );
+                            if ev.end {
+                                println!("RX_DTMF_DIGIT: {}", digit);
+                            }
                             stats.inc_rx_dtmf();
                         }
                     }
@@ -1275,6 +1427,17 @@ impl MediaSession {
                             frame.rtp_timestamp = expected_ts;
                         }
                     }
+
+                    // Count any smaller discontinuity as a glitch warning.
+                    Self::record_ts_jump(
+                        stats,
+                        last_ts,
+                        frame.rtp_timestamp,
+                        expected_ts,
+                        rtp_clock_rate,
+                        tolerance_ms,
+                        username,
+                    );
                 }
             }
         }
@@ -1283,25 +1446,7 @@ impl MediaSession {
         {
             if let MediaSample::Audio(frame) = &sample {
                 if let Some(seq) = frame.sequence_number {
-                    if let Some(last) = *last_seq {
-                        let expected = last.wrapping_add(1);
-                        if seq != expected {
-                            let diff = seq.wrapping_sub(last) as i16;
-
-                            if diff > 1 {
-                                // Gap detected, these are lost
-                                stats.inc_rx_lost((diff - 1) as u64);
-                                *last_seq = Some(seq);
-                            } else if diff < 0 {
-                                // Out of order packet
-                                // We don't increment recovered here because sync_nack_stats handles it from rustrtc
-                            }
-                        } else {
-                            *last_seq = Some(seq);
-                        }
-                    } else {
-                        *last_seq = Some(seq);
-                    }
+                    Self::record_seq_gap(stats, last_seq, seq, username);
                 }
 
                 // Update last timestamp
@@ -1329,6 +1474,7 @@ impl MediaSession {
                             if r.is_silence { 1 } else { 0 },
                             1,
                         );
+                        aq.maybe_log_summary(&stats.jump_stats_line());
                     }
                 }
 
@@ -2090,8 +2236,9 @@ impl MediaSession {
         Ok(())
     }
 
-    pub async fn start_echo(&self, username: String, _recording_path: Option<&Path>) -> Result<()> {
+    pub async fn start_echo(&self, username: String, recording_path: Option<&Path>) -> Result<()> {
         info!("[{}] Starting echo service", username);
+        self.init_recorder(&username, recording_path).await;
 
         // Handle existing transceivers
         let transceivers = self.pc.get_transceivers();
@@ -2256,21 +2403,41 @@ fn resample_audio(
     Ok(buf)
 }
 
-fn inject_telephone_event_sdp(sdp: &str, pt: u8) -> String {
+/// Choose the telephone-event payload type/clock to advertise in an answer.
+///
+/// RFC 4733: telephone-event must share the negotiated audio codec's clock
+/// rate (48000 for opus, 8000 otherwise). Prefer an offered telephone-event
+/// whose clock rate matches, keeping its PT and rate verbatim (RFC 3264
+/// forbids redefining an offered PT with a different clock). Fall back to the
+/// first offered telephone-event, then to a fresh default PT at the audio
+/// clock.
+fn pick_telephone_event(remote_sdp: &str, audio_clock: u32) -> dtmf::TelephoneEventInfo {
+    let offered = dtmf::parse_telephone_events(remote_sdp);
+    offered
+        .iter()
+        .find(|e| e.clock_rate == audio_clock)
+        .or_else(|| offered.first())
+        .copied()
+        .unwrap_or(dtmf::TelephoneEventInfo {
+            pt: dtmf::DTMF_TELEPHONE_EVENT_PT,
+            clock_rate: audio_clock,
+        })
+}
+
+fn inject_telephone_event_sdp(sdp: &str, info: dtmf::TelephoneEventInfo) -> String {
     if sdp.to_lowercase().contains("telephone-event") {
         return sdp.to_string();
     }
-    let pt_str = pt.to_string();
+    let pt_str = info.pt.to_string();
     let mut out = String::new();
     for line in sdp.lines() {
         if line.to_lowercase().starts_with("m=audio") {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 4 {
-                let mut new = parts[..3].join(" ");
+                // Append telephone-event after the audio codecs (keep the
+                // audio codec first in the answer, per RFC 3264 ordering).
+                let mut new = parts.join(" ");
                 new.push_str(&format!(" {}", pt_str));
-                for p in &parts[3..] {
-                    new.push_str(&format!(" {}", p));
-                }
                 out.push_str(&new);
                 out.push('\n');
             } else {
@@ -2280,9 +2447,9 @@ fn inject_telephone_event_sdp(sdp: &str, pt: u8) -> String {
         } else if line.starts_with("a=rtpmap:") {
             out.push_str(line);
             out.push('\n');
-            out.push_str(&dtmf::build_rtpmap_line(pt));
+            out.push_str(&dtmf::build_rtpmap_line(info.pt, info.clock_rate));
             out.push('\n');
-            out.push_str(&dtmf::build_fmtp_line(pt));
+            out.push_str(&dtmf::build_fmtp_line(info.pt));
             out.push('\n');
         } else {
             out.push_str(line);
@@ -2303,6 +2470,7 @@ fn spawn_track_recorder(
     let telephone_event_pt = session.telephone_event_pt.load(Ordering::Relaxed);
     let audio_quality_enabled = session.audio_quality_enabled;
     let audio_quality_config = session.audio_quality_config.clone();
+    let ts_jump_tolerance_ms = session.ts_jump_tolerance_ms;
     #[cfg(feature = "local-device")]
     let local_playback_tx = session.local_playback_tx.clone();
     #[cfg(feature = "local-device")]
@@ -2361,6 +2529,9 @@ fn spawn_track_recorder(
                                         if let Some(ev) = dtmf::decode_dtmf(&frame.data) {
                                             if let Some(digit) = dtmf::event_to_digit(ev.event) {
                                                 info!("[RX] DTMF (jb): digit='{}' event={} end={}", digit, ev.event, ev.end);
+                                                if ev.end {
+                                                    println!("RX_DTMF_DIGIT: {}", digit);
+                                                }
                                                 stats.inc_rx_dtmf();
                                             }
                                         }
@@ -2423,6 +2594,7 @@ fn spawn_track_recorder(
                                         ct.samplerate(),
                                         te_pt,
                                         aq.as_mut(),
+                                        ts_jump_tolerance_ms,
                                     )
                                     .await;
                                 }
@@ -2450,8 +2622,11 @@ fn spawn_track_recorder(
                                         if frame.data.len() >= 4 {
                                             if let Some(ev) = dtmf::decode_dtmf(&frame.data) {
                                                 if let Some(digit) = dtmf::event_to_digit(ev.event) {
-                                                    info!("[RX] DTMF: digit='{}' event={} end={}", digit, ev.event, ev.end);
-                                                    stats.inc_rx_dtmf();
+                                                info!("[RX] DTMF: digit='{}' event={} end={}", digit, ev.event, ev.end);
+                                                if ev.end {
+                                                    println!("RX_DTMF_DIGIT: {}", digit);
+                                                }
+                                                stats.inc_rx_dtmf();
                                                 }
                                             }
                                         }
@@ -2513,6 +2688,7 @@ fn spawn_track_recorder(
                                         ct.samplerate(),
                                         te_pt,
                                         aq.as_mut(),
+                                        ts_jump_tolerance_ms,
                                     )
                                     .await;
                                 }
@@ -2544,6 +2720,7 @@ async fn process_recorded_sample(
     actual_sample_rate: u32,
     _telephone_event_pt: Option<u8>,
     audio_quality: Option<&mut AudioQualityAnalyzer>,
+    tolerance_ms: u32,
 ) {
     let decoded = if let MediaSample::Audio(ref frame) = sample {
         let decoded_data = decoder.decode(&frame.data);
@@ -2571,30 +2748,26 @@ async fn process_recorded_sample(
     };
 
     if let MediaSample::Audio(frame) = &sample {
-        if let Some(seq) = frame.sequence_number {
-            if let Some(last) = *last_seq {
-                let expected = last.wrapping_add(1);
-                if seq != expected {
-                    let diff = seq.wrapping_sub(last) as i16;
-
-                    if diff > 1 {
-                        tracing::warn!(
-                            "Sequence gap detected: last={} current={} gap={}",
-                            last,
-                            seq,
-                            diff - 1
-                        );
-                        stats.inc_rx_lost((diff - 1) as u64);
-                        *last_seq = Some(seq);
-                    } else if diff < 0 {
-                        tracing::debug!("Out of order packet: last={} current={}", last, seq);
-                    }
-                } else {
-                    *last_seq = Some(seq);
-                }
-            } else {
-                *last_seq = Some(seq);
+        // Timestamp continuity: count discontinuities (audio-glitch warning).
+        if let Some(ref decoded_data) = decoded {
+            if let Some(last_ts) = *last_timestamp {
+                let ticks = (decoded_data.len() as u64 * rtp_clock_rate as u64
+                    / actual_sample_rate as u64) as u32;
+                let expected_ts = last_ts.wrapping_add(ticks);
+                MediaSession::record_ts_jump(
+                    stats,
+                    last_ts,
+                    frame.rtp_timestamp,
+                    expected_ts,
+                    rtp_clock_rate,
+                    tolerance_ms,
+                    "RX",
+                );
             }
+        }
+
+        if let Some(seq) = frame.sequence_number {
+            MediaSession::record_seq_gap(stats, last_seq, seq, "RX");
         }
 
         // Update last timestamp
@@ -2620,6 +2793,7 @@ async fn process_recorded_sample(
                 if r.is_silence { 1 } else { 0 },
                 1,
             );
+            aq.maybe_log_summary(&stats.jump_stats_line());
         }
 
         if frame.sequence_number.unwrap_or(0) % 100 == 0 {
@@ -2787,6 +2961,7 @@ mod tests {
             true,
             stats.clone(),
             None,
+            DEFAULT_TS_JUMP_TOLERANCE_MS,
         )
         .await
         .unwrap();
@@ -2797,8 +2972,19 @@ mod tests {
 
         // Check if we can create an answer session
         let (_answer_session, answer_sdp, _) =
-            MediaSession::new(&sdp, false, false, false, false, None, codecs, stats, None)
-                .await
+            MediaSession::new(
+                &sdp,
+                false,
+                false,
+                false,
+                false,
+                None,
+                codecs,
+                stats,
+                None,
+                DEFAULT_TS_JUMP_TOLERANCE_MS,
+            )
+            .await
                 .unwrap();
         assert!(answer_sdp.contains("m=audio"));
         assert!(answer_sdp.contains("a=sendrecv"));
@@ -2820,6 +3006,7 @@ mod tests {
             true,
             stats.clone(),
             None,
+            DEFAULT_TS_JUMP_TOLERANCE_MS,
         )
         .await
         .unwrap();
@@ -2837,6 +3024,7 @@ mod tests {
             None,
             stats.clone(),
             None,
+            DEFAULT_TS_JUMP_TOLERANCE_MS,
         )
         .await
         .unwrap();
@@ -2859,8 +3047,18 @@ mod tests {
     async fn test_echo_tracking_independent_from_recorder_tracking() {
         let stats = Arc::new(CallStats::new());
         let (session, _sdp) =
-            MediaSession::new_offer(false, 
-            false, false, false, None, None, false, stats, None)
+            MediaSession::new_offer(
+                false,
+                false,
+                false,
+                false,
+                None,
+                None,
+                false,
+                stats,
+                None,
+                DEFAULT_TS_JUMP_TOLERANCE_MS,
+            )
                 .await
                 .unwrap();
 
@@ -2875,16 +3073,35 @@ mod tests {
     #[test]
     fn test_inject_telephone_event_sdp_adds_rtpmap() {
         let sdp = "v=0\nm=audio 4000 RTP/AVP 0 8\nc=IN IP4 127.0.0.1\na=rtpmap:0 PCMU/8000\n";
-        let result = inject_telephone_event_sdp(sdp, 101);
+        let result = inject_telephone_event_sdp(
+            sdp,
+            dtmf::TelephoneEventInfo { pt: 101, clock_rate: 8000 },
+        );
         assert!(result.contains("telephone-event"));
         assert!(result.contains("a=rtpmap:101 telephone-event/8000"));
         assert!(result.contains("a=fmtp:101 0-16"));
+        // Appended after the audio codec (audio stays first in the m-line).
+        assert!(result.contains("m=audio 4000 RTP/AVP 0 8 101"));
+    }
+
+    #[test]
+    fn test_inject_telephone_event_sdp_opus_clock() {
+        let sdp = "v=0\nm=audio 5000 RTP/AVP 111\nc=IN IP4 127.0.0.1\na=rtpmap:111 opus/48000/2\n";
+        let result = inject_telephone_event_sdp(
+            sdp,
+            dtmf::TelephoneEventInfo { pt: 110, clock_rate: 48000 },
+        );
+        assert!(result.contains("a=rtpmap:110 telephone-event/48000"));
+        assert!(result.contains("m=audio 5000 RTP/AVP 111 110"));
     }
 
     #[test]
     fn test_inject_telephone_event_sdp_no_duplicate() {
         let sdp = "v=0\nm=audio 4000 RTP/AVP 0 101\nc=IN IP4 127.0.0.1\na=rtpmap:0 PCMU/8000\na=rtpmap:101 telephone-event/8000\n";
-        let result = inject_telephone_event_sdp(sdp, 101);
+        let result = inject_telephone_event_sdp(
+            sdp,
+            dtmf::TelephoneEventInfo { pt: 101, clock_rate: 8000 },
+        );
         // Count occurrences of telephone-event in result (should be exactly 1)
         let count = result.matches("telephone-event").count();
         assert_eq!(
@@ -2894,13 +3111,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_pick_telephone_event_opus_prefers_matching_rate() {
+        let remote_sdp = "v=0\nm=audio 24660 UDP/TLS/RTP/SAVPF 111 9 0 8 13 110 126\n\
+            a=rtpmap:111 opus/48000/2\n\
+            a=rtpmap:9 G722/8000\n\
+            a=rtpmap:110 telephone-event/48000\n\
+            a=rtpmap:126 telephone-event/8000\n";
+        // opus audio → prefer the 48 kHz telephone-event (110), verbatim.
+        let info = pick_telephone_event(remote_sdp, 48000);
+        assert_eq!(info.pt, 110);
+        assert_eq!(info.clock_rate, 48000);
+        // 8 kHz audio → prefer the 8 kHz telephone-event (126).
+        let info = pick_telephone_event(remote_sdp, 8000);
+        assert_eq!(info.pt, 126);
+        assert_eq!(info.clock_rate, 8000);
+    }
+
+    #[test]
+    fn test_pick_telephone_event_fallback_to_default() {
+        let remote_sdp = "v=0\nm=audio 4000 RTP/AVP 0\na=rtpmap:0 PCMU/8000\n";
+        let info = pick_telephone_event(remote_sdp, 48000);
+        assert_eq!(info.pt, dtmf::DTMF_TELEPHONE_EVENT_PT);
+        assert_eq!(info.clock_rate, 48000);
+    }
+
     #[tokio::test]
     async fn test_media_session_offer_contains_telephone_event() {
         let stats = Arc::new(CallStats::new());
         let codecs = Some(vec!["pcmu".to_string()]);
         let (_session, sdp) =
-            MediaSession::new_offer(false, 
-            false, false, false, None, codecs, true, stats, None)
+            MediaSession::new_offer(
+                false,
+                false,
+                false,
+                false,
+                None,
+                codecs,
+                true,
+                stats,
+                None,
+                DEFAULT_TS_JUMP_TOLERANCE_MS,
+            )
                 .await
                 .unwrap();
         // The SDP should contain telephone-event capability
@@ -2925,11 +3177,23 @@ mod tests {
             true,
             stats.clone(),
             None,
+            DEFAULT_TS_JUMP_TOLERANCE_MS,
         )
         .await
         .unwrap();
         let (_answerer, answer_sdp, _) =
-            MediaSession::new(&offer_sdp, false, false, false, false, None, None, stats, None)
+            MediaSession::new(
+                &offer_sdp,
+                false,
+                false,
+                false,
+                false,
+                None,
+                None,
+                stats,
+                None,
+                DEFAULT_TS_JUMP_TOLERANCE_MS,
+            )
                 .await
                 .unwrap();
         assert!(

@@ -117,8 +117,14 @@ impl CallRunner {
         let media_clone = media_session.clone();
         let username = self.account.username.clone();
         let answer_config = self.account.answer.clone();
+        let rx_observer = media_clone
+            .start_rx_observer(format!("{username}-early-media"))
+            .await;
 
         Some(tokio::spawn(async move {
+            // Keep observing inbound RTP while early media plays so RX stats
+            // reflect any audio the remote sends as 183 (ringback/busy/...).
+            let _rx = rx_observer;
             if let Some(cfg) = answer_config {
                 match cfg {
                     AnswerConfig::Echo => {
@@ -257,6 +263,7 @@ impl CallRunner {
             true,
             self.stats.clone(),
             self.account.audio_quality.clone(),
+            self.account.ts_jump_tolerance_ms,
         )
         .await?;
         _guard.media_session = Some(media_session.clone());
@@ -571,6 +578,60 @@ impl CallRunner {
             }
         };
 
+        let info_flows = self
+            .account
+            .info_flows
+            .as_deref()
+            .and_then(|s| crate::config::parse_info_flows(s).ok());
+        let info_dialog = dialog.clone();
+        let info_username = self.account.username.clone();
+        let info_cancel = self.cancel_token.clone();
+        let info_future = async move {
+            if let Some(ref flows) = info_flows {
+                info!(
+                    "[{}] INFO flow: {} entries scheduled",
+                    info_username,
+                    flows.len()
+                );
+                for entry in flows {
+                    tokio::select! {
+                        _ = tokio::time::sleep(entry.delay) => {}
+                        _ = info_cancel.cancelled() => {
+                            info!("[{}] INFO flow cancelled", info_username);
+                            return;
+                        }
+                    }
+                    info!(
+                        "[{}] Sending SIP INFO {} ({} bytes, after {:.1}s)",
+                        info_username,
+                        entry.content_type,
+                        entry.body.len(),
+                        entry.delay.as_secs_f64()
+                    );
+                    let headers = vec![Header::ContentType(rsipstack::sip::ContentType(entry.content_type.clone()))];
+                    let body = entry.body.as_bytes().to_vec();
+                    match info_dialog
+                        .request(Method::Info, Some(headers), Some(body))
+                        .await
+                    {
+                        Ok(Some(resp)) => {
+                            info!(
+                                "[{}] SIP INFO response: {}",
+                                info_username,
+                                resp.status_code()
+                            );
+                        }
+                        Ok(None) => {
+                            warn!("[{}] SIP INFO got no response", info_username);
+                        }
+                        Err(e) => {
+                            warn!("[{}] SIP INFO failed: {:?}", info_username, e);
+                        }
+                    }
+                }
+            }
+        };
+
         if let Some(secs) = hangup_secs {
             info!(
                 "[{}] Call established. Waiting for {} seconds (or Ctrl-C) before hanging up...",
@@ -580,6 +641,7 @@ impl CallRunner {
             let play_handle = tokio::spawn(play_future);
             let dtmf_handle = tokio::spawn(dtmf_future);
             let reinvite_handle = tokio::spawn(reinvite_future);
+            let info_handle = tokio::spawn(info_future);
 
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(secs)) => {
@@ -589,6 +651,7 @@ impl CallRunner {
                     play_handle.abort();
                     dtmf_handle.abort();
                     reinvite_handle.abort();
+                    info_handle.abort();
                     return Ok(());
                 }
                 _ = self.cancel_token.cancelled() => {
@@ -598,6 +661,7 @@ impl CallRunner {
             play_handle.abort();
             dtmf_handle.abort();
             reinvite_handle.abort();
+            info_handle.abort();
         } else {
             info!(
                 "[{}] Call established. Waiting for playback to hang up...",
@@ -605,6 +669,7 @@ impl CallRunner {
             );
             let dtmf_handle = tokio::spawn(dtmf_future);
             let reinvite_handle = tokio::spawn(reinvite_future);
+            let info_handle = tokio::spawn(info_future);
             tokio::select! {
                 _ = play_future => {
                     info!("[{}] Playback finished.", self.account.username);
@@ -612,6 +677,7 @@ impl CallRunner {
                 _ = monitor_future => {
                     dtmf_handle.abort();
                     reinvite_handle.abort();
+                    info_handle.abort();
                     return Ok(());
                 }
                 _ = self.cancel_token.cancelled() => {
@@ -620,6 +686,7 @@ impl CallRunner {
             }
             dtmf_handle.abort();
             reinvite_handle.abort();
+            info_handle.abort();
         }
 
         info!("[{}] Sending BYE...", self.account.username);
@@ -823,10 +890,28 @@ impl SipBot {
     }
 
     fn get_recording_path(&self, call_id: &str) -> Option<PathBuf> {
-        let dir = self.global_config.recorders.as_deref()?;
         let now = Local::now().format("%Y%m%d%H%M%S");
         // Sanitize call_id to be safe for filename
         let safe_call_id = call_id.replace(|c: char| !c.is_alphanumeric(), "_");
+        // Honor an explicit per-account recording path (e.g. `wait --record out.wav`).
+        // The value is used as a base name; timestamp + call id are appended so that
+        // multiple incoming calls do not overwrite each other.
+        if let Some(rec) = self.account.record.as_deref() {
+            let path = Path::new(rec);
+            let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+            let file_name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("record.wav");
+            let stem = file_name.strip_suffix(".wav").unwrap_or(file_name);
+            let filename = format!("{}_{}_{}.wav", stem, now, safe_call_id);
+            return Some(
+                parent
+                    .map(|p| p.join(&filename))
+                    .unwrap_or_else(|| PathBuf::from(filename)),
+            );
+        }
+        let dir = self.global_config.recorders.as_deref()?;
         let filename = format!("{}_{}.wav", now, safe_call_id);
         Some(Path::new(dir).join(filename))
     }
@@ -1310,7 +1395,7 @@ impl SipBot {
             tokio::time::sleep(Duration::from_millis(100)).await;
 
             if let Some(dialog) = dialog_layer_clone.get_dialog(&dialog_id) {
-                if let Dialog::ServerInvite(server_dialog) = dialog {
+                if let Dialog::Invite(server_dialog) = dialog {
                     // Send NOTIFY 100 Trying
                     if let Err(e) = server_dialog
                         .notify_refer(StatusCode::Trying, "active")
@@ -1652,6 +1737,7 @@ impl SipBot {
                             account.codecs.clone(),
                             stats_clone.clone(),
                             account.audio_quality.clone(),
+                            account.ts_jump_tolerance_ms,
                         )
                         .await
                         {

@@ -52,30 +52,53 @@ pub fn decode_dtmf(data: &[u8]) -> Option<DtmfEvent> {
     })
 }
 
-pub fn build_rtpmap_line(pt: u8) -> String {
-    format!("a=rtpmap:{} telephone-event/8000", pt)
+pub fn build_rtpmap_line(pt: u8, clock_rate: u32) -> String {
+    format!("a=rtpmap:{} telephone-event/{}", pt, clock_rate)
 }
 
 pub fn build_fmtp_line(pt: u8) -> String {
     format!("a=fmtp:{} 0-16", pt)
 }
 
-pub fn parse_telephone_event_pt(sdp: &str) -> Option<u8> {
+/// A telephone-event payload type as advertised in an SDP `rtpmap` attribute,
+/// with its clock rate. RFC 4733 requires telephone-event to use the same
+/// clock rate as the audio codec it accompanies (8000 for PCMU/PCMA/G722,
+/// 48000 for opus).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TelephoneEventInfo {
+    pub pt: u8,
+    pub clock_rate: u32,
+}
+
+/// Parse ALL telephone-event `a=rtpmap:` entries from an SDP document,
+/// preserving their advertised payload type and clock rate.
+pub fn parse_telephone_events(sdp: &str) -> Vec<TelephoneEventInfo> {
+    let mut events = Vec::new();
     for line in sdp.lines() {
         let lower = line.to_lowercase().trim().to_string();
-        if lower.contains("telephone-event") {
-            if let Some(cap) = line
-                .split_whitespace()
-                .nth(0)
-                .and_then(|s| s.split(':').nth(1))
-            {
-                if let Ok(pt) = cap.parse::<u8>() {
-                    return Some(pt);
-                }
-            }
+        if !lower.contains("telephone-event") {
+            continue;
         }
+        let mut parts = line.split_whitespace();
+        let Some(pt) = parts
+            .next()
+            .and_then(|s| s.split(':').nth(1))
+            .and_then(|s| s.parse::<u8>().ok())
+        else {
+            continue;
+        };
+        let clock_rate = parts
+            .next()
+            .and_then(|s| s.split('/').nth(1))
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(DTMF_CLOCK_RATE);
+        events.push(TelephoneEventInfo { pt, clock_rate });
     }
-    None
+    events
+}
+
+pub fn parse_telephone_event_pt(sdp: &str) -> Option<u8> {
+    parse_telephone_events(sdp).first().map(|e| e.pt)
 }
 
 pub fn sdp_has_telephone_event(sdp: &str) -> bool {
@@ -126,7 +149,7 @@ pub fn inject_telephone_event_caps(sdp: &str, pt: u8) -> String {
         }
         *mline = new_mline;
 
-        lines.insert(idx + 1, build_rtpmap_line(new_pt));
+        lines.insert(idx + 1, build_rtpmap_line(new_pt, DTMF_CLOCK_RATE));
         lines.insert(idx + 2, build_fmtp_line(new_pt));
     }
 
@@ -213,9 +236,37 @@ mod tests {
 
     #[test]
     fn test_rtpmap_line() {
-        let line = build_rtpmap_line(101);
+        let line = build_rtpmap_line(101, 8000);
         assert_eq!(line, "a=rtpmap:101 telephone-event/8000");
     }
+
+    #[test]
+    fn test_rtpmap_line_opus_clock() {
+        let line = build_rtpmap_line(110, 48000);
+        assert_eq!(line, "a=rtpmap:110 telephone-event/48000");
+    }
+
+    #[test]
+    fn test_parse_telephone_events_rates() {
+        let sdp = "a=rtpmap:111 opus/48000/2\n\
+                   a=rtpmap:110 telephone-event/48000\n\
+                   a=rtpmap:126 telephone-event/8000\n";
+        let events = parse_telephone_events(sdp);
+        assert_eq!(
+            events,
+            vec![
+                TelephoneEventInfo { pt: 110, clock_rate: 48000 },
+                TelephoneEventInfo { pt: 126, clock_rate: 8000 },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_telephone_events_none() {
+        let sdp = "a=rtpmap:0 PCMU/8000\n";
+        assert!(parse_telephone_events(sdp).is_empty());
+    }
+
 
     #[test]
     fn test_fmtp_line() {

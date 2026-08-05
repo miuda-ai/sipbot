@@ -106,8 +106,10 @@ cargo run -- wait --addr 0.0.0.0:5060 -u sipbot --answer welcome.wav
 - `--codecs <LIST>`: Codecs to use (e.g., opus,g722,pcmu).
 - `--audio-quality`: Enable per-call audio quality analysis.
 - `-H, --header <HEADER>`: Add custom SIP header (e.g., `-H 'X-Custom: value'`). Can be used multiple times.
+- `--record <FILE>`: Record to file (wav). If multiple calls arrive, the filename is suffixed with a timestamp and call id (e.g., `out_20260730090500_abc.wav`).
+- `--refer-reject <CODE>`: Reject inbound REFER with this status code (e.g. 405, 486).
 
-> **Note**: By default, `wait` mode does not record calls. To enable recording, you must use a configuration file and specify the `recorders` directory.
+> **Note**: `wait --record <FILE>` records each incoming call to a uniquely-named file derived from the base name. Alternatively, you can set the `recorders` directory in a configuration file to write timestamped files there.
 
 #### Other Commands
 

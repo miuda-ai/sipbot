@@ -4,6 +4,12 @@ use serde::Deserialize;
 use std::path::Path;
 use tokio::fs;
 
+pub const DEFAULT_TS_JUMP_TOLERANCE_MS: u32 = 50;
+
+fn default_ts_jump_tolerance_ms() -> u32 {
+    DEFAULT_TS_JUMP_TOLERANCE_MS
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub addr: Option<String>,
@@ -63,11 +69,20 @@ pub struct AccountConfig {
     // Audio quality analysis configuration
     pub audio_quality: Option<AudioQualityConfig>,
 
+    /// RTP timestamp-jump tolerance in milliseconds for the seq/ts jump
+    /// (audio-glitch) statistics. Defaults to 50.
+    #[serde(default = "default_ts_jump_tolerance_ms")]
+    pub ts_jump_tolerance_ms: u32,
+
     /// DTMF flow after answer: "1s:2,1.5s:#" means send '2' after 1s, then '#' after 1.5s
     pub dtmf_flows: Option<String>,
 
     /// Re-INVITE flow after answer: "5s:hold,10s:resume" means send hold after 5s, resume after 10s
     pub reinvite_flows: Option<String>,
+
+    /// SIP INFO flow after answer: "3s:application/vnd.rustpbx+json:{\"action\":\"ivr.exec\"};5s:application/dtmf-relay:Signal=5\r\nDuration=100\r\n"
+    /// Entries are semicolon-separated. Each entry: <delay>:<content_type>:<body>
+    pub info_flows: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -167,6 +182,59 @@ pub fn parse_reinvite_flows(input: &str) -> Result<Vec<ReinviteFlowEntry>> {
     Ok(entries)
 }
 
+#[derive(Debug, Clone)]
+pub struct InfoFlowEntry {
+    pub delay: std::time::Duration,
+    pub content_type: String,
+    pub body: String,
+}
+
+/// Parse info_flows: "3s:application/json:{\"k\":\"v\"};5s:application/dtmf-relay:Signal=5"
+///
+/// Entries are semicolon-separated. Each entry format:
+///   <delay>:<content_type>:<body>
+///
+/// The body is everything after the second colon, so it may contain colons,
+/// commas, braces, etc. Use `\n` in the body for literal newlines.
+pub fn parse_info_flows(input: &str) -> Result<Vec<InfoFlowEntry>> {
+    let mut entries = Vec::new();
+    for part in input.split(';') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        // Find the first colon (delay boundary)
+        let Some((delay_str, rest)) = part.split_once(':') else {
+            anyhow::bail!("Invalid info_flow entry '{}': expected <delay>:<content_type>:<body>", part);
+        };
+        // Find the second colon (content_type / body boundary)
+        let Some((content_type_str, body_str)) = rest.split_once(':') else {
+            anyhow::bail!("Invalid info_flow entry '{}': expected <delay>:<content_type>:<body>", part);
+        };
+        let delay_str = delay_str.trim();
+        let content_type = content_type_str.trim().to_string();
+        let body = body_str.replace("\\n", "\n");
+        let delay = if delay_str.ends_with('s') {
+            let num: f64 = delay_str[..delay_str.len() - 1]
+                .parse()
+                .with_context(|| format!("Invalid delay '{}'", delay_str))?;
+            std::time::Duration::from_secs_f64(num)
+        } else {
+            let num: f64 = delay_str
+                .parse()
+                .with_context(|| format!("Invalid delay '{}'", delay_str))?;
+            std::time::Duration::from_secs_f64(num)
+        };
+        anyhow::ensure!(!content_type.is_empty(), "Empty content_type in info_flow '{}'", part);
+        entries.push(InfoFlowEntry {
+            delay,
+            content_type,
+            body,
+        });
+    }
+    Ok(entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +317,47 @@ mod tests {
     fn test_parse_reinvite_flows_missing_colon() {
         assert!(parse_reinvite_flows("5s:hold").is_ok());
         assert!(parse_reinvite_flows("5s").is_err());
+    }
+
+    #[test]
+    fn test_parse_info_flows_basic() {
+        let entries = parse_info_flows(
+            "3s:application/vnd.rustpbx+json:{\"action\":\"ivr.exec\"};5s:application/dtmf-relay:Signal=5",
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].delay, std::time::Duration::from_millis(3000));
+        assert_eq!(entries[0].content_type, "application/vnd.rustpbx+json");
+        assert_eq!(entries[0].body, "{\"action\":\"ivr.exec\"}");
+        assert_eq!(entries[1].delay, std::time::Duration::from_millis(5000));
+        assert_eq!(entries[1].content_type, "application/dtmf-relay");
+        assert_eq!(entries[1].body, "Signal=5");
+    }
+
+    #[test]
+    fn test_parse_info_flows_single() {
+        let entries =
+            parse_info_flows("0.5:application/json:{\"key\":\"value\"}").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].delay, std::time::Duration::from_millis(500));
+        assert_eq!(entries[0].content_type, "application/json");
+        assert!(entries[0].body.contains("key"));
+    }
+
+    #[test]
+    fn test_parse_info_flows_newline_escape() {
+        let entries = parse_info_flows("1s:text/plain:line1\\nline2").unwrap();
+        assert_eq!(entries[0].body, "line1\nline2");
+    }
+
+    #[test]
+    fn test_parse_info_flows_empty() {
+        assert!(parse_info_flows("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_parse_info_flows_missing_content_type() {
+        assert!(parse_info_flows("3s:only_body_no_second_colon").is_err());
     }
 }
 

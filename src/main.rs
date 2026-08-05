@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use futures::future::join_all;
-use sipbot::config::{AccountConfig, Config};
+use sipbot::config::{AccountConfig, Config, DEFAULT_TS_JUMP_TOLERANCE_MS};
 use sipbot::csv_stats::{CsvStatsRecorder, write_final_summary};
 use sipbot::sip;
 use sipbot::stats::CallStats;
@@ -96,6 +96,9 @@ enum Commands {
         /// Enable audio quality analysis for this call
         #[arg(long)]
         audio_quality: bool,
+        /// RTP timestamp-jump tolerance (ms) for seq/ts glitch statistics
+        #[arg(long, default_value_t = DEFAULT_TS_JUMP_TOLERANCE_MS)]
+        jump_warn_ms: u32,
         /// Custom headers (e.g., -H 'X-Custom: value')
         #[arg(short = 'H', long = "header")]
         headers: Option<Vec<String>>,
@@ -114,6 +117,11 @@ enum Commands {
         /// Re-INVITE flow after answer: "5s:hold,10s:resume" means send hold after 5s, resume after 10s
         #[arg(long)]
         reinvite_flows: Option<String>,
+        /// SIP INFO flow after answer: "3s:application/json:{\"k\":\"v\"};5s:application/dtmf-relay:Signal=5"
+        ///
+        /// Entries are semicolon-separated. Each: <delay>:<content_type>:<body>. Use \n for newlines in body.
+        #[arg(long)]
+        info_flows: Option<String>,
     },
     /// Wait for incoming calls
     Wait {
@@ -177,9 +185,18 @@ enum Commands {
         /// Enable audio quality analysis for this call
         #[arg(long)]
         audio_quality: bool,
+        /// RTP timestamp-jump tolerance (ms) for seq/ts glitch statistics
+        #[arg(long, default_value_t = DEFAULT_TS_JUMP_TOLERANCE_MS)]
+        jump_warn_ms: u32,
         /// Custom headers (e.g., -H 'X-Custom: value')
         #[arg(short = 'H', long = "header")]
         headers: Option<Vec<String>>,
+        /// Record to file (wav). If multiple calls arrive, the filename is suffixed with a timestamp and call id.
+        #[arg(long)]
+        record: Option<String>,
+        /// Reject inbound REFER with this status code (e.g. 405, 486)
+        #[arg(long)]
+        refer_reject: Option<u16>,
     },
     /// Send OPTIONS request
     Options {
@@ -257,8 +274,10 @@ async fn main() -> Result<()> {
                         headers: None,
                         refer_reject: None,
                         audio_quality: None,
+                        ts_jump_tolerance_ms: DEFAULT_TS_JUMP_TOLERANCE_MS,
                         dtmf_flows: None,
                         reinvite_flows: None,
+                        info_flows: None,
                     }],
                 }
             }
@@ -301,8 +320,10 @@ async fn main() -> Result<()> {
                         headers: None,
                         refer_reject: None,
                         audio_quality: None,
+                        ts_jump_tolerance_ms: DEFAULT_TS_JUMP_TOLERANCE_MS,
                         dtmf_flows: None,
                         reinvite_flows: None,
+                        info_flows: None,
                     }],
                 }
             }
@@ -407,8 +428,10 @@ async fn main() -> Result<()> {
                         headers: headers.clone(),
                         refer_reject: None,
                         audio_quality: None,
+                        ts_jump_tolerance_ms: DEFAULT_TS_JUMP_TOLERANCE_MS,
                         dtmf_flows: None,
                         reinvite_flows: None,
+                        info_flows: None,
                     }],
                 }
             }
@@ -449,8 +472,10 @@ async fn main() -> Result<()> {
         from_override,
         addr_override,
         _audio_quality_flag,
+        jump_warn_ms_override,
         dtmf_flows_override,
         reinvite_flows_override,
+        info_flows_override,
     ) = match &args.command {
             Commands::Call {
                 target,
@@ -478,6 +503,8 @@ async fn main() -> Result<()> {
                 addr,
                 dtmf_flows,
                 reinvite_flows,
+                info_flows,
+                jump_warn_ms,
             } => {
                 let is_register = register.is_some() || password.is_some();
                 let reg_target = if let Some(r) = register {
@@ -511,8 +538,10 @@ async fn main() -> Result<()> {
                     from.clone(),
                     addr.clone(),
                     *audio_quality,
+                    *jump_warn_ms,
                     dtmf_flows.clone(),
                     reinvite_flows.clone(),
+                    info_flows.clone(),
                 )
         }
         Commands::Wait {
@@ -528,6 +557,8 @@ async fn main() -> Result<()> {
             codecs,
             audio_quality,
             headers,
+            record,
+            jump_warn_ms,
             ..
         } => {
             let is_register = register.is_some() || password.is_some();
@@ -541,11 +572,11 @@ async fn main() -> Result<()> {
                 None,
                 username.clone(),
                 auth_user.clone(),
-                password.clone(),
-                None,
-                None,
-                None,
-                *srtp,
+                    password.clone(),
+                    None,
+                    None,
+                    record.clone(),
+                    *srtp,
                 *webrtc,
                 Some(*nack),
                 Some(*jitter),
@@ -562,6 +593,8 @@ async fn main() -> Result<()> {
                 None,
                 None,
                 *audio_quality,
+                *jump_warn_ms,
+                None,
                 None,
                 None,
             )
@@ -592,6 +625,8 @@ async fn main() -> Result<()> {
             None,
             None,
             false,
+            DEFAULT_TS_JUMP_TOLERANCE_MS,
+            None,
             None,
             None,
         ),
@@ -621,6 +656,8 @@ async fn main() -> Result<()> {
             None,
             None,
             false,
+            DEFAULT_TS_JUMP_TOLERANCE_MS,
+            None,
             None,
             None,
         ),
@@ -634,6 +671,11 @@ async fn main() -> Result<()> {
         Commands::Call { audio_quality, .. } => *audio_quality,
         Commands::Wait { audio_quality, .. } => *audio_quality,
         _ => false,
+    };
+
+    let refer_reject_override: Option<u16> = match &args.command {
+        Commands::Wait { refer_reject, .. } => *refer_reject,
+        _ => None,
     };
 
     let mut handles = vec![];
@@ -800,8 +842,18 @@ async fn main() -> Result<()> {
             account.dtmf_flows = Some(dtmf_flows.clone());
         }
 
+        account.ts_jump_tolerance_ms = jump_warn_ms_override;
+
         if let Some(reinvite_flows) = &reinvite_flows_override {
             account.reinvite_flows = Some(reinvite_flows.clone());
+        }
+
+        if let Some(info_flows) = &info_flows_override {
+            account.info_flows = Some(info_flows.clone());
+        }
+
+        if let Some(code) = refer_reject_override {
+            account.refer_reject = Some(code);
         }
 
         let verbose = args.verbose;

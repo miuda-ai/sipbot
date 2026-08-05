@@ -22,6 +22,27 @@ pub struct CallStats {
     pub nack_sent: AtomicU64,
     pub nack_recv: AtomicU64,
     pub nack_recovered: AtomicU64,
+    /// Media-continuity / glitch counters. These surface the events that can
+    /// cause choppy audio: forward sequence gaps (loss bursts), out-of-order
+    /// packets, and RTP timestamp discontinuities.
+    /// Number of forward seq-gap events (a burst of lost packets).
+    pub seq_gap_events: AtomicU64,
+    /// Total packets lost via seq gaps (== sum of individual gap sizes).
+    pub seq_gap_total: AtomicU64,
+    /// Largest single forward gap (packets).
+    pub seq_gap_max: AtomicU64,
+    /// Out-of-order (backward seq) packet count.
+    pub seq_reorder_events: AtomicU64,
+    /// RTP timestamp jumps beyond tolerance (events that can mis-align the
+    /// receiver's playout).
+    pub ts_jump_events: AtomicU64,
+    /// Total accumulated timestamp jump magnitude in milliseconds.
+    pub ts_jump_ms_total: AtomicU64,
+    /// Largest single timestamp jump in milliseconds.
+    pub ts_jump_ms_max: AtomicU64,
+    /// Stream switches: huge (>10s) timestamp discontinuities that force a
+    /// jitter-buffer reset (informational, not a glitch).
+    pub stream_switch_events: AtomicU64,
     pub total_rtcp_rtt_us: AtomicU64,
     pub rtcp_rtt_samples: AtomicU32,
     pub rx_dtmf_events: AtomicU64,
@@ -53,6 +74,14 @@ impl Default for CallStats {
             nack_sent: AtomicU64::new(0),
             nack_recv: AtomicU64::new(0),
             nack_recovered: AtomicU64::new(0),
+            seq_gap_events: AtomicU64::new(0),
+            seq_gap_total: AtomicU64::new(0),
+            seq_gap_max: AtomicU64::new(0),
+            seq_reorder_events: AtomicU64::new(0),
+            ts_jump_events: AtomicU64::new(0),
+            ts_jump_ms_total: AtomicU64::new(0),
+            ts_jump_ms_max: AtomicU64::new(0),
+            stream_switch_events: AtomicU64::new(0),
             total_rtcp_rtt_us: AtomicU64::new(0),
             rtcp_rtt_samples: AtomicU32::new(0),
             rx_dtmf_events: AtomicU64::new(0),
@@ -159,8 +188,18 @@ impl CallStats {
         let nack_r = self.nack_recv.load(Ordering::Relaxed);
         let nack_rec = self.nack_recovered.load(Ordering::Relaxed);
 
+        let aq_total = self.audio_quality_total_frames.load(Ordering::Relaxed);
+        let aq_silence = self.audio_quality_silence_frames.load(Ordering::Relaxed);
+        let aq_clipping = self.audio_quality_clipping_frames.load(Ordering::Relaxed);
+        let aq_shrill = self.audio_quality_shrill_count.load(Ordering::Relaxed);
+        let aq_muffled = self.audio_quality_muffled_count.load(Ordering::Relaxed);
+        let has_audio =
+            aq_total > 0 && (aq_silence as f64 / aq_total.max(1) as f64) < 0.95;
+        let rx_dtmf = self.rx_dtmf_events.load(Ordering::Relaxed);
+        let tx_dtmf = self.tx_dtmf_events.load(Ordering::Relaxed);
+
         println!(
-            "Progress: {}/{} (Current: {}), Avg Duration: {:.2}s, Avg Setup Latency: {:.2}ms, Avg RTCP RTT: {:.2}ms, Status: [{}], TX: {}p/{}b, RX: {}p/{}b, Avg Loss: {:.2}%, NACK: {}s/{}r/{}rec",
+            "Progress: {}/{} (Current: {}), Avg Duration: {:.2}s, Avg Setup Latency: {:.2}ms, Avg RTCP RTT: {:.2}ms, Status: [{}], TX: {}p/{}b, RX: {}p/{}b, Avg Loss: {:.2}%, NACK: {}s/{}r/{}rec, AudioQuality: silence={}/{}, clipping={}/{}, shrill={}, muffled={}, has_audio={}, RX_DTMF: {}, TX_DTMF: {}",
             finished,
             total,
             current,
@@ -175,12 +214,45 @@ impl CallStats {
             loss,
             nack_s,
             nack_r,
-            nack_rec
+            nack_rec,
+            aq_silence,
+            aq_total,
+            aq_clipping,
+            aq_total,
+            aq_shrill,
+            aq_muffled,
+            has_audio,
+            rx_dtmf,
+            tx_dtmf
         );
     }
 
     pub fn inc_rx_lost(&self, count: u64) {
         self.rx_lost_packets.fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Record a forward sequence gap (a burst of `gap` lost packets).
+    pub fn inc_seq_gap(&self, gap: u64) {
+        self.seq_gap_events.fetch_add(1, Ordering::Relaxed);
+        self.seq_gap_total.fetch_add(gap, Ordering::Relaxed);
+        self.seq_gap_max.fetch_max(gap, Ordering::Relaxed);
+    }
+
+    /// Record an out-of-order (backward sequence) packet.
+    pub fn inc_seq_reorder(&self) {
+        self.seq_reorder_events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an RTP timestamp jump of `delta_ms` beyond tolerance.
+    pub fn inc_ts_jump(&self, delta_ms: u64) {
+        self.ts_jump_events.fetch_add(1, Ordering::Relaxed);
+        self.ts_jump_ms_total.fetch_add(delta_ms, Ordering::Relaxed);
+        self.ts_jump_ms_max.fetch_max(delta_ms, Ordering::Relaxed);
+    }
+
+    /// Record a stream switch (huge timestamp discontinuity).
+    pub fn inc_stream_switch(&self) {
+        self.stream_switch_events.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_nack_sent(&self, count: u64) {
@@ -238,6 +310,21 @@ impl CallStats {
         } else {
             0
         }
+    }
+
+    /// Single-line media-continuity summary for greppable log output.
+    pub fn jump_stats_line(&self) -> String {
+        format!(
+            "seq_gap_events={}, seq_gap_total={}, seq_gap_max={}, seq_reorder_events={}, ts_jump_events={}, ts_jump_ms_total={}, ts_jump_ms_max={}, stream_switch_events={}",
+            self.seq_gap_events.load(Ordering::Relaxed),
+            self.seq_gap_total.load(Ordering::Relaxed),
+            self.seq_gap_max.load(Ordering::Relaxed),
+            self.seq_reorder_events.load(Ordering::Relaxed),
+            self.ts_jump_events.load(Ordering::Relaxed),
+            self.ts_jump_ms_total.load(Ordering::Relaxed),
+            self.ts_jump_ms_max.load(Ordering::Relaxed),
+            self.stream_switch_events.load(Ordering::Relaxed),
+        )
     }
 
     pub fn add_duration(&self, duration: Duration) {
