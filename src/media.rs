@@ -2429,34 +2429,46 @@ fn inject_telephone_event_sdp(sdp: &str, info: dtmf::TelephoneEventInfo) -> Stri
         return sdp.to_string();
     }
     let pt_str = info.pt.to_string();
-    let mut out = String::new();
-    for line in sdp.lines() {
-        if line.to_lowercase().starts_with("m=audio") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
+    let mut lines: Vec<String> = sdp.lines().map(|l| l.to_string()).collect();
+
+    let mut mline_idx = None;
+    let mut last_rtpmap_idx = None;
+    for (i, line) in lines.iter().enumerate() {
+        let lower = line.to_lowercase();
+        if lower.starts_with("m=audio") {
+            mline_idx = Some(i);
+        }
+        if line.starts_with("a=rtpmap:") {
+            last_rtpmap_idx = Some(i);
+        }
+    }
+
+    if let Some(mline_idx) = mline_idx {
+        if let Some(mline) = lines.get_mut(mline_idx) {
+            let mut parts: Vec<&str> = mline.split_whitespace().collect();
             if parts.len() >= 4 {
                 // Append telephone-event after the audio codecs (keep the
                 // audio codec first in the answer, per RFC 3264 ordering).
-                let mut new = parts.join(" ");
-                new.push_str(&format!(" {}", pt_str));
-                out.push_str(&new);
-                out.push('\n');
-            } else {
-                out.push_str(line);
-                out.push('\n');
+                parts.push(&pt_str);
+                *mline = parts.join(" ");
             }
-        } else if line.starts_with("a=rtpmap:") {
-            out.push_str(line);
-            out.push('\n');
-            out.push_str(&dtmf::build_rtpmap_line(info.pt, info.clock_rate));
-            out.push('\n');
-            out.push_str(&dtmf::build_fmtp_line(info.pt));
-            out.push('\n');
-        } else {
-            out.push_str(line);
-            out.push('\n');
         }
+
+        // Insert the telephone-event rtpmap/fmtp once, after the last codec
+        // rtpmap line (appending after every rtpmap line would duplicate it).
+        let insert_idx = last_rtpmap_idx
+            .map(|i| i + 1)
+            .unwrap_or(mline_idx + 1);
+        lines.splice(
+            insert_idx..insert_idx,
+            [
+                dtmf::build_rtpmap_line(info.pt, info.clock_rate),
+                dtmf::build_fmtp_line(info.pt),
+            ],
+        );
     }
-    out
+
+    lines.join("\n")
 }
 
 fn spawn_track_recorder(
@@ -3109,6 +3121,21 @@ mod tests {
             "telephone-event should not be duplicated: {}",
             result
         );
+    }
+
+    #[test]
+    fn test_inject_telephone_event_sdp_multi_codec_no_duplicate() {
+        // Multiple codecs in the answer used to cause the telephone-event
+        // rtpmap/fmtp block to be inserted after every rtpmap line.
+        let sdp = "v=0\nm=audio 4000 RTP/AVP 0 8\nc=IN IP4 127.0.0.1\n\
+            a=rtpmap:0 PCMU/8000\na=rtpmap:8 PCMA/8000\n";
+        let result = inject_telephone_event_sdp(
+            sdp,
+            dtmf::TelephoneEventInfo { pt: 101, clock_rate: 8000 },
+        );
+        assert_eq!(result.matches("telephone-event").count(), 1);
+        assert_eq!(result.matches("a=fmtp:101 0-16").count(), 1);
+        assert!(result.contains("m=audio 4000 RTP/AVP 0 8 101"));
     }
 
     #[test]

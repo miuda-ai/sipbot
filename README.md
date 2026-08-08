@@ -79,6 +79,7 @@ cargo run -- call -t sip:user@domain -u sipbot --play audio.wav --hangup 10 --to
 - `-H, --header <HEADER>`: Add custom SIP header (e.g., `-H 'X-Custom: value'`). Can be used multiple times.
 - `--dtmf-flows <FLOW>`: Scheduled DTMF flow after answer (e.g., `"1s:2,1.5s:#"` sends `2` after 1s, `#` after 1.5s).
 - `--reinvite-flows <FLOW>`: Scheduled re-INVITE flow after answer (e.g., `"5s:hold,10s:resume"` sends hold after 5s, resume after 10s).
+- `--info-flows <FLOW>`: Scheduled in-dialog SIP INFO after answer (e.g., `"3s:application/json:{\"k\":\"v\"};5s:application/dtmf-relay:Signal=5"`). Entries are semicolon-separated, each `<delay>:<content_type>:<body>`; use `\n` for newlines in the body.
 
 > **Tip**: When making a single call (`--total 1`), you can send DTMF digits by typing them in the terminal. Supported: `0-9`, `*`, `#`, `A-D`. Press `q` to quit the DTMF reader.
 
