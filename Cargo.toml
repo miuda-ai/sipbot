@@ -33,6 +33,3 @@ ringbuf = { version = "0.5.0", optional = true }
 [features]
 default = ["local-device"]
 local-device = ["dep:cpal", "dep:ringbuf"]
-
-[patch.crates-io]
-rustrtc = { path = "../rustrtc" }
