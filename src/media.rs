@@ -444,6 +444,7 @@ impl MediaSession {
         let chosen_codec_name = chosen_cap.codec_name.clone();
         let chosen_params = RtpCodecParameters {
             payload_type: chosen_cap.payload_type,
+            name: chosen_codec_name.clone(),
             clock_rate: chosen_cap.clock_rate,
             channels: chosen_cap.channels,
         };
@@ -484,6 +485,7 @@ impl MediaSession {
         } else {
             let params = RtpCodecParameters {
                 payload_type: chosen_params.payload_type,
+                name: chosen_params.name.clone(),
                 clock_rate: chosen_params.clock_rate,
                 channels: 1,
             };
@@ -662,11 +664,13 @@ impl MediaSession {
                 .and_then(|c| c.audio.first())
                 .map(|a| RtpCodecParameters {
                     payload_type: a.payload_type,
+                    name: a.codec_name.clone(),
                     clock_rate: a.clock_rate,
                     channels: a.channels,
                 })
                 .unwrap_or(RtpCodecParameters {
                     payload_type: 0,
+                    name: "PCMU".to_string(),
                     clock_rate: 8000,
                     channels: 1,
                 });
@@ -830,7 +834,21 @@ impl MediaSession {
     }
 
     pub async fn set_remote_answer(&self, remote_sdp: &str) -> Result<String> {
-        let remote_desc = SessionDescription::parse(SdpType::Answer, remote_sdp)?;
+        self.set_remote_answer_typed(remote_sdp, SdpType::Answer).await
+    }
+
+    /// Apply a remote answer SDP. When `provisional` is true the SDP is
+    /// parsed as a provisional answer (SIP 183 early media) so rustrtc keeps
+    /// the signaling state in `HaveLocalOffer` and a later final 200 OK answer
+    /// can still complete the negotiation. Applying the 183 as a full Answer
+    /// would move state to `Stable`, and the subsequent 200 OK would then be
+    /// rejected with "set_remote_description(answer) requires local offer".
+    pub async fn set_remote_answer_typed(
+        &self,
+        remote_sdp: &str,
+        sdp_type: SdpType,
+    ) -> Result<String> {
+        let remote_desc = SessionDescription::parse(sdp_type, remote_sdp)?;
 
         // In RTP mode, rustrtc now supports setting remote description multiple times
         // (e.g., 183 early media followed by 200 OK reinvite)

@@ -1,6 +1,6 @@
 [package]
 name = "sipbot"
-version = "0.2.52"
+version = "0.2.53"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 repository = "https://github.com/miuda-ai/sipbot"
@@ -18,7 +18,7 @@ tracing = "0.1"
 anyhow = "1.0"
 rsipstack = "0.6.1"
 tokio-util = "0.7.18"
-rustrtc = "0.3.113"
+rustrtc = "0.3.117"
 audio-codec = "0.3.41"
 clap = { version = "4", features = ["derive"] }
 chrono = "0.4.45"
@@ -33,3 +33,6 @@ ringbuf = { version = "0.5.0", optional = true }
 [features]
 default = ["local-device"]
 local-device = ["dep:cpal", "dep:ringbuf"]
+
+[patch.crates-io]
+rustrtc = { path = "../rustrtc" }

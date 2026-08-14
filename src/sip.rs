@@ -94,7 +94,14 @@ impl CallRunner {
             "[{}] Received Early Media (183) SDP:\n{}",
             self.account.username, answer_sdp
         );
-        match media_session.set_remote_answer(answer_sdp).await {
+        info!(
+            "[{}] EARLY_MEDIA_183_SDP\n{}",
+            self.account.username, answer_sdp
+        );
+        match media_session
+            .set_remote_answer_typed(answer_sdp, rustrtc::sdp::SdpType::Pranswer)
+            .await
+        {
             Ok(codec_name) => {
                 info!(
                     "[{}] Early media (183) remote description set, codec: {}",
@@ -117,6 +124,24 @@ impl CallRunner {
         let media_clone = media_session.clone();
         let username = self.account.username.clone();
         let answer_config = self.account.answer.clone();
+
+        // Caller mode (outbound `call`, target set): do NOT take over playback
+        // here. The final 200 OK may negotiate a different codec than the 183
+        // early media (e.g. rustpbx sends a multi-codec 183 answer then a
+        // callee-selected-codec 200 OK). Starting playback now with the 183
+        // codec would leave the sender stamped for the 200 OK codec,
+        // producing undecodable audio. start_media_playback() will start the
+        // real playback once the 200 OK is applied, with the final codec.
+        // The RX observer still runs in the background (detached) so early
+        // media RTP (ringback/busy/failure tones) is counted in RX stats.
+        let is_caller = self.account.target.is_some();
+        if is_caller {
+            let _rx = media_clone
+                .start_rx_observer(format!("{username}-early-media"))
+                .await;
+            return None;
+        }
+
         let rx_observer = media_clone
             .start_rx_observer(format!("{username}-early-media"))
             .await;
@@ -125,23 +150,37 @@ impl CallRunner {
             // Keep observing inbound RTP while early media plays so RX stats
             // reflect any audio the remote sends as 183 (ringback/busy/...).
             let _rx = rx_observer;
-            if let Some(cfg) = answer_config {
-                match cfg {
-                    AnswerConfig::Echo => {
-                        let _ = media_clone.start_echo(username, None).await;
-                    }
-                    AnswerConfig::Play { wav_file } => {
+            match answer_config {
+                Some(AnswerConfig::Echo) => {
+                    let _ = media_clone.start_echo(username, None).await;
+                }
+                Some(AnswerConfig::Play { wav_file }) => {
+                    let _ = media_clone
+                        .play_file(username, Path::new(&wav_file), None, true)
+                        .await;
+                }
+                Some(AnswerConfig::Local) => {
+                    #[cfg(feature = "local-device")]
+                    if let Err(e) = media_clone
+                        .play_local_device(username.clone(), None, true, None)
+                        .await
+                    {
+                        error!(
+                            "[{}] Failed to play local device during early media: {:?}, falling back to file",
+                            username, e
+                        );
                         let _ = media_clone
-                            .play_file(username, Path::new(&wav_file), None, true)
+                            .play_wav_bytes(username, PLAY_WAV, None, true)
                             .await;
                     }
-                    AnswerConfig::Local => {
-                        #[cfg(feature = "local-device")]
+                    #[cfg(not(feature = "local-device"))]
+                    {
                         let _ = media_clone
-                            .play_local_device(username, None, true, None)
+                            .play_wav_bytes(username, PLAY_WAV, None, true)
                             .await;
                     }
                 }
+                None => {}
             }
         }))
     }
@@ -416,7 +455,20 @@ impl CallRunner {
                     "[{}] Received 200 OK Answer SDP:\n{}",
                     self.account.username, answer_sdp
                 );
-                let codec_name = media_session.set_remote_answer(&answer_sdp).await?;
+                let codec_name = match media_session.set_remote_answer(&answer_sdp).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!(
+                            "[{}] set_remote_answer on 200 OK FAILED: {:?}",
+                            self.account.username, e
+                        );
+                        error!(
+                            "[{}] 200 OK Answer SDP was:\n{}",
+                            self.account.username, answer_sdp
+                        );
+                        return Err(e);
+                    }
+                };
                 info!(
                     "[{}] 200 OK remote description set (supports reinvite after 183), codec: {}",
                     self.account.username, codec_name
