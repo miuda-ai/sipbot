@@ -1,5 +1,4 @@
 use crate::audio_quality::{AudioQualityAnalyzer, AudioQualityConfig};
-use crate::config::DEFAULT_TS_JUMP_TOLERANCE_MS;
 use crate::dtmf;
 use crate::recorder::Recorder;
 use crate::stats::CallStats;
@@ -32,6 +31,12 @@ use tokio::sync::Mutex;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+fn new_resampler(input_rate: usize, output_rate: usize) -> Option<Resampler<'static>> {
+    let coeffs: &'static mut [f32] =
+        Box::leak(vec![0.0f32; audio_codec::resampler::COEFFS_LEN].into_boxed_slice());
+    Resampler::new(input_rate, output_rate, coeffs).ok()
+}
 
 fn create_encoder_for(ct: CodecType, channels: u16) -> Box<dyn audio_codec::Encoder> {
     if ct == CodecType::Opus {
@@ -283,7 +288,7 @@ pub struct MediaSession {
     #[cfg(feature = "local-device")]
     output_sample_rate: Arc<std::sync::atomic::AtomicU32>,
     #[cfg(feature = "local-device")]
-    output_resampler: Arc<Mutex<Option<audio_codec::Resampler>>>,
+    output_resampler: Arc<Mutex<Option<audio_codec::Resampler<'static>>>>,
     #[cfg(feature = "local-device")]
     local_stop_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>>,
     tracked_mids: Arc<Mutex<std::collections::HashSet<String>>>,
@@ -1049,7 +1054,7 @@ impl MediaSession {
         tokio::spawn(async move {
             let mut decoder: Option<Box<dyn Decoder + Send>> = None;
             let mut current_pt: Option<u8> = None;
-            let mut recorder_resampler: Option<Resampler> = None;
+            let mut recorder_resampler: Option<Resampler<'static>> = None;
             let mut aq = if audio_quality_enabled {
                 audio_quality_config.map(AudioQualityAnalyzer::new)
             } else {
@@ -1121,7 +1126,7 @@ impl MediaSession {
                                             decoder = Some(d);
                                             let rate = ct.samplerate();
                                             if rate != 16000 {
-                                                recorder_resampler = Some(Resampler::new(rate as usize, 16000));
+                                                recorder_resampler = new_resampler(rate as usize, 16000);
                                             } else {
                                                 recorder_resampler = None;
                                             }
@@ -1203,7 +1208,7 @@ impl MediaSession {
                                                 decoder = Some(d);
                                                 let rate = ct.samplerate();
                                                 if rate != 16000 {
-                                                    recorder_resampler = Some(Resampler::new(rate as usize, 16000));
+                                                    recorder_resampler = new_resampler(rate as usize, 16000);
                                                 } else {
                                                     recorder_resampler = None;
                                                 }
@@ -1345,7 +1350,7 @@ impl MediaSession {
         recorder: &Mutex<Option<Recorder>>,
         stats: &CallStats,
         decoder: &mut Box<dyn Decoder + Send>,
-        recorder_resampler: &mut Option<Resampler>,
+        recorder_resampler: &mut Option<Resampler<'static>>,
         last_seq: &mut Option<u16>,
         last_timestamp: &mut Option<u32>,
         rtp_clock_rate: u32,
@@ -1760,10 +1765,10 @@ impl MediaSession {
             let mut encoder = create_encoder_for(ct, target_channels);
 
             let mut resampler = if input_sample_rate != target_sample_rate || input_channels != 1 {
-                Some(audio_codec::Resampler::new(
+                new_resampler(
                     input_sample_rate as usize,
                     target_sample_rate as usize,
-                ))
+                )
             } else {
                 None
             };
@@ -2108,8 +2113,7 @@ impl MediaSession {
 
         // Pre-process: Resample audio for recording (16000Hz target) if needed
         let record_samples = if sample_rate != 16000 {
-            let mut resampler = Resampler::new(sample_rate as usize, 16000);
-            resampler.resample(&samples)
+            resample(&samples, sample_rate, 16000)
         } else {
             samples.clone()
         };
@@ -2510,7 +2514,7 @@ fn spawn_track_recorder(
     tokio::spawn(async move {
         let mut decoder: Option<Box<dyn Decoder + Send>> = None;
         let mut current_pt: Option<u8> = None;
-        let mut recorder_resampler: Option<Resampler> = None;
+        let mut recorder_resampler: Option<Resampler<'static>> = None;
         let mut aq = if audio_quality_enabled {
             audio_quality_config.map(AudioQualityAnalyzer::new)
         } else {
@@ -2583,7 +2587,7 @@ fn spawn_track_recorder(
                                         decoder = Some(d);
                                         let rate = ct.samplerate();
                                         if rate != 16000 {
-                                            recorder_resampler = Some(Resampler::new(rate as usize, 16000));
+                                            recorder_resampler = new_resampler(rate as usize, 16000);
                                         } else {
                                             recorder_resampler = None;
                                         }
@@ -2677,7 +2681,7 @@ fn spawn_track_recorder(
                                             decoder = Some(d);
                                             let rate = ct.samplerate();
                                             if rate != 16000 {
-                                                recorder_resampler = Some(Resampler::new(rate as usize, 16000));
+                                                recorder_resampler = new_resampler(rate as usize, 16000);
                                             } else {
                                                 recorder_resampler = None;
                                             }
@@ -2739,12 +2743,12 @@ async fn process_recorded_sample(
     recorder: &Mutex<Option<Recorder>>,
     stats: &CallStats,
     decoder: &mut Box<dyn Decoder + Send>,
-    recorder_resampler: &mut Option<Resampler>,
+    recorder_resampler: &mut Option<Resampler<'static>>,
     last_seq: &mut Option<u16>,
     last_timestamp: &mut Option<u32>,
     #[cfg(feature = "local-device")] local_playback_tx: &Mutex<Option<ringbuf::HeapProd<i16>>>,
     #[cfg(feature = "local-device")] output_sample_rate: &std::sync::atomic::AtomicU32,
-    #[cfg(feature = "local-device")] output_resampler: &mut Option<audio_codec::Resampler>,
+    #[cfg(feature = "local-device")] output_resampler: &mut Option<audio_codec::Resampler<'static>>,
     rtp_clock_rate: u32,
     #[allow(unused_variables)] channels: u16,
     actual_sample_rate: u32,
@@ -2876,10 +2880,10 @@ async fn process_recorded_sample(
                         };
 
                         if need_new {
-                            *output_resampler = Some(audio_codec::Resampler::new(
+                            *output_resampler = new_resampler(
                                 actual_sample_rate as usize,
                                 target_rate as usize,
-                            ));
+                            );
                         }
 
                         if let Some(resampler) = output_resampler.as_mut() {

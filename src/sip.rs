@@ -9,6 +9,7 @@ use rsipstack::dialog::dialog::{Dialog, DialogState};
 use rsipstack::rsip::headers::ToTypedHeader;
 use rsipstack::rsip::message::HeadersExt;
 use rsipstack::rsip::{Header, Method, StatusCode, Transport, Uri};
+use rsipstack::sip::{Host, HostWithPort};
 use rsipstack::{
     EndpointBuilder,
     dialog::authenticate::Credential,
@@ -22,7 +23,6 @@ use rsipstack::{
     },
     transport::{SipAddr, TransportLayer, udp::UdpConnection},
 };
-use rsipstack::sip::{Host, HostWithPort};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -30,8 +30,8 @@ use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-const ANSWER_WAV: &[u8] = include_bytes!("../wavs/answer.wav");
-const PLAY_WAV: &[u8] = include_bytes!("../wavs/play.wav");
+const ANSWER_WAV: &[u8] = include_bytes!("../wavs/play.wav");
+const RINGING_WAV: &[u8] = include_bytes!("../wavs/ringing.wav");
 
 #[derive(Clone)]
 struct CallRunner {
@@ -170,13 +170,13 @@ impl CallRunner {
                             username, e
                         );
                         let _ = media_clone
-                            .play_wav_bytes(username, PLAY_WAV, None, true)
+                            .play_wav_bytes(username, RINGING_WAV, None, true)
                             .await;
                     }
                     #[cfg(not(feature = "local-device"))]
                     {
                         let _ = media_clone
-                            .play_wav_bytes(username, PLAY_WAV, None, true)
+                            .play_wav_bytes(username, RINGING_WAV, None, true)
                             .await;
                     }
                 }
@@ -220,7 +220,7 @@ impl CallRunner {
                     {
                         error!("Failed to play local device: {:?}, falling back to file", e);
                         if let Err(e) = media_session
-                            .play_wav_bytes(username, PLAY_WAV, record_path_ref, keep_alive)
+                            .play_wav_bytes(username, RINGING_WAV, record_path_ref, keep_alive)
                             .await
                         {
                             error!("Fallback failed: {:?}", e);
@@ -230,7 +230,7 @@ impl CallRunner {
                     {
                         error!("Local device support is disabled in this build");
                         if let Err(e) = media_session
-                            .play_wav_bytes(username, PLAY_WAV, record_path_ref, keep_alive)
+                            .play_wav_bytes(username, RINGING_WAV, record_path_ref, keep_alive)
                             .await
                         {
                             error!("Fallback failed: {:?}", e);
@@ -241,7 +241,7 @@ impl CallRunner {
             }
         } else {
             if let Err(e) = media_session
-                .play_wav_bytes(username, PLAY_WAV, record_path_ref, keep_alive)
+                .play_wav_bytes(username, RINGING_WAV, record_path_ref, keep_alive)
                 .await
             {
                 warn!("Play built-in answer stopped: {:?}", e);
@@ -587,7 +587,10 @@ impl CallRunner {
                     let offer_sdp = match reinvite_media.create_reinvite_offer(is_hold).await {
                         Ok(sdp) => sdp,
                         Err(e) => {
-                            warn!("[{}] Failed to create re-INVITE offer: {:?}", reinvite_username, e);
+                            warn!(
+                                "[{}] Failed to create re-INVITE offer: {:?}",
+                                reinvite_username, e
+                            );
                             continue;
                         }
                     };
@@ -598,11 +601,20 @@ impl CallRunner {
                     let response = reinvite_dialog.reinvite(Some(headers), Some(body)).await;
 
                     match response {
-                        Ok(Some(resp)) if matches!(resp.status_code().kind(), rsipstack::rsip::status_code::StatusCodeKind::Successful) => {
+                        Ok(Some(resp))
+                            if matches!(
+                                resp.status_code().kind(),
+                                rsipstack::rsip::status_code::StatusCodeKind::Successful
+                            ) =>
+                        {
                             let answer_sdp = String::from_utf8_lossy(&resp.body).to_string();
                             if !answer_sdp.is_empty() {
-                                if let Err(e) = reinvite_media.set_remote_answer(&answer_sdp).await {
-                                    warn!("[{}] Failed to set remote answer for re-INVITE: {:?}", reinvite_username, e);
+                                if let Err(e) = reinvite_media.set_remote_answer(&answer_sdp).await
+                                {
+                                    warn!(
+                                        "[{}] Failed to set remote answer for re-INVITE: {:?}",
+                                        reinvite_username, e
+                                    );
                                 }
                             }
                             reinvite_media.set_audio_silent(is_hold).await;
@@ -660,7 +672,9 @@ impl CallRunner {
                         entry.body.len(),
                         entry.delay.as_secs_f64()
                     );
-                    let headers = vec![Header::ContentType(rsipstack::sip::ContentType(entry.content_type.clone()))];
+                    let headers = vec![Header::ContentType(rsipstack::sip::ContentType(
+                        entry.content_type.clone(),
+                    ))];
                     let body = entry.body.as_bytes().to_vec();
                     match info_dialog
                         .request(Method::Info, Some(headers), Some(body))
@@ -840,7 +854,11 @@ impl SipBot {
             );
 
             // Set proxy so registration & invites use WebSocket transport
-            let transport_param = if transport == Transport::Wss { "wss" } else { "ws" };
+            let transport_param = if transport == Transport::Wss {
+                "wss"
+            } else {
+                "ws"
+            };
             self.account.proxy = Some(format!("{}:{};transport={}", host, port, transport_param));
 
             // WS transport implies WebRTC mode
@@ -912,18 +930,19 @@ impl SipBot {
                 if let Some(first_addr) = addrs.first() {
                     if let Ok(sock) = first_addr.get_socketaddr() {
                         let local_str = format!("sip:{}@{}:{}", username, sock.ip(), sock.port());
-                        if let Ok(contact_uri) = rsipstack::rsip::Uri::try_from(local_str.as_str()) {
+                        if let Ok(contact_uri) = rsipstack::rsip::Uri::try_from(local_str.as_str())
+                        {
                             use rsipstack::rsip::Param;
                             use rsipstack::rsip::uri::OtherParam;
                             reg.contact = Some(rsipstack::rsip::typed::Contact {
                                 display_name: None,
                                 uri: contact_uri,
-                                params: vec![Param::Other(
-                                    OtherParam::new("+sip.ice"),
-                                    None,
-                                )],
+                                params: vec![Param::Other(OtherParam::new("+sip.ice"), None)],
                             });
-                            info!("[{}] WebRTC enabled, set +sip.ice in registration contact", username);
+                            info!(
+                                "[{}] WebRTC enabled, set +sip.ice in registration contact",
+                                username
+                            );
                         }
                     }
                 }
@@ -1505,13 +1524,16 @@ impl SipBot {
         let offer_body = String::from_utf8_lossy(transaction.original.body()).to_string();
         let offer_lower = offer_body.to_lowercase();
 
-        let is_hold =
-            offer_lower.contains("a=sendonly") || offer_lower.contains("a=inactive");
+        let is_hold = offer_lower.contains("a=sendonly") || offer_lower.contains("a=inactive");
 
         info!(
             "[{}] Received re-INVITE: {}",
             self.account.username,
-            if is_hold { "HOLD (a=sendonly/inactive)" } else { "RESUME (a=sendrecv)" }
+            if is_hold {
+                "HOLD (a=sendonly/inactive)"
+            } else {
+                "RESUME (a=sendrecv)"
+            }
         );
 
         // Renegotiate SDP and get answer, toggle audio_silent
@@ -1528,7 +1550,10 @@ impl SipBot {
                         match media.renegotiate(&offer_body).await {
                             Ok(answer) => Some(answer),
                             Err(e) => {
-                                warn!("[{}] SDP renegotiation failed: {:?}", self.account.username, e);
+                                warn!(
+                                    "[{}] SDP renegotiation failed: {:?}",
+                                    self.account.username, e
+                                );
                                 None
                             }
                         }
@@ -1537,7 +1562,10 @@ impl SipBot {
                     }
                 }
                 None => {
-                    warn!("[{}] No active media session for re-INVITE", self.account.username);
+                    warn!(
+                        "[{}] No active media session for re-INVITE",
+                        self.account.username
+                    );
                     None
                 }
             }
@@ -1546,7 +1574,9 @@ impl SipBot {
         // Reply 200 OK with answer SDP body for proper re-INVITE negotiation
         if let Some(sdp) = answer_sdp {
             let headers = vec![Header::ContentType("application/sdp".into())];
-            transaction.reply_with(StatusCode::OK, headers, Some(sdp.into_bytes())).await?;
+            transaction
+                .reply_with(StatusCode::OK, headers, Some(sdp.into_bytes()))
+                .await?;
         } else {
             transaction.reply(StatusCode::OK).await?;
         }
@@ -2235,10 +2265,7 @@ fn parse_ws_url(url: &str) -> Result<(Transport, String, u16, String)> {
     let transport = match scheme {
         "wss" => Transport::Wss,
         "ws" => Transport::Ws,
-        _ => anyhow::bail!(
-            "Invalid ws-url scheme '{}': expected 'ws' or 'wss'",
-            scheme
-        ),
+        _ => anyhow::bail!("Invalid ws-url scheme '{}': expected 'ws' or 'wss'", scheme),
     };
 
     let (host_port, path) = match rest.find('/') {
@@ -2255,7 +2282,11 @@ fn parse_ws_url(url: &str) -> Result<(Transport, String, u16, String)> {
         ),
         None => (
             host_port.to_string(),
-            if transport == Transport::Wss { 443u16 } else { 80u16 },
+            if transport == Transport::Wss {
+                443u16
+            } else {
+                80u16
+            },
         ),
     };
 
@@ -2268,8 +2299,14 @@ mod tests {
 
     #[test]
     fn test_normalize_sip_addr() {
-        assert_eq!(normalize_sip_addr("192.168.1.1:5060"), "sip:192.168.1.1:5060");
-        assert_eq!(normalize_sip_addr("sip:192.168.1.1:5060"), "sip:192.168.1.1:5060");
+        assert_eq!(
+            normalize_sip_addr("192.168.1.1:5060"),
+            "sip:192.168.1.1:5060"
+        );
+        assert_eq!(
+            normalize_sip_addr("sip:192.168.1.1:5060"),
+            "sip:192.168.1.1:5060"
+        );
         assert_eq!(normalize_sip_addr("example.com"), "sip:example.com");
         assert_eq!(normalize_sip_addr("sip:example.com"), "sip:example.com");
         assert_eq!(normalize_sip_addr(""), "sip:");
