@@ -93,8 +93,8 @@ cargo run -- wait --addr 0.0.0.0:5060 -u sipbot --answer welcome.wav
 - `--auth-user <USER>`: Auth username (optional).
 - `-p, --password <PASS>`: Password for registration.
 - `--register [DOMAIN]`: Register to SIP server (optional domain).
-- `--ringback <FILE>`: Ringback file (wav).
-- `--ring-duration <SECONDS>`: Ring duration in seconds.
+- `--ringback [<FILE>]`: Ringback file (wav). Flag without value = built-in ringing.wav: sends 183, plays it to the end, then answers.
+- `--ring-duration <SECONDS>`: Ring duration in seconds (optional with `--ringback`; caps playback).
 - `--answer <FILE>`: Answer and play file (wav).
 - `--echo`: Answer and echo.
 - `--local`: Answer and use local audio device.
@@ -250,12 +250,13 @@ headers = [                     # Custom SIP headers
 # --- Call Handling Flow ---
 
 # Stage 1: Ringing
-# Wait for 5 seconds before answering.
-# If 'ringback' is provided, sends 183 Session Progress and plays the file.
-# If 'ringback' is omitted, sends 180 Ringing.
+# If 'ringback' is a file path, sends 183 Session Progress and plays the file.
+# If 'ringback' is "" (empty), sends 183 and plays the built-in ringing.wav, answering when it finishes.
+# If 'ringback' is omitted, sends 180 Ringing and waits 'duration_secs'.
 [accounts.ring]
 duration_secs = 5
-# ringback = "sounds/ringback.wav" 
+# ringback = "sounds/ringback.wav"
+# ringback = ""
 
 # Stage 2: Answer
 # Answer the call (200 OK) and perform an action.

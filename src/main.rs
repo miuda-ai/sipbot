@@ -143,10 +143,10 @@ enum Commands {
         /// Register to SIP server (optional domain)
         #[arg(short = 'r', long, num_args = 0..=1, default_missing_value = "")]
         register: Option<String>,
-        /// Ringback file (wav)
-        #[arg(long)]
+        /// Ringback file (wav). Flag without value = built-in ringing.wav (play to end, then answer)
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
         ringback: Option<String>,
-        /// Ring duration in seconds
+        /// Ring duration in seconds (caps the ring stage; optional with --ringback)
         #[arg(long)]
         ring_duration: Option<u64>,
         /// Answer and play file (wav)
@@ -354,7 +354,7 @@ async fn main() -> Result<()> {
 
                 let ring_config = if ringback.is_some() || ring_duration.is_some() {
                     Some(sipbot::config::RingConfig {
-                        duration_secs: ring_duration.unwrap_or(5),
+                        duration_secs: *ring_duration,
                         ringback: ringback.clone(),
                         local: Some(*local),
                     })

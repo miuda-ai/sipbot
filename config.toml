@@ -27,7 +27,7 @@ username = "1003"
 domain = "sip.example.com"
 password = "secretpassword"
 
-# Strategy: Ring for 5 seconds, then Reject
+# Strategy: Ring 5 seconds (180 Ringing, no media), then Reject
 [accounts.ring]
 duration_secs = 5
 # No ringback specified -> Send 180 Ringing
@@ -40,13 +40,11 @@ username = "1004"
 domain = "sip.example.com"
 password = "secretpassword"
 
-# Strategy: Early Media (Color Ring), Wait 10s, Answer, Play file
-[accounts.early_media]
-wav_file = "ringback.wav"
-
+# Strategy: Early Media (Color Ring), Answer, Play file
 [accounts.ring]
-duration_secs = 10
-ringback = "custom_ring.wav" # Send 183 and play file
+# ringback = "custom_ring.wav" # Send 183 and play file (duration_secs caps it)
+# ringback = ""                # Send 183 and play built-in ringing.wav, answer when it ends
+ringback = ""
 
 [accounts.answer]
 action = "play"

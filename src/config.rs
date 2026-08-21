@@ -369,8 +369,13 @@ pub struct EarlyMediaConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct RingConfig {
-    pub duration_secs: u64,
-    pub ringback: Option<String>, // Optional wav file for 183, otherwise 180
+    // Optional cap on the ring stage. If omitted with a ringback file/builtin,
+    // the call is answered when playback finishes.
+    #[serde(default)]
+    pub duration_secs: Option<u64>,
+    // Optional wav file for 183. Empty string = built-in ringing.wav.
+    // None -> 180 Ringing without media.
+    pub ringback: Option<String>,
     pub local: Option<bool>,
 }
 

@@ -1927,11 +1927,14 @@ impl SipBot {
                 if let Some(ref cfg) = account.ring {
                     let play_local = cfg.local.unwrap_or(false);
                     if play_local || cfg.ringback.is_some() {
+                        let builtin = cfg.ringback.as_deref() == Some("");
                         info!(
                             "[{}] Stage 1: Ringing with media (183) - {}",
                             account.username,
                             if play_local {
                                 "Local Device".to_string()
+                            } else if builtin {
+                                "Playing built-in ringing.wav".to_string()
                             } else {
                                 format!("Playing {}", cfg.ringback.as_deref().unwrap_or(""))
                             }
@@ -1964,7 +1967,7 @@ impl SipBot {
                                             account.username.clone(),
                                             None,
                                             true, // keep_alive=true so it doesn't stop
-                                            Some(cfg.duration_secs),
+                                            cfg.duration_secs,
                                         ) => {},
                                         _ = cancel_token.cancelled() => {},
                                         _ = call_token_for_logic.cancelled() => {},
@@ -1974,30 +1977,67 @@ impl SipBot {
                                 {
                                     error!("Local device support is disabled in this build");
                                     tokio::select! {
-                                        _ = tokio::time::sleep(Duration::from_secs(cfg.duration_secs)) => {}
+                                        _ = tokio::time::sleep(Duration::from_secs(cfg.duration_secs.unwrap_or(5))) => {}
                                         _ = cancel_token.cancelled() => {}
                                         _ = call_token_for_logic.cancelled() => {}
                                     }
                                 }
+                            } else if builtin {
+                                // Play built-in ringing.wav to the end, then answer
+                                let play = media.play_wav_bytes(
+                                    account.username.clone(),
+                                    RINGING_WAV,
+                                    None,
+                                    false,
+                                );
+                                tokio::pin!(play);
+                                match cfg.duration_secs {
+                                    Some(secs) => {
+                                        let _ = tokio::select! {
+                                            _ = &mut play => {},
+                                            _ = tokio::time::sleep(Duration::from_secs(secs)) => {},
+                                            _ = cancel_token.cancelled() => {},
+                                            _ = call_token_for_logic.cancelled() => {},
+                                        };
+                                    }
+                                    None => {
+                                        let _ = tokio::select! {
+                                            _ = &mut play => {},
+                                            _ = cancel_token.cancelled() => {},
+                                            _ = call_token_for_logic.cancelled() => {},
+                                        };
+                                    }
+                                }
                             } else if let Some(wav) = cfg.ringback.as_ref() {
-                                // Play file with timeout
-                                let _ = tokio::select! {
-                                    _ = tokio::time::timeout(
-                                        Duration::from_secs(cfg.duration_secs),
-                                        media.play_file(
-                                            account.username.clone(),
-                                            std::path::Path::new(wav),
-                                            None,
-                                            false,
-                                        ),
-                                    ) => {},
-                                    _ = cancel_token.cancelled() => {},
-                                    _ = call_token_for_logic.cancelled() => {},
-                                };
+                                // Play file (to the end if no duration set)
+                                let play = media.play_file(
+                                    account.username.clone(),
+                                    std::path::Path::new(wav),
+                                    None,
+                                    false,
+                                );
+                                tokio::pin!(play);
+                                match cfg.duration_secs {
+                                    Some(secs) => {
+                                        let _ = tokio::select! {
+                                            _ = &mut play => {},
+                                            _ = tokio::time::sleep(Duration::from_secs(secs)) => {},
+                                            _ = cancel_token.cancelled() => {},
+                                            _ = call_token_for_logic.cancelled() => {},
+                                        };
+                                    }
+                                    None => {
+                                        let _ = tokio::select! {
+                                            _ = &mut play => {},
+                                            _ = cancel_token.cancelled() => {},
+                                            _ = call_token_for_logic.cancelled() => {},
+                                        };
+                                    }
+                                }
                             }
                         } else {
                             tokio::select! {
-                                _ = tokio::time::sleep(Duration::from_secs(cfg.duration_secs)) => {}
+                                _ = tokio::time::sleep(Duration::from_secs(cfg.duration_secs.unwrap_or(5))) => {}
                                 _ = cancel_token.cancelled() => {}
                                 _ = call_token_for_logic.cancelled() => {}
                             }
@@ -2010,7 +2050,7 @@ impl SipBot {
                         }
                         stats_clone.add_status(180);
                         tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_secs(cfg.duration_secs)) => {}
+                            _ = tokio::time::sleep(Duration::from_secs(cfg.duration_secs.unwrap_or(5))) => {}
                             _ = cancel_token.cancelled() => {}
                             _ = call_token_for_logic.cancelled() => {}
                         }
