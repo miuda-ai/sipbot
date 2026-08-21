@@ -1,6 +1,6 @@
 [package]
 name = "sipbot"
-version = "0.2.55"
+version = "0.2.56"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 repository = "https://github.com/miuda-ai/sipbot"

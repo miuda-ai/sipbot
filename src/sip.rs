@@ -1984,11 +1984,10 @@ impl SipBot {
                                 }
                             } else if builtin {
                                 // Play built-in ringing.wav to the end, then answer
-                                let play = media.play_wav_bytes(
+                                let play = media.play_wav_bytes_once(
                                     account.username.clone(),
                                     RINGING_WAV,
                                     None,
-                                    false,
                                 );
                                 tokio::pin!(play);
                                 match cfg.duration_secs {
@@ -2009,12 +2008,11 @@ impl SipBot {
                                     }
                                 }
                             } else if let Some(wav) = cfg.ringback.as_ref() {
-                                // Play file (to the end if no duration set)
-                                let play = media.play_file(
+                                // Play file (once, to the end if no duration set)
+                                let play = media.play_file_once(
                                     account.username.clone(),
                                     std::path::Path::new(wav),
                                     None,
-                                    false,
                                 );
                                 tokio::pin!(play);
                                 match cfg.duration_secs {

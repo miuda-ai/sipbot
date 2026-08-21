@@ -1935,73 +1935,25 @@ impl MediaSession {
     ) -> Result<()> {
         info!("[{}] Playing file: {:?}", username, file_path);
 
-        self.init_recorder(&username, recording_path).await;
+        let mut reader = hound::WavReader::open(file_path).context("Failed to open WAV file")?;
+        let samples = self.load_codec_samples(&username, &mut reader)?;
+        self.run_playback(username, samples, recording_path, keep_alive, true)
+            .await
+    }
+
+    /// Play a WAV file exactly once (looping disabled); returns when finished.
+    pub async fn play_file_once(
+        &self,
+        username: String,
+        file_path: &Path,
+        recording_path: Option<&Path>,
+    ) -> Result<()> {
+        info!("[{}] Playing file (once): {:?}", username, file_path);
 
         let mut reader = hound::WavReader::open(file_path).context("Failed to open WAV file")?;
-        let spec = reader.spec();
-        let raw_samples: Vec<i16> = reader.samples::<i16>().map(|s| s.unwrap_or(0)).collect();
-
-        let pt = self
-            .pc
-            .get_transceivers()
-            .first()
-            .and_then(|t| t.sender().as_ref().map(|s| s.params().payload_type));
-        let target_sample_rate =
-            get_codec_type(pt, &self.pc.config().media_capabilities).samplerate();
-
-        let samples = if spec.sample_rate != target_sample_rate || spec.channels != 1 {
-            info!(
-                "[{}] Resampling audio from {}Hz {}ch to {}Hz 1ch",
-                username, spec.sample_rate, spec.channels, target_sample_rate
-            );
-            resample_audio(
-                raw_samples,
-                spec.sample_rate,
-                target_sample_rate,
-                spec.channels,
-            )?
-        } else {
-            raw_samples
-        };
-
-        let child_token = self.cancel_token.child_token();
-
-        // Handle existing transceivers
-        self.setup_transceivers_for_recording(child_token.clone())
-            .await;
-
-        let rx_task = self.spawn_track_event_handler(username.clone(), child_token.clone());
-
-        let play_fut = self.play_samples(username.clone(), samples);
-        tokio::pin!(play_fut);
-        tokio::pin!(rx_task);
-
-        let mut play_done = false;
-        let mut sync_interval = tokio::time::interval(Duration::from_secs(1));
-
-        loop {
-            tokio::select! {
-                _ = sync_interval.tick() => {
-                    self.sync_nack_stats();
-                }
-                res = &mut play_fut, if !play_done => {
-                    play_done = true;
-                    if let Err(e) = res {
-                        error!("[{}] Playback error: {:?}", username, e);
-                    }
-                    if !keep_alive {
-                        return Ok(());
-                    }
-                    info!("[{}] Playback finished, keeping alive...", username);
-                }
-                _ = &mut rx_task => {
-                    return Ok(())
-                }
-                _ = self.cancel_token.cancelled() => {
-                    return Ok(())
-                }
-            }
-        }
+        let samples = self.load_codec_samples(&username, &mut reader)?;
+        self.run_playback(username, samples, recording_path, false, false)
+            .await
     }
 
     pub async fn play_wav_bytes(
@@ -2013,10 +1965,35 @@ impl MediaSession {
     ) -> Result<()> {
         info!("[{}] Playing embedded wav...", username);
 
-        self.init_recorder(&username, recording_path).await;
+        let mut reader = hound::WavReader::new(Cursor::new(wav_bytes))
+            .context("Failed to read WAV bytes")?;
+        let samples = self.load_codec_samples(&username, &mut reader)?;
+        self.run_playback(username, samples, recording_path, keep_alive, true)
+            .await
+    }
 
-        let cursor = Cursor::new(wav_bytes);
-        let mut reader = hound::WavReader::new(cursor).context("Failed to read WAV bytes")?;
+    /// Play embedded WAV bytes exactly once (looping disabled); returns when finished.
+    pub async fn play_wav_bytes_once(
+        &self,
+        username: String,
+        wav_bytes: &[u8],
+        recording_path: Option<&Path>,
+    ) -> Result<()> {
+        info!("[{}] Playing embedded wav (once)...", username);
+
+        let mut reader = hound::WavReader::new(Cursor::new(wav_bytes))
+            .context("Failed to read WAV bytes")?;
+        let samples = self.load_codec_samples(&username, &mut reader)?;
+        self.run_playback(username, samples, recording_path, false, false)
+            .await
+    }
+
+    /// Load WAV samples and resample to the negotiated codec's sample rate.
+    fn load_codec_samples<R: std::io::Read + std::io::Seek>(
+        &self,
+        username: &str,
+        reader: &mut hound::WavReader<R>,
+    ) -> Result<Vec<i16>> {
         let spec = reader.spec();
         let raw_samples: Vec<i16> = reader.samples::<i16>().map(|s| s.unwrap_or(0)).collect();
 
@@ -2028,7 +2005,7 @@ impl MediaSession {
         let target_sample_rate =
             get_codec_type(pt, &self.pc.config().media_capabilities).samplerate();
 
-        let samples = if spec.sample_rate != target_sample_rate || spec.channels != 1 {
+        if spec.sample_rate != target_sample_rate || spec.channels != 1 {
             info!(
                 "[{}] Resampling audio from {}Hz {}ch to {}Hz 1ch",
                 username, spec.sample_rate, spec.channels, target_sample_rate
@@ -2038,19 +2015,32 @@ impl MediaSession {
                 spec.sample_rate,
                 target_sample_rate,
                 spec.channels,
-            )?
+            )
         } else {
-            raw_samples
-        };
+            Ok(raw_samples)
+        }
+    }
+
+    /// Shared playback session: transceiver setup, RX observer, pacing loop.
+    async fn run_playback(
+        &self,
+        username: String,
+        samples: Vec<i16>,
+        recording_path: Option<&Path>,
+        keep_alive: bool,
+        loop_playback: bool,
+    ) -> Result<()> {
+        self.init_recorder(&username, recording_path).await;
 
         let child_token = self.cancel_token.child_token();
 
+        // Handle existing transceivers
         self.setup_transceivers_for_recording(child_token.clone())
             .await;
 
         let rx_task = self.spawn_track_event_handler(username.clone(), child_token.clone());
 
-        let play_fut = self.play_samples(username.clone(), samples);
+        let play_fut = self.play_samples(username.clone(), samples, loop_playback);
         tokio::pin!(play_fut);
         tokio::pin!(rx_task);
 
@@ -2073,16 +2063,21 @@ impl MediaSession {
                     info!("[{}] Playback finished, keeping alive...", username);
                 }
                 _ = &mut rx_task => {
-                    return Ok(());
+                    return Ok(())
                 }
                 _ = self.cancel_token.cancelled() => {
-                    return Ok(());
+                    return Ok(())
                 }
             }
         }
     }
 
-    async fn play_samples(&self, username: String, samples: Vec<i16>) -> Result<()> {
+    async fn play_samples(
+        &self,
+        username: String,
+        samples: Vec<i16>,
+        loop_playback: bool,
+    ) -> Result<()> {
         let pt = self
             .pc
             .get_transceivers()
@@ -2152,6 +2147,9 @@ impl MediaSession {
 
             // Loop audio: wrap around when all chunks have been played
             if num_chunks == 0 {
+                break;
+            }
+            if !loop_playback && chunk_index >= num_chunks {
                 break;
             }
             let ci = chunk_index % num_chunks;
