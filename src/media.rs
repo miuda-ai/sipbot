@@ -10,7 +10,8 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 #[cfg(feature = "local-device")]
 use ringbuf::{HeapRb, traits::*};
 use rustrtc::config::{
-    AudioCapability, MediaCapabilities, RtcConfiguration, RtcpMuxPolicy, TransportMode,
+    AudioCapability, MediaCapabilities, RtcConfiguration, RtcpMuxPolicy, SdpCompatibilityMode,
+    TransportMode,
 };
 use rustrtc::media::MediaError;
 use rustrtc::media::MediaKind;
@@ -38,8 +39,22 @@ fn new_resampler(input_rate: usize, output_rate: usize) -> Option<Resampler<'sta
     Resampler::new(input_rate, output_rate, coeffs).ok()
 }
 
+/// Encoding channel count. Always encode Opus as MONO, even when the
+/// negotiated rtpmap says opus/48000/2: the pure-Rust opus encoder
+/// (opus-rs) fails on stereo input (SILK stereo path returns empty packets),
+/// and Opus receivers adapt to the per-packet channel count carried in the
+/// TOC byte, so mono packets are decoded fine.
+fn encode_channels(ct: CodecType, negotiated: u16) -> u16 {
+    if ct == CodecType::Opus {
+        1
+    } else {
+        negotiated
+    }
+}
+
 fn create_encoder_for(ct: CodecType, channels: u16) -> Box<dyn audio_codec::Encoder> {
     if ct == CodecType::Opus {
+        let channels = encode_channels(ct, channels);
         let app = if channels == 2 {
             audio_codec::opus::OpusApplication::Audio
         } else {
@@ -215,7 +230,15 @@ fn get_audio_caps(codecs: &Option<Vec<String>>, nack_enabled: bool) -> Vec<Audio
         let mut cap = match codec.to_lowercase().as_str() {
             "pcmu" => AudioCapability::pcmu(),
             "pcma" => AudioCapability::pcma(),
-            "opus" => AudioCapability::opus(),
+            "opus" => {
+                let mut cap = AudioCapability::opus();
+                // RFC 7587: rtpmap stays opus/48000/2 (mandatory), but we only
+                // ever send mono packets (see encode_channels). Declare the
+                // send capability explicitly; stereo=1 remains a receive
+                // capability.
+                cap.fmtp = Some("minptime=10;useinbandfec=1;stereo=1;sprop-stereo=0".to_string());
+                cap
+            }
             _ => {
                 if let Ok(ct) = CodecType::try_from(codec.as_str()) {
                     AudioCapability {
@@ -302,6 +325,36 @@ pub struct MediaSession {
     /// RTP timestamp-jump tolerance in milliseconds. Any forward/backward
     /// deviation beyond this counts as a `ts_jump` (audio-glitch warning).
     ts_jump_tolerance_ms: u32,
+    /// Continuity state for locally generated RTP timestamps, shared across
+    /// playback sessions (183 early media -> 200 OK answer). Keeps the next
+    /// session advancing from the last emitted timestamp (plus the idle gap)
+    /// instead of starting from a fresh random base, which receivers' jitter
+    /// buffers hear as a discontinuity (seq continues but ts jumps).
+    rtp_ts_state: Arc<std::sync::Mutex<Option<(u32, std::time::Instant)>>>,
+}
+
+/// Continuity helpers for locally generated RTP timestamps (see
+/// [`MediaSession::rtp_ts_state`]).
+fn session_rtp_ts_start(
+    state: &Arc<std::sync::Mutex<Option<(u32, std::time::Instant)>>>,
+    clock_rate: u32,
+) -> u32 {
+    let st = state.lock().unwrap();
+    match *st {
+        Some((ts, at)) => {
+            // Advance by the idle gap so the RTP clock keeps tracking real time.
+            let advance = (at.elapsed().as_secs_f64() * clock_rate as f64) as u32;
+            ts.wrapping_add(advance)
+        }
+        None => random_u32(),
+    }
+}
+
+fn session_rtp_ts_mark(
+    state: &Arc<std::sync::Mutex<Option<(u32, std::time::Instant)>>>,
+    ts: u32,
+) {
+    *state.lock().unwrap() = Some((ts, std::time::Instant::now()));
 }
 
 impl MediaSession {
@@ -386,6 +439,13 @@ impl MediaSession {
             config.certificates = vec![];
             TransportMode::Rtp
         };
+        // Plain SIP interop (Linphone etc.): never negotiate RFC 8843 BUNDLE.
+        // We don't send the sdes:mid RTP header extension, so bundle demuxers
+        // (ortp) would drop every packet: "SSRC not found and msg does not
+        // have an extension header".
+        if !webrtc_enabled {
+            config.sdp_compatibility = SdpCompatibilityMode::LegacySip;
+        }
         let mut audio_caps = get_audio_caps(&codecs, nack_enabled);
         let remote_sdp_upper = remote_sdp.to_uppercase();
 
@@ -393,18 +453,13 @@ impl MediaSession {
         let mut remote_pt_map: std::collections::HashMap<String, u8> =
             std::collections::HashMap::new();
         for line in remote_sdp.lines() {
-            if line.to_lowercase().starts_with("a=rtpmap:") {
-                // Format: a=rtpmap:111 opus/48000/2
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    if let Some(pt_and_codec) = parts[1].split_once(' ') {
-                        let pt_str = pt_and_codec.0;
-                        let codec_spec = pt_and_codec.1;
-                        if let Ok(pt) = pt_str.parse::<u8>() {
-                            let codec_name =
-                                codec_spec.split('/').next().unwrap_or("").to_uppercase();
-                            remote_pt_map.insert(codec_name, pt);
-                        }
+            // Format: a=rtpmap:111 opus/48000/2
+            if let Some(rest) = line.to_lowercase().strip_prefix("a=rtpmap:") {
+                if let Some((pt_str, codec_spec)) = rest.trim().split_once(' ') {
+                    if let Ok(pt) = pt_str.parse::<u8>() {
+                        let codec_name =
+                            codec_spec.split('/').next().unwrap_or("").to_uppercase();
+                        remote_pt_map.insert(codec_name, pt);
                     }
                 }
             }
@@ -436,6 +491,11 @@ impl MediaSession {
                 cap.payload_type = remote_pt;
             }
         }
+
+        // RFC 3264: answer codecs in the order the offer listed them, so the
+        // offerer's most preferred codec comes first instead of our local
+        // preference order (e.g. Linphone offers opus,pcmu -> answer opus,pcmu).
+        order_caps_by_remote_offer(&mut audio_caps, remote_sdp);
 
         if audio_caps.is_empty() {
             info!("No matching codecs found in offer, falling back to PCMU");
@@ -553,6 +613,7 @@ impl MediaSession {
             audio_quality_config: _audio_quality_config.clone(),
             audio_silent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ts_jump_tolerance_ms,
+            rtp_ts_state: Arc::new(std::sync::Mutex::new(None)),
         };
 
         // Spawn a background task to listen for incoming track events so there is
@@ -638,6 +699,10 @@ impl MediaSession {
             config.certificates = vec![];
             TransportMode::Rtp
         };
+        // See MediaSession::new: don't negotiate BUNDLE with plain SIP peers.
+        if !webrtc_enabled {
+            config.sdp_compatibility = SdpCompatibilityMode::LegacySip;
+        }
         let audio_caps = get_audio_caps(&codecs, nack_enabled);
         let audio_clock = match audio_caps
             .first()
@@ -744,6 +809,7 @@ impl MediaSession {
             audio_quality_config: _audio_quality_config.clone(),
             audio_silent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ts_jump_tolerance_ms,
+            rtp_ts_state: Arc::new(std::sync::Mutex::new(None)),
         };
 
         session.spawn_rtcp_rtt_collectors();
@@ -1759,8 +1825,10 @@ impl MediaSession {
             let ct = get_codec_type(pt, &session_input_clone.pc.config().media_capabilities);
 
             let target_sample_rate = ct.samplerate();
-            let target_channels =
-                get_codec_channels(pt, &session_input_clone.pc.config().media_capabilities, ct);
+            let target_channels = encode_channels(
+                ct,
+                get_codec_channels(pt, &session_input_clone.pc.config().media_capabilities, ct),
+            );
 
             let mut encoder = create_encoder_for(ct, target_channels);
 
@@ -1773,7 +1841,8 @@ impl MediaSession {
                 None
             };
 
-            let mut rtp_timestamp: u32 = random_u32();
+            let mut rtp_timestamp: u32 =
+                session_rtp_ts_start(&session_input_clone.rtp_ts_state, ct.clock_rate());
             let samples_per_frame = (target_sample_rate / 50) as usize; // 20ms
             let mut input_buffer: Vec<i16> =
                 Vec::with_capacity(samples_per_frame * target_channels as usize);
@@ -1846,6 +1915,7 @@ impl MediaSession {
                     let ticks = (samples_per_frame as u64 * ct.clock_rate() as u64
                         / target_sample_rate as u64) as u32;
                     rtp_timestamp = rtp_timestamp.wrapping_add(ticks);
+                    session_rtp_ts_mark(&session_input_clone.rtp_ts_state, rtp_timestamp);
                 }
             }
         };
@@ -2087,7 +2157,10 @@ impl MediaSession {
 
         let sample_rate = ct.samplerate();
         let clock_rate = ct.clock_rate();
-        let channels = get_codec_channels(pt, &self.pc.config().media_capabilities, ct);
+        let channels = encode_channels(
+            ct,
+            get_codec_channels(pt, &self.pc.config().media_capabilities, ct),
+        );
         let mut encoder = create_encoder_for(ct, channels);
         let payload_type = pt.unwrap_or(ct.payload_type());
 
@@ -2140,7 +2213,7 @@ impl MediaSession {
         let num_chunks = (samples.len() + chunk_size - 1) / chunk_size;
         let num_record_chunks = (record_samples.len() + record_chunk_size - 1) / record_chunk_size;
         let mut sent_chunks = 0u64;
-        let mut rtp_timestamp: u32 = random_u32();
+        let mut rtp_timestamp: u32 = session_rtp_ts_start(&self.rtp_ts_state, clock_rate);
 
         loop {
             ticker.tick().await;
@@ -2199,6 +2272,7 @@ impl MediaSession {
             if self.audio_silent.load(Ordering::Relaxed) {
                 let ticks = (chunk_size as u64 * clock_rate as u64 / sample_rate as u64) as u32;
                 rtp_timestamp = rtp_timestamp.wrapping_add(ticks);
+                session_rtp_ts_mark(&self.rtp_ts_state, rtp_timestamp);
                 continue;
             }
 
@@ -2232,6 +2306,7 @@ impl MediaSession {
 
             let ticks = (chunk_size as u64 * clock_rate as u64 / sample_rate as u64) as u32;
             rtp_timestamp = rtp_timestamp.wrapping_add(ticks);
+            session_rtp_ts_mark(&self.rtp_ts_state, rtp_timestamp);
 
             if let Err(e) = self.audio_source.send_audio(frame) {
                 error!("[{}] Failed to send audio: {:?}", username, e);
@@ -2444,6 +2519,44 @@ fn pick_telephone_event(remote_sdp: &str, audio_clock: u32) -> dtmf::TelephoneEv
         })
 }
 
+/// Reorder answer capabilities to follow the remote offer's codec order
+/// (RFC 3264). Position is taken from the m=audio payload list; caps whose PT
+/// is absent there fall back to their a=rtpmap order, and unknown caps keep
+/// their local (stable sort) order at the end.
+fn order_caps_by_remote_offer(caps: &mut [AudioCapability], remote_sdp: &str) {
+    let mut pt_pos: std::collections::HashMap<u8, usize> = std::collections::HashMap::new();
+    let mut name_pos: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    if let Some(mline) = remote_sdp
+        .lines()
+        .find(|l| l.to_lowercase().starts_with("m=audio"))
+    {
+        for (i, tok) in mline.split_whitespace().skip(3).enumerate() {
+            if let Ok(pt) = tok.parse::<u8>() {
+                pt_pos.entry(pt).or_insert(i);
+            }
+        }
+    }
+    for (i, line) in remote_sdp.lines().enumerate() {
+        let lower = line.to_lowercase();
+        if let Some(rest) = lower.strip_prefix("a=rtpmap:") {
+            if let Some((_, codec_spec)) = rest.split_once(' ') {
+                if let Some(name) = codec_spec.split('/').next() {
+                    name_pos.entry(name.trim().to_string()).or_insert(i);
+                }
+            }
+        }
+    }
+
+    caps.sort_by_key(|cap| {
+        pt_pos
+            .get(&cap.payload_type)
+            .copied()
+            .or_else(|| name_pos.get(&cap.codec_name.to_lowercase()).copied())
+            .unwrap_or(usize::MAX)
+    });
+}
+
 fn inject_telephone_event_sdp(sdp: &str, info: dtmf::TelephoneEventInfo) -> String {
     if sdp.to_lowercase().contains("telephone-event") {
         return sdp.to_string();
@@ -2488,7 +2601,10 @@ fn inject_telephone_event_sdp(sdp: &str, info: dtmf::TelephoneEventInfo) -> Stri
         );
     }
 
-    lines.join("\n")
+    // RFC 4566 mandates CRLF line endings; belle-sip (Linphone) rejects LF-only SDP.
+    let mut out = lines.join("\r\n");
+    out.push_str("\r\n");
+    out
 }
 
 fn spawn_track_recorder(
@@ -2925,6 +3041,7 @@ async fn process_recorded_sample(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DEFAULT_TS_JUMP_TOLERANCE_MS;
 
     #[test]
     fn test_resample_audio_identity() {
@@ -3023,6 +3140,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_media_session_answer_no_bundle_for_linphone_offer() {
+        // Linphone-style offer: a=group:BUNDLE + sdes:mid extmap. Our answer
+        // must NOT echo the BUNDLE group, otherwise ortp demuxes by MID
+        // extension and drops our RTP ("SSRC not found and msg does not have
+        // an extension header").
+        let offer = "v=0\r\n\
+o=alice 1285 868 IN IP4 192.168.3.181\r\n\
+s=Talk\r\n\
+c=IN IP4 192.168.3.181\r\n\
+t=0 0\r\n\
+a=group:BUNDLE as\r\n\
+m=audio 55315 RTP/AVP 96 0 101\r\n\
+a=rtpmap:96 opus/48000/2\r\n\
+a=fmtp:96 useinbandfec=1\r\n\
+a=rtpmap:101 telephone-event/48000\r\n\
+a=rtcp-mux\r\n\
+a=mid:as\r\n\
+a=extmap:1 urn:ietf:params:rtp-hdrext:sdes:mid\r\n\
+a=sendrecv\r\n";
+        let stats = Arc::new(CallStats::new());
+        let (_session, answer_sdp, _) = MediaSession::new(
+            offer,
+            false,
+            false,
+            false,
+            false,
+            None,
+            None,
+            stats,
+            None,
+            DEFAULT_TS_JUMP_TOLERANCE_MS,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !answer_sdp.to_lowercase().contains("a=group:bundle"),
+            "answer must not negotiate BUNDLE: {}",
+            answer_sdp
+        );
+        // Codec order follows the offer (opus before pcmu).
+        let mline = answer_sdp
+            .lines()
+            .find(|l| l.to_lowercase().starts_with("m=audio"))
+            .unwrap();
+        assert!(mline.contains("96"), "mline: {}", mline);
+        let pos_96 = mline.find("96").unwrap();
+        let pos_0 = mline.find(" 0").map(|i| i + 1).unwrap();
+        assert!(pos_96 < pos_0, "opus (96) must precede pcmu (0): {}", mline);
+    }
+
+    #[tokio::test]
     async fn test_media_session_negotiation_g729() {
         let stats = Arc::new(CallStats::new());
 
@@ -3100,6 +3268,62 @@ mod tests {
         // Echo tracking must be independent from recorder tracking.
         assert!(session.try_track_echo_mid("audio-0").await);
         assert!(!session.try_track_echo_mid("audio-0").await);
+    }
+
+    #[test]
+    fn test_order_caps_by_remote_offer_follows_mline_order() {
+        // Linphone-style offer: opus (96) first, then PCMU (0), telephone-event.
+        let remote = "v=0\r\nm=audio 55315 RTP/AVP 96 0 101\r\na=rtpmap:96 opus/48000/2\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n";
+        // Local preference: PCMU before opus (default codec list order).
+        let mut caps = vec![AudioCapability::pcmu(), AudioCapability::opus()];
+        // PT remap, as done in MediaSession::new.
+        for cap in &mut caps {
+            if cap.codec_name.eq_ignore_ascii_case("opus") {
+                cap.payload_type = 96;
+            }
+        }
+        order_caps_by_remote_offer(&mut caps, remote);
+        assert_eq!(caps[0].codec_name.to_lowercase(), "opus");
+        assert_eq!(caps[0].payload_type, 96);
+        assert_eq!(caps[1].codec_name.to_lowercase(), "pcmu");
+    }
+
+    #[test]
+    fn test_order_caps_by_remote_offer_rtpmap_fallback() {
+        // Static PT (0) is in the m-line; dynamic caps not listed there fall
+        // back to rtpmap order, and unknown caps stay last (stable).
+        let remote = "v=0\r\nm=audio 4000 RTP/AVP 0 8\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\n";
+        let mut caps = vec![AudioCapability::pcma(), AudioCapability::pcmu()];
+        order_caps_by_remote_offer(&mut caps, remote);
+        assert_eq!(caps[0].codec_name.to_lowercase(), "pcmu");
+        assert_eq!(caps[1].codec_name.to_lowercase(), "pcma");
+    }
+
+    #[test]
+    fn test_session_rtp_ts_continuity() {
+        let state = Arc::new(std::sync::Mutex::new(None));
+        let first = session_rtp_ts_start(&state, 48000);
+        // No history yet -> random base, state stays None until marked.
+        assert!(state.lock().unwrap().is_none());
+        session_rtp_ts_mark(&state, first);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let second = session_rtp_ts_start(&state, 48000);
+        let diff = second.wrapping_sub(first);
+        // 30ms idle gap at 48kHz must advance >= 20ms worth of ticks.
+        assert!(
+            diff >= 960,
+            "ts should advance by the idle gap, got diff={}",
+            diff
+        );
+    }
+
+    #[test]
+    fn test_opus_caps_advertise_mono_send() {
+        let caps = get_audio_caps(&Some(vec!["opus".to_string()]), false);
+        let fmtp = caps[0].fmtp.as_deref().unwrap_or_default();
+        assert!(fmtp.contains("sprop-stereo=0"), "fmtp: {}", fmtp);
+        assert!(fmtp.contains("stereo=1"), "fmtp: {}", fmtp);
+        assert_eq!(caps[0].channels, 2, "rtpmap channels must stay opus/48000/2");
     }
 
     #[test]

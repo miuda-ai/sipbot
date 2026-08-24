@@ -153,7 +153,10 @@ pub fn inject_telephone_event_caps(sdp: &str, pt: u8) -> String {
         lines.insert(idx + 2, build_fmtp_line(new_pt));
     }
 
-    lines.join("\n")
+    // RFC 4566 mandates CRLF line endings; belle-sip (Linphone) rejects LF-only SDP.
+    let mut out = lines.join("\r\n");
+    out.push_str("\r\n");
+    out
 }
 
 #[cfg(test)]
