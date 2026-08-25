@@ -125,17 +125,50 @@ impl CallRunner {
         let username = self.account.username.clone();
         let answer_config = self.account.answer.clone();
 
-        // Caller mode (outbound `call`, target set): do NOT take over playback
-        // here. The final 200 OK may negotiate a different codec than the 183
-        // early media (e.g. rustpbx sends a multi-codec 183 answer then a
-        // callee-selected-codec 200 OK). Starting playback now with the 183
-        // codec would leave the sender stamped for the 200 OK codec,
-        // producing undecodable audio. start_media_playback() will start the
-        // real playback once the 200 OK is applied, with the final codec.
-        // The RX observer still runs in the background (detached) so early
-        // media RTP (ringback/busy/failure tones) is counted in RX stats.
+        // Caller mode (outbound `call`, target set):
+        // - Do NOT start file/echo TX playback here. The final 200 OK may
+        //   negotiate a different codec than the 183 early media; starting
+        //   send-side playback with the 183 codec can leave the sender stamped
+        //   for the wrong codec after answer.
+        // - DO open the local device when configured for Local, so the caller
+        //   can hear the remote CRBT / ringback on 183. Mic is muted until
+        //   200 OK (see start_media_playback).
+        // - Otherwise only observe RX so early-media RTP is counted in stats.
         let is_caller = self.account.target.is_some();
         if is_caller {
+            if matches!(answer_config, Some(AnswerConfig::Local)) {
+                info!(
+                    "[{}] Playing remote early media (CRBT/彩铃) on local device",
+                    username
+                );
+                media_clone.set_audio_silent(true).await;
+                #[cfg(feature = "local-device")]
+                {
+                    return Some(tokio::spawn(async move {
+                        if let Err(e) = media_clone
+                            .play_local_device(username.clone(), None, true, None)
+                            .await
+                        {
+                            error!(
+                                "[{}] Failed to play remote early media on local device: {:?}",
+                                username, e
+                            );
+                        }
+                    }));
+                }
+                #[cfg(not(feature = "local-device"))]
+                {
+                    warn!(
+                        "[{}] Local device support is disabled; cannot play remote early media",
+                        username
+                    );
+                    let _rx = media_clone
+                        .start_rx_observer(format!("{username}-early-media"))
+                        .await;
+                    return None;
+                }
+            }
+
             let _rx = media_clone
                 .start_rx_observer(format!("{username}-early-media"))
                 .await;
@@ -195,7 +228,17 @@ impl CallRunner {
         answer_config: Option<AnswerConfig>,
     ) {
         if let Some(task) = media_task {
+            // Early media already opened the local device (e.g. to hear remote
+            // CRBT). Unmute mic now that the call is answered, attach recorder
+            // if needed, then keep the session until hangup.
+            media_session.set_audio_silent(false).await;
             info!("[{}] Using already started early media.", username);
+            #[cfg(feature = "local-device")]
+            {
+                let _ = media_session
+                    .play_local_device(username.clone(), record_path.as_deref(), keep_alive, None)
+                    .await;
+            }
             let _ = task.await;
             return;
         }
@@ -213,6 +256,7 @@ impl CallRunner {
                     }
                 }
                 AnswerConfig::Local => {
+                    media_session.set_audio_silent(false).await;
                     #[cfg(feature = "local-device")]
                     if let Err(e) = media_session
                         .play_local_device(username.clone(), record_path_ref, keep_alive, None)

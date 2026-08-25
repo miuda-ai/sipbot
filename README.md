@@ -18,7 +18,7 @@ The media transport uses [rustrtc](https://github.com/restsend/rustrtc).
     - **Echo**: Echo received RTP packets back to the sender (Latency testing).
     - **Local**: Use local audio device for playback and capture (Mic/Speaker).
   - **Hangup (Stage 3)**: Automatically hang up after a configurable duration or reject calls with specific SIP codes.
-- **Outbound Calls**: Ability to initiate calls to a target URI.
+- **Outbound Calls**: Ability to initiate calls to a target URI. With `--local`, the caller plays remote early media (CRBT / 彩铃) on the speaker when the peer sends `183` with SDP.
 - **Call Recording**: (Experimental) Record call audio to WAV files. (Requires configuration)
 - **DTMF (RFC 2833)**: Send DTMF digits via keyboard during single calls; receive and log DTMF events from remote endpoints. Supports scheduled DTMF flows: `--dtmf-flows "1s:2,1.5s:#"`.
 - **Hold/Resume (Re-INVITE)**: Automatically send hold/resume re-INVITEs at scheduled times. Supports `--reinvite-flows "5s:hold,10s:resume"` — ideal for testing RFC 3264 SDP direction negotiation and RTP silence during hold.
@@ -63,7 +63,7 @@ cargo run -- call -t sip:user@domain -u sipbot --play audio.wav --hangup 10 --to
 - `--register [DOMAIN]`: Register to SIP server before calling (optional domain).
 - `--hangup <SECONDS>`: Hangup after seconds.
 - `--play <FILE>`: Play file (wav).
-- `--local`: Use local audio device for playback and capture.
+- `--local`: Use local audio device for playback and capture. Also plays remote early media (CRBT / 彩铃) to the speaker when the peer sends `183 Session Progress` with SDP.
 - `--record <FILE>`: Record to file (wav). If multiple calls are made, the filename will be suffixed with the call index (e.g., `record_1.wav`).
 - `--srtp`: Enable SRTP/SDES.
 - `--nack`: Enable NACK.
@@ -129,10 +129,14 @@ sipbot wait --username echo-bot --echo
 
 ### 2. Intercom Mode (Local Audio)
 
-Use your computer's microphone and speakers to talk to a SIP caller.
+Use your computer's microphone and speakers to talk to a SIP endpoint.
 
 ```bash
+# Answer incoming calls with local audio
 sipbot wait --username intercom --local
+
+# Outbound call: hear remote CRBT/彩铃 on 183, then talk after answer
+sipbot call -t sip:user@domain -u sipbot --local
 ```
 
 ### 3. Automated Announcement
