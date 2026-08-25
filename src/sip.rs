@@ -1513,6 +1513,59 @@ impl SipBot {
             .is_some_and(|to| to.value().to_string().contains("tag="))
     }
 
+    /// Rewrite an incoming request's Contact whose host is unspecified (e.g. `0.0.0.0`)
+    /// to the top Via's `received` IP and `rport` port (RFC 3581), falling back to the
+    /// Via sent-by address and finally to the default SIP port 5060.
+    fn fix_unspecified_contact(request: &mut rsipstack::rsip::Request) {
+        let needs_fix = request
+            .typed_contact_headers()
+            .ok()
+            .and_then(|cs| cs.first().cloned())
+            .is_some_and(|c| {
+                matches!(&c.uri.host_with_port.host, Host::IpAddr(ip) if ip.is_unspecified())
+            });
+        if !needs_fix {
+            return;
+        }
+
+        let via = request
+            .top_via_header()
+            .ok()
+            .and_then(|v| v.typed().ok());
+        let Some(via) = via else {
+            return;
+        };
+        let ip = via
+            .received()
+            .and_then(|r| r.ok())
+            .or_else(|| match via.sent_by().host {
+                Host::IpAddr(ip) if !ip.is_unspecified() => Some(ip),
+                _ => None,
+            });
+        let Some(ip) = ip else {
+            warn!("Contact host is unspecified but no usable address in Via, leaving as-is");
+            return;
+        };
+        let port = via
+            .rport()
+            .flatten()
+            .or_else(|| via.sent_by().port.map(|p| p.0))
+            .unwrap_or(5060);
+
+        if let Ok(contact) = request.contact_header_mut()
+            && let Ok(mut typed) = rsipstack::rsip::typed::Contact::parse(contact.value())
+        {
+            let old = typed.uri.host_with_port.to_string();
+            typed.uri.host_with_port = HostWithPort {
+                host: Host::IpAddr(ip),
+                port: Some(rsipstack::rsip::Port(port)),
+            };
+            let new_value = typed.to_string();
+            contact.replace(new_value);
+            info!("Fixed unspecified Contact host {} -> {}:{}", old, ip, port);
+        }
+    }
+
     /// Handle a re-INVITE (e.g., for hold/resume scenarios).
     ///
     /// Parses the offer for direction attribute:
@@ -1587,6 +1640,7 @@ impl SipBot {
     async fn handle_incoming_transaction(&self, mut transaction: Transaction) -> Result<()> {
         match transaction.original.method {
             Method::Invite => {
+                Self::fix_unspecified_contact(&mut transaction.original);
                 if Self::is_reinvite(&transaction) {
                     self.handle_reinvite(transaction).await?
                 } else {
@@ -2348,5 +2402,55 @@ mod tests {
         assert_eq!(normalize_sip_addr("example.com"), "sip:example.com");
         assert_eq!(normalize_sip_addr("sip:example.com"), "sip:example.com");
         assert_eq!(normalize_sip_addr(""), "sip:");
+    }
+
+    fn make_invite_with_contact(contact: &str, via: &str) -> rsipstack::rsip::Request {
+        let raw = format!(
+            "INVITE sip:bot@192.168.1.2:5060 SIP/2.0\r\n\
+             Via: {}\r\n\
+             From: <sip:caller@example.com>;tag=abc\r\n\
+             To: <sip:bot@example.com>\r\n\
+             Call-ID: fix-test@192.168.1.2\r\n\
+             CSeq: 1 INVITE\r\n\
+             Max-Forwards: 70\r\n\
+             Contact: {}\r\n\
+             Content-Length: 0\r\n\
+             \r\n",
+            via, contact
+        );
+        raw.try_into().unwrap()
+    }
+
+    #[test]
+    fn test_fix_unspecified_contact_with_received_rport() {
+        let mut req = make_invite_with_contact(
+            "<sip:caller@0.0.0.0:5060>",
+            "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK1;rport=51372;received=203.0.113.5",
+        );
+        SipBot::fix_unspecified_contact(&mut req);
+        let contact = req.contact_header().unwrap().value().to_string();
+        assert!(contact.contains("sip:caller@203.0.113.5:51372"), "{}", contact);
+    }
+
+    #[test]
+    fn test_fix_unspecified_contact_fallback_via_sent_by() {
+        let mut req = make_invite_with_contact(
+            "sip:caller@0.0.0.0",
+            "SIP/2.0/UDP 203.0.113.9:6060;branch=z9hG4bK2",
+        );
+        SipBot::fix_unspecified_contact(&mut req);
+        let contact = req.contact_header().unwrap().value().to_string();
+        assert!(contact.contains("sip:caller@203.0.113.9:6060"), "{}", contact);
+    }
+
+    #[test]
+    fn test_fix_unspecified_contact_keeps_valid_contact() {
+        let mut req = make_invite_with_contact(
+            "<sip:caller@198.51.100.7:5090>",
+            "SIP/2.0/UDP 203.0.113.9:5060;branch=z9hG4bK3;rport=40000;received=203.0.113.9",
+        );
+        SipBot::fix_unspecified_contact(&mut req);
+        let contact = req.contact_header().unwrap().value().to_string();
+        assert!(contact.contains("198.51.100.7:5090"), "{}", contact);
     }
 }
