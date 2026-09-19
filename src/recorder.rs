@@ -106,6 +106,10 @@ impl Recorder {
             // 20ms at 16000Hz = 320 samples
             let chunk_size = 320;
             let mut ticker = interval(Duration::from_millis(20));
+            // Wall-clock semantics: never burst-catch-up missed ticks, that
+            // would drain the buffers faster than real time and shift the
+            // audio timeline.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
                 tokio::select! {

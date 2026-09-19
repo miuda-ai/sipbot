@@ -6,3 +6,5 @@ pub mod media;
 pub mod recorder;
 pub mod sip;
 pub mod stats;
+pub mod status;
+pub mod web;

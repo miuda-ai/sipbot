@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sipbot · Answer Test</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">sipbot <span class="brand-sub">Answer Test</span></div>
+  <nav>
+    <button class="tab active" data-tab="strategies">Strategies</button>
+    <button class="tab" data-tab="calls">Calls</button>
+    <button class="tab" data-tab="outbound">Outbound</button>
+  </nav>
+  <div class="conn" id="conn-badge"><span class="dot off"></span><span id="conn-text">offline</span></div>
+</header>
+
+<main>
+  <!-- Strategies -->
+  <section id="tab-strategies" class="tab-page active">
+    <div class="section-head">
+      <h2>Accounts</h2>
+      <span class="muted">SIP identity · bind a strategy from the dropdown · duplicate to create a new one</span>
+      <button class="btn primary" id="btn-add-account">＋ New Account</button>
+    </div>
+    <div id="account-list" class="cards"></div>
+
+    <div class="section-head" style="margin-top:26px">
+      <h2>Answer Strategies</h2>
+      <span class="muted">Reusable templates · one strategy can serve many accounts</span>
+      <div class="tpl-bar" id="tpl-bar">
+        <span class="muted">New from template:</span>
+        <button class="btn tpl" data-tpl="standard">Standard</button>
+        <button class="btn tpl" data-tpl="crbt">Ringback</button>
+        <button class="btn tpl" data-tpl="announce">Announce+Jump</button>
+        <button class="btn tpl" data-tpl="reject">Reject</button>
+        <button class="btn tpl" data-tpl="blank">Blank</button>
+      </div>
+    </div>
+    <div id="strategy-list" class="cards"></div>
+  </section>
+
+  <!-- Calls -->
+  <section id="tab-calls" class="tab-page">
+    <div class="split">
+      <div class="split-left">
+        <div class="toolbar">
+          <h2>Calls</h2>
+          <span id="call-count" class="muted"></span>
+        </div>
+        <table class="call-table" id="call-table">
+          <thead>
+            <tr><th>Time</th><th>Dir</th><th>Caller</th><th>Callee</th><th>State</th><th>Dur</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="split-right" id="call-detail">
+        <div class="placeholder">Select a call on the left to view details</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Outbound -->
+  <section id="tab-outbound" class="tab-page">
+    <div class="toolbar"><h2>Outbound Test Call</h2><span class="muted">uses an ephemeral caller (random port)</span></div>
+    <div class="form-card" id="outbound-form">
+      <label>Target URI<input id="ob-target" placeholder="sip:1001@127.0.0.1:35060"></label>
+      <label>Caller user name<input id="ob-from" value="caller"></label>
+      <label>Media action
+        <select id="ob-action">
+          <option value="play">Play file</option>
+          <option value="echo">Echo</option>
+        </select>
+      </label>
+      <label>Play file<span class="media-widget" data-media="ob-wav"></span></label>
+      <label>Hangup after (secs)<input id="ob-hangup" type="number" value="10" min="0"></label>
+      <label>DTMF flows<input id="ob-dtmf" placeholder='1s:2,2s:# (optional)'></label>
+      <div class="row2">
+        <label>Total calls<input id="ob-total" type="number" value="1" min="1"></label>
+        <label>CPS<input id="ob-cps" type="number" value="1" min="1"></label>
+      </div>
+      <div class="actions">
+        <button class="btn primary" id="ob-submit">Start Call</button>
+        <span id="ob-result" class="muted"></span>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- Account editor modal -->
+<div id="account-modal" class="modal hidden">
+  <div class="modal-body narrow">
+    <div class="toolbar">
+      <h2 id="am-title">Account</h2>
+      <button class="btn" id="am-close">Close</button>
+      <button class="btn primary" id="am-save">Save &amp; Reload</button>
+    </div>
+    <div class="form-card" id="am-form"></div>
+  </div>
+</div>
+
+<!-- Strategy editor modal -->
+<div id="strategy-modal" class="modal hidden">
+  <div class="modal-body">
+    <div class="toolbar">
+      <h2 id="sm-title">Strategy</h2>
+      <button class="btn" id="sm-close">Close</button>
+      <button class="btn primary" id="sm-save">Save &amp; Reload</button>
+    </div>
+    <div id="sm-form" class="form-grid"></div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

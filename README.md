@@ -117,6 +117,123 @@ cargo run -- wait --addr 0.0.0.0:5060 -u sipbot --answer welcome.wav
 - `options`: Send OPTIONS request.
 - `info`: Send INFO request.
 
+### Web Answer Test Server (`serve`)
+
+`sipbot serve` starts a web UI + REST/WebSocket API plus one SIP bot per configured
+account — a self-service "answer test" workbench:
+
+```bash
+sipbot serve --conf serve.toml --http 0.0.0.0:8080
+# open http://localhost:8080
+```
+
+#### Features
+
+- **策略模板** (per-account, hot-reloadable from the UI):
+  - **标准被叫**: 180 ringing N secs → 200 OK → echo/play → hangup
+  - **运营商彩铃**: 183 with ringback SDP → answer after playback/N secs
+  - **来电报号**: answer → play announcement ("XX来电") → **in-call stream jump**
+    (new SSRC + fresh seq/ts bases, *no* re-INVITE — mimics carrier media handoff)
+  - **拒接**: play tone via 183 then respond 486/603 (or reject immediately)
+  - **SDP 跳变** (`sdp_jump`): the 200 OK answer SDP differs from the 183 SDP
+    (new SSRC/port/codec/ts/seq) — verify receiver robustness
+  - Custom caller matching (`match_caller = "138*|139*"`), per-strategy codecs,
+    scheduled DTMF flows, hangup modes (`remote` / `after N secs` / `playback`)
+- **观测**: per-call SIP message trace, SDP offer/183/200 capture + diff view,
+  live RTP/RTCP stats (packets/loss/RTT/NACK/seq-gap/ts-jump), DTMF events,
+  WAV recordings playback
+- **控制**: hang up a live call, send DTMF digits from the UI
+- **外呼测试**: start outbound test calls (play/echo, DTMF flows, CPS/total)
+  from the UI via an ephemeral caller bot
+- **媒体文件**: list / preview / upload-overwrite WAV files used by strategies
+- **传输**: per-account `udp` / `tcp` / `ws` / `wss`; media modes
+  `rtp` / `srtp` / `webrtc` (+NACK, jitter buffer)
+
+#### Example `serve.toml`
+
+Accounts (SIP identity) and strategies (reusable answer behavior) are separate
+entities; accounts bind a strategy by name, one strategy can serve many accounts.
+
+```toml
+addr = "0.0.0.0:35060"           # default UDP/TCP bind (per-account override below)
+recorders = "./recordings"       # WAV recordings directory
+media_dir = "./wavs"             # UI-manageable announcement/media files
+records_dir = "./records"        # persisted call records (JSON per call, survives restart)
+http_addr = "0.0.0.0:8080"       # web UI/API
+
+# ── reusable strategies ──
+[[strategies]]
+name = "彩铃-报号-跳变"
+# match_caller = "138*|139*"     # only answer matching callers
+codecs = ["pcmu", "pcma", "g722", "opus"]
+
+[strategies.ring]
+duration_secs = 3                # 0 = answer immediately
+ringback = "wavs/crbt.wav"       # 183 early media; "" = built-in; omit = 180
+
+[strategies.announce]
+file = "wavs/announce.wav"       # "XX来电" announcement ({{caller}} supported)
+jump_after = true                # in-call stream jump: new SSRC/seq/ts, no re-INVITE
+# jump_codec = "g722"            # optional codec switch on jump
+
+[strategies.answer]
+action = "echo"                  # play | echo
+
+sdp_jump = true                  # 200 OK SDP differs from 183 (new SSRC/port/codec)
+jump_codecs = ["pcmu"]
+
+dtmf_flows = "1s:2,2s:#"
+
+[strategies.hangup]
+mode = "after"                   # remote (wait for peer BYE) | after | playback
+after_secs = 30
+
+[[strategies]]
+name = "秒拒"
+[strategies.reject]
+code = 486
+tone = "wavs/busy.wav"           # play tone via 183, then 486
+delay_secs = 2
+
+# ── accounts: pure SIP identity + strategy binding ──
+[[accounts]]
+username = "1001"
+domain = "127.0.0.1"
+password = "123456"
+register = true
+strategy = "彩铃-报号-跳变"
+# transport = "udp"              # udp | tcp | ws | wss
+# transport_addr = "0.0.0.0:35061"  # omit → auto port allocation
+# transport_ws_url = "wss://host:8443/ws"
+
+[[accounts]]
+username = "1002"
+domain = "127.0.0.1"
+strategy = "秒拒"
+```
+
+- Strategy/account edits in the UI are written back to `serve.toml` and applied
+  immediately (account bots are hot-reloaded; ports auto-allocated per account).
+- Accounts may also keep legacy inline strategy fields (ring/answer/hangup/...)
+  instead of binding a named strategy.
+- **Call records**: every finished call is flushed as JSON (`sip_trace`, SDP
+  offer/183/200, jump events, DTMF, final RTP/RTCP stats, recording path) into
+  `records_dir` and reloaded on startup — history survives restarts.
+
+#### REST / WebSocket API
+
+| Method/Path | Description |
+|---|---|
+| `GET/PUT /api/config` | read / update+persist+hot-reload config |
+| `GET /api/accounts` | accounts + registration status |
+| `GET /api/calls` · `POST /api/calls` | call list · start outbound test call |
+| `GET /api/calls/{id}` | full detail: sip trace, SDP, DTMF, jumps, stats |
+| `POST /api/calls/{id}/hangup` · `.../dtmf` | control a live call |
+| `GET /api/recordings` · `GET /recordings/{file}` | recordings list / WAV |
+| `GET /api/media` · `POST/DELETE /api/media/{file}` · `GET /media/{file}` | media files |
+| `WS /ws` | live SIP messages, call states, DTMF events |
+
+
 ## Typical Usage Examples
 
 ### 1. Echo Test (Latency & Connectivity)

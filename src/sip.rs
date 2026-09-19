@@ -21,7 +21,7 @@ use rsipstack::{
         key::{TransactionKey, TransactionRole},
         transaction::Transaction,
     },
-    transport::{SipAddr, TransportLayer, udp::UdpConnection},
+    transport::{SipAddr, SipConnection, TransportLayer, tcp_listener::TcpListenerConnection, udp::UdpConnection},
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -819,6 +819,14 @@ pub struct SipBot {
     pub cancel_token: CancellationToken,
     transport_token: CancellationToken,
     pub current_media_session: Arc<tokio::sync::Mutex<Option<MediaSession>>>,
+    /// serve 模式下用于上报注册状态到 Web UI。
+    pub status_board: Option<Arc<crate::status::StatusBoard>>,
+    /// serve 模式下采集 SIP 信令(收发均记录)到 Web UI。
+    pub trace_inspector: Option<Box<dyn rsipstack::transaction::endpoint::MessageInspector>>,
+    /// serve 模式: 通话记录表(每通话详情)。
+    pub call_registry: Option<Arc<crate::web::state::CallRegistry>>,
+    /// serve 模式: WebSocket 事件广播。
+    pub ws_events: Option<tokio::sync::broadcast::Sender<crate::web::state::WsEvent>>,
 }
 
 impl SipBot {
@@ -841,6 +849,10 @@ impl SipBot {
             transport_token: CancellationToken::new(),
             cancel_token,
             current_media_session: Arc::new(tokio::sync::Mutex::new(None)),
+            status_board: None,
+            trace_inspector: None,
+            call_registry: None,
+            ws_events: None,
         }
     }
 
@@ -866,12 +878,29 @@ impl SipBot {
         }
 
         let transport_layer = TransportLayer::new(self.transport_token.clone());
-        let uses_ws = self.global_config.ws_url.is_some();
+        // Account-level transport (serve mode): udp | tcp | ws | wss.
+        // Falls back to global ws_url (legacy) then udp.
+        let transport_kind = self
+            .account
+            .transport
+            .as_deref()
+            .and_then(crate::config::TransportKind::parse);
+        let uses_ws = match transport_kind {
+            Some(crate::config::TransportKind::Ws)
+            | Some(crate::config::TransportKind::Wss) => true,
+            Some(_) => false,
+            None => self.global_config.ws_url.is_some(),
+        };
 
         if uses_ws {
             // ── WebSocket transport mode ──
-            let ws_url = self.global_config.ws_url.as_ref().unwrap();
-            let (transport, host, port, path) = parse_ws_url(ws_url)?;
+            let ws_url = self
+                .account
+                .transport_ws_url
+                .clone()
+                .or_else(|| self.global_config.ws_url.clone())
+                .context("ws/wss transport requires a websocket url")?;
+            let (transport, host, port, path) = parse_ws_url(&ws_url)?;
 
             transport_layer.set_ws_path(&path);
 
@@ -897,6 +926,11 @@ impl SipBot {
                 self.account.username, ws_url
             );
 
+            info!(
+                "[{}] WebSocket connected to {}",
+                self.account.username, ws_url
+            );
+
             // Set proxy so registration & invites use WebSocket transport
             let transport_param = if transport == Transport::Wss {
                 "wss"
@@ -907,13 +941,30 @@ impl SipBot {
 
             // WS transport implies WebRTC mode
             self.account.webrtc_enabled = Some(true);
+        } else if transport_kind == Some(crate::config::TransportKind::Tcp) {
+            // ── TCP listener transport mode ──
+            let addr_str = self
+                .account
+                .transport_addr
+                .clone()
+                .or_else(|| self.global_config.addr.clone())
+                .unwrap_or_else(|| "0.0.0.0:35060".to_string());
+            let addr: std::net::SocketAddr = addr_str.parse().context("Invalid bind address")?;
+            let tcp_listener = TcpListenerConnection::new(addr, None).await?;
+            info!(
+                "[{}] Listening (TCP) on {}",
+                self.account.username,
+                tcp_listener.get_addr()
+            );
+            transport_layer.add_transport(SipConnection::TcpListener(tcp_listener));
         } else {
             // ── UDP transport mode (original) ──
             let addr_str = self
-                .global_config
-                .addr
-                .as_deref()
-                .unwrap_or("0.0.0.0:35060");
+                .account
+                .transport_addr
+                .clone()
+                .or_else(|| self.global_config.addr.clone())
+                .unwrap_or_else(|| "0.0.0.0:35060".to_string());
             let addr: std::net::SocketAddr = addr_str.parse().context("Invalid bind address")?;
 
             let mut udp_conn =
@@ -938,11 +989,15 @@ impl SipBot {
             // Store local addr for WebRTC contact later
         }
 
-        let endpoint = EndpointBuilder::new()
+        let mut builder = EndpointBuilder::new();
+        builder
             .with_user_agent(&format!("SipBot/{}", env!("CARGO_PKG_VERSION")))
             .with_transport_layer(transport_layer)
-            .with_cancel_token(self.transport_token.clone())
-            .build();
+            .with_cancel_token(self.transport_token.clone());
+        if let Some(inspector) = self.trace_inspector.take() {
+            builder.with_inspector(inspector);
+        }
+        let endpoint = builder.build();
 
         let endpoint = Arc::new(endpoint);
         self.endpoint = Some(endpoint.clone());
@@ -1351,6 +1406,33 @@ impl SipBot {
         let verbose = self.verbose;
         let is_wait = self.is_wait;
         let cancel_token = self.cancel_token.clone();
+        let status_board = self.status_board.clone();
+        let transport_kind = self
+            .account
+            .transport
+            .as_deref()
+            .and_then(crate::config::TransportKind::parse)
+            .unwrap_or_default()
+            .as_str()
+            .to_string();
+
+        let report = {
+            let username = username.clone();
+            let domain = domain.clone();
+            move |registered: bool, expires: Option<u64>, last_error: Option<String>| {
+                if let Some(board) = &status_board {
+                    board.set(crate::status::RegistrationStatus {
+                        username: username.clone(),
+                        domain: domain.clone(),
+                        registered,
+                        expires,
+                        transport: Some(transport_kind.clone()),
+                        last_error,
+                        updated_at: Some(crate::status::now_epoch_secs()),
+                    });
+                }
+            }
+        };
 
         tokio::spawn(async move {
             info!("[{}] Starting registration loop", username);
@@ -1381,6 +1463,7 @@ impl SipBot {
                     Ok(response) => {
                         if *response.status_code() == StatusCode::OK {
                             let expires = registration.expires();
+                            report(true, Some(expires as u64), None);
                             if is_wait && !verbose {
                                 println!(
                                     "[{}] Registered successfully, expires in {}s",
@@ -1399,6 +1482,11 @@ impl SipBot {
                                 _ = cancel_token.cancelled() => break,
                             }
                         } else {
+                            report(
+                                false,
+                                None,
+                                Some(format!("registration failed: {}", response.status_code())),
+                            );
                             warn!(
                                 "[{}] Registration failed: {}",
                                 username,
@@ -1411,6 +1499,7 @@ impl SipBot {
                         }
                     }
                     Err(e) => {
+                        report(false, None, Some(format!("registration error: {:?}", e)));
                         error!("[{}] Registration error: {:?}", username, e);
                         tokio::select! {
                             _ = tokio::time::sleep(Duration::from_secs(30)) => {}
@@ -1730,7 +1819,7 @@ impl SipBot {
     }
 
     async fn handle_invite(&self, mut transaction: Transaction) -> Result<()> {
-        let call_id = transaction.original.call_id_header()?.value();
+        let call_id = transaction.original.call_id_header()?.value().to_string();
         let caller = transaction.original.from_header()?.uri()?.to_string();
         let callee = transaction.original.to_header()?.uri()?.to_string();
 
@@ -1746,7 +1835,7 @@ impl SipBot {
         let local_ip = local_socket.ip();
         let local_port = local_socket.port();
 
-        let recording_path = self.get_recording_path(call_id);
+        let recording_path = self.get_recording_path(&call_id);
         if let Some(path) = &recording_path {
             info!(
                 "[{}] Recording will be saved to: {:?}",
@@ -1791,6 +1880,8 @@ impl SipBot {
         self.stats.inc_current();
         let username_log = self.account.username.clone();
         let bot_media_session = self.current_media_session.clone();
+        let call_registry = self.call_registry.clone();
+        let ws_events = self.ws_events.clone();
         tokio::spawn(async move {
             info!("[{}] Call task started", username_log);
             let mut _call_guard = CallGuard {
@@ -1868,8 +1959,87 @@ impl SipBot {
             };
             // Call logic
             let stats_for_decrement = stats_clone.clone();
+            let call_id_str = call_id.clone();
+            let caller_user = caller_user_part(&caller);
             let call_logic = async move {
                 info!("[{}] Call logic started", account.username);
+
+                // ── serve mode: per-call stats + call record + DTMF observer ──
+                let is_serve = call_registry.is_some();
+                let call_stats: Arc<CallStats> = if is_serve {
+                    Arc::new(CallStats::new())
+                } else {
+                    stats_clone.clone()
+                };
+                let call_record = call_registry
+                    .as_ref()
+                    .map(|reg| reg.get_or_create(&call_id_str));
+                if let Some(rec) = &call_record {
+                    let mut r = rec.lock().unwrap();
+                    r.direction = Some(crate::web::state::CallDirection::Inbound);
+                    r.caller = caller.clone();
+                    r.callee = callee.clone();
+                    r.account = account.username.clone();
+                    r.stats = Some(call_stats.clone());
+                    if let Some(p) = &recording_path {
+                        r.recording = Some(p.display().to_string());
+                    }
+                }
+                let dtmf_observer: Arc<CallDtmfObserver> = Arc::new(CallDtmfObserver {
+                    record: call_record.clone(),
+                    events: ws_events.clone(),
+                    call_id: call_id_str.clone(),
+                });
+                // UI hangup control
+                let control_token = tokio_util::sync::CancellationToken::new();
+                if let Some(rec) = &call_record {
+                    rec.lock().unwrap().control = Some(control_token.clone());
+                }
+                // UI-triggered DTMF → current media session
+                let (dtmf_req_tx, mut dtmf_req_rx) = tokio::sync::mpsc::unbounded_channel::<char>();
+                if let Some(rec) = &call_record {
+                    rec.lock().unwrap().dtmf_tx = Some(dtmf_req_tx);
+                }
+                {
+                    let shared = shared_media_session.clone();
+                    tokio::spawn(async move {
+                        while let Some(digit) = dtmf_req_rx.recv().await {
+                            let media = shared.lock().await.clone();
+                            if let Some(m) = media {
+                                let _: Result<(), anyhow::Error> = m.send_dtmf(digit).await;
+                            }
+                        }
+                    });
+                }
+
+                let finish_record = |state: crate::web::state::CallState, reason: String| {
+                    if let Some(rec) = &call_record {
+                        let mut r = rec.lock().unwrap();
+                        r.state = Some(state);
+                        r.ended_at_ms = Some(crate::web::state::now_ms());
+                        if r.end_reason.is_none() {
+                            r.end_reason = Some(reason);
+                        }
+                    }
+                };
+
+                // ── caller match (serve strategy routing) ──
+                if let Some(pattern) = &account.match_caller {
+                    if !caller_matches(pattern, &caller_user) {
+                        info!(
+                            "[{}] Caller '{}' does not match '{}' — rejecting 403",
+                            account.username, caller_user, pattern
+                        );
+                        let _ = server_dialog_clone.reject(Some(StatusCode::Forbidden), None);
+                        stats_clone.add_status(403);
+                        finish_record(
+                            crate::web::state::CallState::Rejected,
+                            "403 caller mismatch".to_string(),
+                        );
+                        return;
+                    }
+                }
+
                 // Random rejection check
                 if let Some(prob) = account.reject_prob {
                     let should_reject = {
@@ -1893,6 +2063,31 @@ impl SipBot {
                             error!("Reject error: {:?}", e);
                         }
                         stats_clone.add_status(code);
+                        finish_record(
+                            crate::web::state::CallState::Rejected,
+                            format!("random reject {}", code),
+                        );
+                        return;
+                    }
+                }
+
+                // ── plain reject stage (no tone): respond code immediately ──
+                if let Some(reject_cfg) = &account.reject {
+                    if reject_cfg.tone.is_none() {
+                        let sc = StatusCode::try_from(reject_cfg.code)
+                            .unwrap_or(StatusCode::BusyHere);
+                        info!(
+                            "[{}] Reject stage: responding {}",
+                            account.username, reject_cfg.code
+                        );
+                        if let Err(e) = server_dialog_clone.reject(Some(sc), None) {
+                            error!("Reject error: {:?}", e);
+                        }
+                        stats_clone.add_status(reject_cfg.code);
+                        finish_record(
+                            crate::web::state::CallState::Rejected,
+                            format!("reject {}", reject_cfg.code),
+                        );
                         return;
                     }
                 }
@@ -1900,6 +2095,8 @@ impl SipBot {
                 // Stage 1: Ringing (Alerting)
                 let mut media_session: Option<MediaSession> = None;
                 let mut local_sdp: Option<String> = None;
+                // All sessions created for this call ( jumped sessions keep RX alive )
+                let mut live_sessions: Vec<MediaSession> = Vec::new();
 
                 if !offer_body.is_empty() {
                     if let Ok(body_str) = std::str::from_utf8(&offer_body) {
@@ -1915,13 +2112,14 @@ impl SipBot {
                             jitter_buffer_enabled,
                             global_config.external_ip.clone(),
                             account.codecs.clone(),
-                            stats_clone.clone(),
+                            call_stats.clone(),
                             account.audio_quality.clone(),
                             account.ts_jump_tolerance_ms,
                         )
                         .await
                         {
                             Ok((session, sdp, codec_name)) => {
+                                session.dtmf_notify.set(dtmf_observer.clone());
                                 {
                                     let mut m = shared_media_session.lock().await;
                                     *m = Some(session.clone());
@@ -1931,8 +2129,12 @@ impl SipBot {
                                     *m = Some(session.clone());
                                 }
                                 media_session = Some(session.clone());
+                                live_sessions.push(session.clone());
                                 _call_guard.media_session = Some(session);
                                 local_sdp = Some(sdp);
+                                if let Some(rec) = &call_record {
+                                    rec.lock().unwrap().codec = Some(codec_name.clone());
+                                }
                                 info!(
                                     "[{}] Media session established. Preferred Codec: {}",
                                     account.username, codec_name
@@ -1949,9 +2151,61 @@ impl SipBot {
                                     error!("Reject error: {:?}", e);
                                 }
                                 stats_clone.add_status(StatusCode::TemporarilyUnavailable.into());
+                                finish_record(
+                                    crate::web::state::CallState::Failed,
+                                    "media session failed".to_string(),
+                                );
                                 return;
                             }
                         }
+                    }
+                }
+
+                // ── reject-with-tone stage: 183 + tone → reject code ──
+                if let Some(reject_cfg) = &account.reject {
+                    if reject_cfg.tone.is_some() {
+                        info!(
+                            "[{}] Reject stage: playing tone then {}",
+                            account.username, reject_cfg.code
+                        );
+                        if let (Some(session), Some(sdp)) = (media_session.as_ref(), local_sdp.as_ref()) {
+                            let headers = vec![Header::ContentType("application/sdp".into())];
+                            if server_dialog_clone
+                                .ringing(Some(headers), Some(sdp.clone().into_bytes()))
+                                .is_ok()
+                            {
+                                stats_clone.add_status(183);
+                            }
+                            let file = reject_cfg.tone.clone().unwrap_or_default();
+                            let play = session.play_file_once(
+                                account.username.clone(),
+                                std::path::Path::new(&file),
+                                None,
+                            );
+                            tokio::pin!(play);
+                            let _ = tokio::select! {
+                                _ = &mut play => {}
+                                _ = tokio::time::sleep(Duration::from_secs(
+                                    reject_cfg.delay_secs.unwrap_or(u64::MAX).min(3600),
+                                )) => {}
+                                _ = cancel_token.cancelled() => {}
+                                _ = call_token_for_logic.cancelled() => {}
+                            };
+                        }
+                        let sc =
+                            StatusCode::try_from(reject_cfg.code).unwrap_or(StatusCode::BusyHere);
+                        if let Err(e) = server_dialog_clone.reject(Some(sc), None) {
+                            error!("Reject error: {:?}", e);
+                        }
+                        stats_clone.add_status(reject_cfg.code);
+                        for s in live_sessions {
+                            s.stop().await;
+                        }
+                        finish_record(
+                            crate::web::state::CallState::Rejected,
+                            format!("reject {}", reject_cfg.code),
+                        );
+                        return;
                     }
                 }
 
@@ -2160,7 +2414,89 @@ impl SipBot {
                         account.username
                     );
                     let _ = server_dialog_clone.reject(Some(StatusCode::BusyHere), None);
+                    for s in live_sessions {
+                        s.stop().await;
+                    }
+                    finish_record(
+                        crate::web::state::CallState::Terminated,
+                        "cancelled".to_string(),
+                    );
                     return;
+                }
+
+                // ── sdp_jump: answer with a NEW session so the 200 OK SDP
+                //    differs from the 183 SDP (new SSRC/codec/ts/seq) ──
+                let sdp_jump_enabled = account.sdp_jump.unwrap_or(false);
+                if sdp_jump_enabled && !offer_body.is_empty() {
+                    if let Ok(body_str) = std::str::from_utf8(&offer_body) {
+                        let jump_codecs = if account.jump_codecs.is_some() {
+                            account.jump_codecs.clone()
+                        } else {
+                            account.codecs.clone()
+                        };
+                        match MediaSession::new(
+                            body_str,
+                            account.srtp_enabled.unwrap_or(false),
+                            account.webrtc_enabled.unwrap_or(false),
+                            account.nack_enabled.unwrap_or(false),
+                            account.jitter_buffer_enabled.unwrap_or(false),
+                            global_config.external_ip.clone(),
+                            jump_codecs,
+                            call_stats.clone(),
+                            account.audio_quality.clone(),
+                            account.ts_jump_tolerance_ms,
+                        )
+                        .await
+                        {
+                            Ok((session_b, sdp_b, codec_b)) => {
+                                session_b.dtmf_notify.set(dtmf_observer.clone());
+                                let old_info =
+                                    media_session.as_ref().and_then(|s| s.local_stream_info());
+                                let new_info = session_b.local_stream_info();
+                                info!(
+                                    "[{}] sdp_jump: answering with new session (codec {}) old_stream={:?} new_stream={:?}",
+                                    account.username, codec_b, old_info, new_info
+                                );
+                                if let Some(rec) = &call_record {
+                                    let mut r = rec.lock().unwrap();
+                                    let t_ms =
+                                        crate::web::state::now_ms().saturating_sub(r.started_at_ms);
+                                    r.sdp_200 = Some(sdp_b.clone());
+                                    r.codec = Some(codec_b);
+                                    r.jump_events.push(crate::web::state::JumpEvent {
+                                        t_ms,
+                                        reason: "sdp_jump(200 OK new SDP)".to_string(),
+                                        old_ssrc: old_info.map(|i| i.0),
+                                        new_ssrc: new_info.map(|i| i.0),
+                                    });
+                                }
+                                {
+                                    let mut m = shared_media_session.lock().await;
+                                    *m = Some(session_b.clone());
+                                }
+                                {
+                                    let mut m = bot_media_session.lock().await;
+                                    *m = Some(session_b.clone());
+                                }
+                                // Old session (183 early media) no longer needed;
+                                // pre-answer only session A exists in live_sessions.
+                                if let Some(old) = media_session.take() {
+                                    old.stop().await;
+                                    live_sessions.clear();
+                                }
+                                media_session = Some(session_b.clone());
+                                live_sessions.push(session_b.clone());
+                                _call_guard.media_session = Some(session_b);
+                                local_sdp = Some(sdp_b);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "[{}] sdp_jump session failed, falling back: {:?}",
+                                    account.username, e
+                                );
+                            }
+                        }
+                    }
                 }
 
                 // Always answer with configured or default media
@@ -2200,21 +2536,141 @@ impl SipBot {
                 let username_media = account.username.clone();
                 let answer_config = account.answer.clone();
                 let hangup_config = account.hangup.clone();
-                let keep_alive = hangup_config.is_some();
-                let media_session_to_stop = media_session.clone();
+                let hangup_mode = hangup_config
+                    .as_ref()
+                    .map(|h| h.effective_mode())
+                    .unwrap_or(crate::config::HangupMode::Playback);
+                let keep_alive = !matches!(hangup_mode, crate::config::HangupMode::Playback);
 
-                let media_future = async move {
-                    if let Some(media) = media_session {
+                // ── announce stage ("XX来电") + in-call stream jump ──
+                let mut bridged = false;
+                if let Some(announce_cfg) = &account.announce {
+                    if let Some(session) = media_session.clone() {
+                        let file = announce_cfg.file.replace("{{caller}}", &caller_user);
+                        info!(
+                            "[{}] Announce stage: playing {}",
+                            account.username, file
+                        );
+                        let play = session.play_file_once(
+                            username_media.clone(),
+                            std::path::Path::new(&file),
+                            None,
+                        );
+                        tokio::pin!(play);
+                        let _ = tokio::select! {
+                            _ = &mut play => {}
+                            _ = tokio::time::sleep(Duration::from_secs(120)) => {}
+                            _ = cancel_token.cancelled() => {}
+                            _ = call_token_for_logic.cancelled() => {}
+                        };
+
+                        if announce_cfg.jump_after
+                            && !call_token_for_logic.is_cancelled()
+                            && !offer_body.is_empty()
+                        {
+                            if let Ok(body_str) = std::str::from_utf8(&offer_body) {
+                                let jump_codecs = announce_cfg
+                                    .jump_codec
+                                    .as_ref()
+                                    .map(|c| vec![c.clone()])
+                                    .or_else(|| account.jump_codecs.clone())
+                                    .or_else(|| account.codecs.clone());
+                                match MediaSession::new(
+                                    body_str,
+                                    account.srtp_enabled.unwrap_or(false),
+                                    account.webrtc_enabled.unwrap_or(false),
+                                    account.nack_enabled.unwrap_or(false),
+                                    account.jitter_buffer_enabled.unwrap_or(false),
+                                    global_config.external_ip.clone(),
+                                    jump_codecs,
+                                    call_stats.clone(),
+                                    account.audio_quality.clone(),
+                                    account.ts_jump_tolerance_ms,
+                                )
+                                .await
+                                {
+                                    Ok((jump_session, _sdp_j, codec_j)) => {
+                                        jump_session.dtmf_notify.set(dtmf_observer.clone());
+                                        let old_info =
+                                            session.local_stream_info();
+                                        let new_info =
+                                            jump_session.local_stream_info();
+                                        info!(
+                                            "[{}] Stream JUMP (no re-INVITE): old={:?} new={:?} codec={}",
+                                            account.username, old_info, new_info, codec_j
+                                        );
+                                        // Keep receiving on the old session,
+                                        // transmit via the jump session.
+                                        session
+                                            .start_rx_bridge_to(
+                                                &jump_session,
+                                                username_media.clone(),
+                                            )
+                                            .await;
+                                        {
+                                            let mut m = shared_media_session.lock().await;
+                                            *m = Some(jump_session.clone());
+                                        }
+                                        {
+                                            let mut m = bot_media_session.lock().await;
+                                            *m = Some(jump_session.clone());
+                                        }
+                                        if let Some(rec) = &call_record {
+                                            let mut r = rec.lock().unwrap();
+                                            let t_ms = crate::web::state::now_ms()
+                                                .saturating_sub(r.started_at_ms);
+                                            r.jump_events.push(crate::web::state::JumpEvent {
+                                                t_ms,
+                                                reason: "announce jump_after (in-call)"
+                                                    .to_string(),
+                                                old_ssrc: old_info.map(|i| i.0),
+                                                new_ssrc: new_info.map(|i| i.0),
+                                            });
+                                        }
+                                        media_session = Some(jump_session.clone());
+                                        live_sessions.push(jump_session.clone());
+                                        _call_guard.media_session = Some(jump_session);
+                                        bridged = true;
+                                    }
+                                    Err(e) => warn!(
+                                        "[{}] jump session failed, staying put: {:?}",
+                                        account.username, e
+                                    ),
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let park_token = call_token_for_logic.clone();
+                let username_media = account.username.clone();
+                let media_future = async move {                    if let Some(media) = media_session {
                         if let Some(cfg) = answer_config {
                             match cfg {
                                 AnswerConfig::Echo => {
-                                    info!("[{}] Stage 2: Starting Echo", username_media);
-                                    media
-                                        .start_echo(
-                                            username_media.clone(),
-                                            recording_path.as_deref(),
-                                        )
-                                        .await
+                                    if bridged {
+                                        // The RX bridge already loops remote audio
+                                        // back through the jump session.
+                                        info!(
+                                            "[{}] Stage 2: Echo via jump bridge",
+                                            username_media
+                                        );
+                                        if let Some(path) = recording_path.as_deref() {
+                                            media
+                                                .init_recording(&username_media, path)
+                                                .await;
+                                        }
+                                        park_token.cancelled().await;
+                                        Ok(())
+                                    } else {
+                                        info!("[{}] Stage 2: Starting Echo", username_media);
+                                        media
+                                            .start_echo(
+                                                username_media.clone(),
+                                                recording_path.as_deref(),
+                                            )
+                                            .await
+                                    }
                                 }
                                 AnswerConfig::Play { wav_file } => {
                                     info!("[{}] Stage 2: Playing {}", username_media, wav_file);
@@ -2290,61 +2746,144 @@ impl SipBot {
                     }
                 };
 
-                let wait_timeout = hangup_config.as_ref().and_then(|h| h.after_secs);
-
-                match wait_timeout {
-                    Some(secs) => {
-                        info!(
-                            "[{}] Stage 3: Will hangup after {} seconds",
-                            account.username, secs
-                        );
-                        tokio::select! {
-                            res = media_future => {
-                                if let Err(e) = res {
-                                    error!("[{}] Media error: {:?}", account.username, e);
-                                }
-                                info!("[{}] Media finished", account.username);
+                // Scheduled DTMF flows after answer (sent through the current
+                // TX session — follows the jump when one occurs).
+                let dtmf_flows = account
+                    .dtmf_flows
+                    .as_deref()
+                    .and_then(|s| crate::config::parse_dtmf_flows(s).ok());
+                let dtmf_media_shared = shared_media_session.clone();
+                let dtmf_username = account.username.clone();
+                let dtmf_cancel = cancel_token.clone();
+                let dtmf_future = async move {
+                    if let Some(flows) = dtmf_flows {
+                        for entry in flows {
+                            tokio::select! {
+                                _ = tokio::time::sleep(entry.delay) => {}
+                                _ = dtmf_cancel.cancelled() => return,
                             }
-                            _ = tokio::time::sleep(Duration::from_secs(secs)) => {
-                                info!("[{}] Hangup timer expired", account.username);
-                            }
-                            _ = cancel_token.cancelled() => {
-                                info!("[{}] Cancellation requested during call.", account.username);
-                            }
-                            _ = call_token_for_logic.cancelled() => {
-                                info!("[{}] Call ended remotely during playback.", account.username);
+                            let media = dtmf_media_shared.lock().await.clone();
+                            if let Some(m) = media {
+                                info!(
+                                    "[{}] Sending DTMF '{}' (after {:.1}s)",
+                                    dtmf_username,
+                                    entry.digit,
+                                    entry.delay.as_secs_f64()
+                                );
+                                let _: Result<(), anyhow::Error> = m.send_dtmf(entry.digit).await;
                             }
                         }
                     }
-                    None => {
+                };
+
+                let wait_timeout = match hangup_mode {
+                    crate::config::HangupMode::After(secs) => Some(secs),
+                    _ => None,
+                };
+
+                match hangup_mode {
+                    crate::config::HangupMode::Remote => {
+                        info!(
+                            "[{}] Stage 3: waiting for remote hangup (no BYE)",
+                            account.username
+                        );
+                        let media_handle = tokio::spawn(media_future);
+                        let dtmf_handle = tokio::spawn(dtmf_future);
+                        let mut ui_requested_bye = false;
                         tokio::select! {
-                            res = media_future => {
-                                if let Err(e) = res {
-                                    error!("[{}] Media error: {:?}", account.username, e);
-                                }
-                            }
-                            _ = cancel_token.cancelled() => {
-                                info!("[{}] Cancellation requested during call.", account.username);
-                            }
                             _ = call_token_for_logic.cancelled() => {
                                 info!("[{}] Call ended remotely.", account.username);
                             }
+                            _ = control_token.cancelled() => {
+                                info!("[{}] UI requested hangup — sending BYE.", account.username);
+                                ui_requested_bye = true;
+                            }
+                            _ = cancel_token.cancelled() => {
+                                info!("[{}] Cancellation requested during call.", account.username);
+                            }
+                        }
+                        media_handle.abort();
+                        dtmf_handle.abort();
+                        if ui_requested_bye {
+                            match server_dialog_clone.bye().await {
+                                Ok(_) => info!("[{}] BYE sent successfully", account.username),
+                                Err(e) => debug!("[{}] BYE send result: {:?}", account.username, e),
+                            }
+                        }
+                    }
+                    _ => {
+                        match wait_timeout {
+                            Some(secs) => {
+                                info!(
+                                    "[{}] Stage 3: Will hangup after {} seconds",
+                                    account.username, secs
+                                );
+                                let dtmf_handle = tokio::spawn(dtmf_future);
+                                tokio::select! {
+                                    res = media_future => {
+                                        if let Err(e) = res {
+                                            error!("[{}] Media error: {:?}", account.username, e);
+                                        }
+                                        info!("[{}] Media finished", account.username);
+                                    }
+                                    _ = tokio::time::sleep(Duration::from_secs(secs)) => {
+                                        info!("[{}] Hangup timer expired", account.username);
+                                    }
+                                    _ = control_token.cancelled() => {
+                                        info!("[{}] UI requested hangup", account.username);
+                                    }
+                                    _ = cancel_token.cancelled() => {
+                                        info!("[{}] Cancellation requested during call.", account.username);
+                                    }
+                                    _ = call_token_for_logic.cancelled() => {
+                                        info!("[{}] Call ended remotely during playback.", account.username);
+                                    }
+                                }
+                                dtmf_handle.abort();
+                            }
+                            None => {
+                                let dtmf_handle = tokio::spawn(dtmf_future);
+                                tokio::select! {
+                                    res = media_future => {
+                                        if let Err(e) = res {
+                                            error!("[{}] Media error: {:?}", account.username, e);
+                                        }
+                                    }
+                                    _ = control_token.cancelled() => {
+                                        info!("[{}] UI requested hangup", account.username);
+                                    }
+                                    _ = cancel_token.cancelled() => {
+                                        info!("[{}] Cancellation requested during call.", account.username);
+                                    }
+                                    _ = call_token_for_logic.cancelled() => {
+                                        info!("[{}] Call ended remotely.", account.username);
+                                    }
+                                }
+                                dtmf_handle.abort();
+                            }
                         }
                     }
                 }
 
-                if let Some(media) = media_session_to_stop {
-                    media.stop().await;
+                for s in live_sessions {
+                    s.stop().await;
                 }
 
-                // Send BYE explicitly before dropping the guard
-                info!("[{}] About to send BYE", account.username);
-                match server_dialog_clone.bye().await {
-                    Ok(_) => {
-                        info!("[{}] BYE sent successfully", account.username);
-                    }
-                    Err(e) => {
-                        debug!("[{}] BYE send result: {:?}", account.username, e);
+                if matches!(hangup_mode, crate::config::HangupMode::Remote) {
+                    info!(
+                        "[{}] Remote hangup mode: skipping BYE (peer should hang up)",
+                        account.username
+                    );
+                } else {
+                    // Send BYE explicitly before dropping the guard
+                    info!("[{}] About to send BYE", account.username);
+                    match server_dialog_clone.bye().await {
+                        Ok(_) => {
+                            info!("[{}] BYE sent successfully", account.username);
+                        }
+                        Err(e) => {
+                            debug!("[{}] BYE send result: {:?}", account.username, e);
+                        }
                     }
                 }
                 info!("[{}] Call logic completed", account.username);
@@ -2372,6 +2911,65 @@ impl SipBot {
 fn normalize_sip_addr(addr: &str) -> String {
     let stripped = addr.strip_prefix("sip:").unwrap_or(addr);
     format!("sip:{}", stripped)
+}
+
+/// Extract the user part from a URI string (`sip:1001@host` → `1001`).
+fn caller_user_part(uri: &str) -> String {
+    let stripped = uri.trim().trim_start_matches("sip:").trim_start_matches("sips:");
+    let user = stripped.split(['@', ';', ':', '>', '?']).next().unwrap_or("");
+    user.to_string()
+}
+
+/// Caller match: patterns separated by `|`. A trailing `*` is a prefix
+/// wildcard; otherwise exact (case-insensitive) match. Empty pattern list
+/// matches everything.
+fn caller_matches(pattern: &str, caller_user: &str) -> bool {
+    let caller_user = caller_user.to_lowercase();
+    pattern
+        .split('|')
+        .map(|p| p.trim().to_lowercase())
+        .filter(|p| !p.is_empty())
+        .any(|p| {
+            if let Some(prefix) = p.strip_suffix('*') {
+                caller_user.starts_with(prefix)
+            } else {
+                caller_user == p
+            }
+        })
+}
+
+/// Forwards DTMF events into the serve-mode call record and WebSocket feed.
+struct CallDtmfObserver {
+    record: Option<Arc<std::sync::Mutex<crate::web::state::CallRecord>>>,
+    events: Option<tokio::sync::broadcast::Sender<crate::web::state::WsEvent>>,
+    call_id: String,
+}
+
+impl crate::media::DtmfObserver for CallDtmfObserver {
+    fn on_dtmf(&self, dir: &'static str, digit: char, end: bool) {
+        if !end {
+            return; // log completed digits only
+        }
+        let started_at_ms = self
+            .record
+            .as_ref()
+            .map(|r| r.lock().unwrap().started_at_ms)
+            .unwrap_or(0);
+        let entry = crate::web::state::DtmfEventLog {
+            t_ms: crate::web::state::now_ms().saturating_sub(started_at_ms),
+            digit: digit.to_string(),
+            dir: dir.to_string(),
+        };
+        if let Some(rec) = &self.record {
+            rec.lock().unwrap().dtmf_events.push(entry.clone());
+        }
+        if let Some(tx) = &self.events {
+            let _ = tx.send(crate::web::state::WsEvent::Dtmf {
+                call_id: self.call_id.clone(),
+                entry,
+            });
+        }
+    }
 }
 
 fn generate_random_string() -> String {

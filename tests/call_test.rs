@@ -16,6 +16,10 @@ async fn test_call_flow() -> Result<()> {
     // 1. Configure Server (Wait)
     let server_addr = "127.0.0.1:5080";
     let server_config = Config {
+        http_addr: None,
+        media_dir: None,
+        records_dir: None,
+        strategies: Vec::new(),
         addr: Some(server_addr.to_string()),
         external_ip: None,
         recorders: Some("/tmp/recorders_test".to_string()),
@@ -32,6 +36,10 @@ async fn test_call_flow() -> Result<()> {
     // 2. Configure Client (Call)
     let client_addr = "127.0.0.1:5081";
     let client_config = Config {
+        http_addr: None,
+        media_dir: None,
+        records_dir: None,
+        strategies: Vec::new(),
         addr: Some(client_addr.to_string()),
         external_ip: None,
         recorders: None,
@@ -44,6 +52,7 @@ async fn test_call_flow() -> Result<()> {
             hangup: Some(sipbot::config::HangupConfig {
                 code: 200,
                 after_secs: Some(5),
+                mode: None,
             }),
             ..Default::default()
         }],
@@ -113,6 +122,10 @@ async fn test_options_flow() -> Result<()> {
     // 1. Configure Server (Wait)
     let server_addr = "127.0.0.1:5070";
     let server_config = Config {
+        http_addr: None,
+        media_dir: None,
+        records_dir: None,
+        strategies: Vec::new(),
         addr: Some(server_addr.to_string()),
         external_ip: None,
         recorders: None,
@@ -128,6 +141,10 @@ async fn test_options_flow() -> Result<()> {
     // 2. Configure Client (Options)
     let client_addr = "127.0.0.1:5071";
     let client_config = Config {
+        http_addr: None,
+        media_dir: None,
+        records_dir: None,
+        strategies: Vec::new(),
         addr: Some(client_addr.to_string()),
         external_ip: None,
         recorders: None,
@@ -199,6 +216,10 @@ async fn test_wait_echo_tx_rx_stats() -> Result<()> {
     // 1. Configure Server (Wait + Echo)
     let server_addr = "127.0.0.1:5090";
     let server_config = Config {
+        http_addr: None,
+        media_dir: None,
+        records_dir: None,
+        strategies: Vec::new(),
         addr: Some(server_addr.to_string()),
         external_ip: None,
         recorders: None,
@@ -215,6 +236,10 @@ async fn test_wait_echo_tx_rx_stats() -> Result<()> {
     // 2. Configure Client (Call)
     let client_addr = "127.0.0.1:5091";
     let client_config = Config {
+        http_addr: None,
+        media_dir: None,
+        records_dir: None,
+        strategies: Vec::new(),
         addr: Some(client_addr.to_string()),
         external_ip: None,
         recorders: None,
@@ -227,6 +252,7 @@ async fn test_wait_echo_tx_rx_stats() -> Result<()> {
             hangup: Some(sipbot::config::HangupConfig {
                 code: 200,
                 after_secs: Some(4),
+                mode: None,
             }),
             ..Default::default()
         }],

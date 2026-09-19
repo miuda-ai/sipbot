@@ -316,12 +316,19 @@ pub struct MediaSession {
     local_stop_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>>,
     tracked_mids: Arc<Mutex<std::collections::HashSet<String>>>,
     echo_tracked_mids: Arc<Mutex<std::collections::HashSet<String>>>,
+    bridge_tracked_mids: Arc<Mutex<std::collections::HashSet<String>>>,
     cancel_token: CancellationToken,
     telephone_event_pt: Arc<std::sync::atomic::AtomicU8>,
     telephone_event_clock_rate: Arc<std::sync::atomic::AtomicU32>,
     audio_quality_enabled: bool,
     audio_quality_config: Option<AudioQualityConfig>,
     audio_silent: Arc<std::sync::atomic::AtomicBool>,
+    /// DTMF observer notified on RX decode and TX send (serve mode UI).
+    pub dtmf_notify: DtmfNotifier,
+    /// Set when an echo/bridge loop takes over RX processing; the built-in
+    /// record-only loop (spawn_track_recorder) then yields, preventing the
+    /// double-write that halved recording pitch and duplicated echo frames.
+    pub echo_active: Arc<std::sync::atomic::AtomicBool>,
     /// RTP timestamp-jump tolerance in milliseconds. Any forward/backward
     /// deviation beyond this counts as a `ts_jump` (audio-glitch warning).
     ts_jump_tolerance_ms: u32,
@@ -331,6 +338,27 @@ pub struct MediaSession {
     /// instead of starting from a fresh random base, which receivers' jitter
     /// buffers hear as a discontinuity (seq continues but ts jumps).
     rtp_ts_state: Arc<std::sync::Mutex<Option<(u32, std::time::Instant)>>>,
+}
+
+/// Observer for DTMF events (serve mode: pushes events into the call record).
+pub trait DtmfObserver: Send + Sync {
+    fn on_dtmf(&self, dir: &'static str, digit: char, end: bool);
+}
+
+/// Thread-safe holder for the optional DTMF observer.
+#[derive(Clone, Default)]
+pub struct DtmfNotifier(Arc<std::sync::Mutex<Option<Arc<dyn DtmfObserver>>>>);
+
+impl DtmfNotifier {
+    pub fn set(&self, observer: Arc<dyn DtmfObserver>) {
+        *self.0.lock().unwrap() = Some(observer);
+    }
+
+    pub fn notify(&self, dir: &'static str, digit: char, end: bool) {
+        if let Some(observer) = self.0.lock().unwrap().as_ref() {
+            observer.on_dtmf(dir, digit, end);
+        }
+    }
 }
 
 /// Continuity helpers for locally generated RTP timestamps (see
@@ -601,6 +629,9 @@ impl MediaSession {
             local_stop_tx: Arc::new(Mutex::new(None)),
             tracked_mids: Arc::new(Mutex::new(std::collections::HashSet::new())),
             echo_tracked_mids: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            bridge_tracked_mids: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            dtmf_notify: DtmfNotifier::default(),
+            echo_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancel_token: cancel_token.clone(),
             telephone_event_pt: Arc::new(std::sync::atomic::AtomicU8::new(telephone_event.pt)),
             telephone_event_clock_rate: Arc::new(std::sync::atomic::AtomicU32::new(
@@ -797,6 +828,9 @@ impl MediaSession {
             local_stop_tx: Arc::new(Mutex::new(None)),
             tracked_mids: Arc::new(Mutex::new(std::collections::HashSet::new())),
             echo_tracked_mids: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            bridge_tracked_mids: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            dtmf_notify: DtmfNotifier::default(),
+            echo_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancel_token,
             telephone_event_pt: Arc::new(std::sync::atomic::AtomicU8::new(telephone_event.pt)),
             telephone_event_clock_rate: Arc::new(std::sync::atomic::AtomicU32::new(
@@ -856,8 +890,94 @@ impl MediaSession {
         });
         self.audio_source.send(end_frame)?;
         self.stats.inc_tx_dtmf();
+        self.dtmf_notify.notify("tx", digit, true);
         info!("[DTMF] Sent digit '{}' (event={})", digit, event);
         Ok(())
+    }
+
+    /// (ssrc, next seq, last ts) of this session's audio sender.
+    pub fn local_stream_info(&self) -> Option<(u32, u16, u32)> {
+        let sender = self.pc.get_transceivers().first()?.sender()?;
+        Some((
+            sender.ssrc(),
+            sender.next_sequence_number(),
+            sender.last_rtp_timestamp(),
+        ))
+    }
+
+    /// Initialize the recorder without starting any media action (serve mode).
+    pub async fn init_recording(&self, username: &str, recording_path: &Path) {
+        self.init_recorder(username, Some(recording_path)).await;
+    }
+
+    /// Receive RTP on `self` and forward the decoded audio into `target`'s
+    /// send path (cross-session bridge for the in-call stream jump:
+    /// new SSRC + fresh seq/ts bases without any re-INVITE).
+    pub async fn start_rx_bridge_to(&self, target: &MediaSession, username: String) {
+        info!("[{}] Starting RX bridge to jump session", username);
+        // The bridge loop takes over RX processing on THIS session; the
+        // built-in record-only loop must yield to avoid double-writes.
+        self.echo_active
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let child_token = self.cancel_token.child_token();
+        self.setup_transceivers_for_recording(child_token.clone())
+            .await;
+
+        // Existing transceivers (SDP already negotiated).
+        for transceiver in self.pc.get_transceivers() {
+            let mid = transceiver
+                .mid()
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            if !self.try_track_bridge_mid(&mid).await {
+                continue;
+            }
+            if let Some(receiver) = transceiver.receiver().as_ref() {
+                self.spawn_audio_loop_into(
+                    target.audio_source.clone(),
+                    target.recorder.clone(),
+                    username.clone(),
+                    receiver.track(),
+                    child_token.clone(),
+                );
+            }
+        }
+
+        // Future track events.
+        let pc = self.pc.clone();
+        let session = self.clone();
+        let target = target.clone();
+        tokio::spawn(async move {
+            while let Some(event) = pc.recv().await {
+                if let PeerConnectionEvent::Track(transceiver) = event {
+                    let mid = transceiver
+                        .mid()
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    if !session.try_track_bridge_mid(&mid).await {
+                        continue;
+                    }
+                    if let Some(receiver) = transceiver.receiver().as_ref() {
+                        session.spawn_audio_loop_into(
+                            target.audio_source.clone(),
+                            target.recorder.clone(),
+                            username.clone(),
+                            receiver.track(),
+                            child_token.clone(),
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    async fn try_track_bridge_mid(&self, mid: &str) -> bool {
+        let mut mids = self.bridge_tracked_mids.lock().await;
+        if mids.contains(mid) {
+            return false;
+        }
+        mids.insert(mid.to_string());
+        true
     }
 
     pub fn get_telephone_event_pt(&self) -> u8 {
@@ -1106,8 +1226,25 @@ impl MediaSession {
         track: Arc<dyn MediaStreamTrack>,
         token: CancellationToken,
     ) {
-        let audio_source = self.audio_source.clone();
-        let recorder = self.recorder.clone();
+        self.spawn_audio_loop_into(
+            self.audio_source.clone(),
+            self.recorder.clone(),
+            username,
+            track,
+            token,
+        );
+    }
+
+    /// Audio receive loop; decoded samples are fed into `audio_source`
+    /// (echo semantics) and written into `recorder` when active.
+    fn spawn_audio_loop_into(
+        &self,
+        audio_source: Arc<SampleStreamSource>,
+        recorder: Arc<Mutex<Option<Recorder>>>,
+        username: String,
+        track: Arc<dyn MediaStreamTrack>,
+        token: CancellationToken,
+    ) {
         let stats = self.stats.clone();
         let jitter_buffer_enabled = self.jitter_buffer_enabled;
         let session = self.clone();
@@ -1177,6 +1314,7 @@ impl MediaSession {
                                                         println!("RX_DTMF_DIGIT: {}", digit);
                                                     }
                                                     stats.inc_rx_dtmf();
+                                                    session.dtmf_notify.notify("rx", digit, ev.end);
                                                 }
                                             }
                                         }
@@ -1227,6 +1365,7 @@ impl MediaSession {
                                         aq.as_mut(),
                                         &audio_silent,
                                         ts_jump_tolerance_ms,
+                                        &session.dtmf_notify,
                                     )
                                     .await;
                                 }
@@ -1259,6 +1398,7 @@ impl MediaSession {
                                                             println!("RX_DTMF_DIGIT: {}", digit);
                                                         }
                                                         stats.inc_rx_dtmf();
+                                                        session.dtmf_notify.notify("rx", digit, ev.end);
                                                     }
                                                 }
                                             }
@@ -1309,6 +1449,7 @@ impl MediaSession {
                                             aq.as_mut(),
                                             &audio_silent,
                                             ts_jump_tolerance_ms,
+                                            &session.dtmf_notify,
                                         )
                                         .await;
                                     }
@@ -1425,6 +1566,7 @@ impl MediaSession {
         audio_quality: Option<&mut AudioQualityAnalyzer>,
         audio_silent: &Arc<std::sync::atomic::AtomicBool>,
         tolerance_ms: u32,
+        dtmf_notify: &DtmfNotifier,
     ) {
         // Check for DTMF telephone-event packets
         if let MediaSample::Audio(ref frame) = sample {
@@ -1440,6 +1582,7 @@ impl MediaSession {
                                 println!("RX_DTMF_DIGIT: {}", digit);
                             }
                             stats.inc_rx_dtmf();
+                            dtmf_notify.notify("rx", digit, ev.end);
                         }
                     }
                     // Don't echo telephone-event packets back
@@ -2333,6 +2476,10 @@ impl MediaSession {
 
     pub async fn start_echo(&self, username: String, recording_path: Option<&Path>) -> Result<()> {
         info!("[{}] Starting echo service", username);
+        // The echo loop takes over RX processing (recording/stats/DTMF);
+        // the built-in record-only loop must yield to avoid double-writes.
+        self.echo_active
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.init_recorder(&username, recording_path).await;
 
         // Handle existing transceivers
@@ -2402,6 +2549,13 @@ impl MediaSession {
     pub async fn stop(&self) {
         self.cancel_token.cancel();
         self.pc.close();
+        // Finalize the recording NOW: dropping the Recorder sends Stop to the
+        // writer task, which finalizes the wav header. Do NOT rely on
+        // MediaSession being dropped — serve mode keeps sessions alive in
+        // shared slots (current_media_session) for the bot's lifetime, which
+        // used to leave every recording without a finalized header and with
+        // silence appended until process exit.
+        *self.recorder.lock().await = None;
     }
 
     pub fn sync_nack_stats(&self) {
@@ -2607,13 +2761,27 @@ fn inject_telephone_event_sdp(sdp: &str, info: dtmf::TelephoneEventInfo) -> Stri
     out
 }
 
+/// Check-and-yield helper for the built-in record loop.
+fn session_echo_yield(echo_active: &std::sync::atomic::AtomicBool) -> bool {
+    echo_active.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 fn spawn_track_recorder(
     session: MediaSession,
     track: Arc<dyn MediaStreamTrack>,
     token: CancellationToken,
 ) {
+    // Yield to the echo/bridge loop when it owns RX processing — otherwise
+    // both loops decode the same track and write the recorder twice (halved
+    // pitch, duplicated echo frames).
+    if session.echo_active.load(std::sync::atomic::Ordering::SeqCst) {
+        info!("RX record loop yielding: echo/bridge loop active");
+        return;
+    }
     let recorder = session.recorder.clone();
     let stats = session.stats.clone();
+    let dtmf_notify = session.dtmf_notify.clone();
+    let echo_active = session.echo_active.clone();
     let jitter_buffer_enabled = session.jitter_buffer_enabled;
     let telephone_event_pt = session.telephone_event_pt.load(Ordering::Relaxed);
     let audio_quality_enabled = session.audio_quality_enabled;
@@ -2681,6 +2849,7 @@ fn spawn_track_recorder(
                                                     println!("RX_DTMF_DIGIT: {}", digit);
                                                 }
                                                 stats.inc_rx_dtmf();
+                                                dtmf_notify.notify("rx", digit, ev.end);
                                             }
                                         }
                                     }
@@ -2758,6 +2927,10 @@ fn spawn_track_recorder(
                         break;
                     },
                     res = track.recv() => {
+                        if session_echo_yield(&echo_active) {
+                            info!("RX record loop yielding mid-stream: echo/bridge loop active");
+                            return;
+                        }
                         match res {
                             Ok(mut sample) => {
                                 let is_te = if let MediaSample::Audio(ref frame) = sample {
@@ -2775,6 +2948,7 @@ fn spawn_track_recorder(
                                                     println!("RX_DTMF_DIGIT: {}", digit);
                                                 }
                                                 stats.inc_rx_dtmf();
+                                                dtmf_notify.notify("rx", digit, ev.end);
                                                 }
                                             }
                                         }

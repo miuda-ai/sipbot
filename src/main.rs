@@ -208,6 +208,13 @@ enum Commands {
         /// Target URI (e.g., sip:user@domain)
         target: Option<String>,
     },
+    /// Start the web answer-test server (serve mode): HTTP UI + API + one SIP
+    /// bot per configured account.
+    Serve {
+        /// HTTP listen address for the web UI/API (e.g., 0.0.0.0:8080)
+        #[arg(long)]
+        http: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -247,37 +254,18 @@ async fn main() -> Result<()> {
                 );
                 Config {
                     addr: Some("0.0.0.0:0".to_string()),
+                    http_addr: None,
+                    media_dir: None,
+                    strategies: Vec::new(),
+                    records_dir: None,
                     external_ip: None,
                     recorders: None,
                     ws_url: None,
                     accounts: vec![AccountConfig {
                         username: "sipbot".to_string(),
-                        auth_username: None,
                         domain: "127.0.0.1".to_string(),
-                        password: None,
-                        proxy: None,
                         register: Some(false),
-                        from_user: None,
-                        target: None,
-                        record: None,
-                        srtp_enabled: None,
-                        webrtc_enabled: None,
-                        nack_enabled: None,
-                        jitter_buffer_enabled: None,
-                        reject_prob: None,
-                        cancel_prob: 0,
-                        early_media: None,
-                        ring: None,
-                        answer: None,
-                        hangup: None,
-                        codecs: None,
-                        headers: None,
-                        refer_reject: None,
-                        audio_quality: None,
-                        ts_jump_tolerance_ms: DEFAULT_TS_JUMP_TOLERANCE_MS,
-                        dtmf_flows: None,
-                        reinvite_flows: None,
-                        info_flows: None,
+                        ..Default::default()
                     }],
                 }
             }
@@ -293,37 +281,19 @@ async fn main() -> Result<()> {
                 );
                 Config {
                     addr: Some(addr.clone().unwrap_or_else(|| "0.0.0.0:0".to_string())),
+                    http_addr: None,
+                    media_dir: None,
+                    strategies: Vec::new(),
+                    records_dir: None,
                     external_ip: None,
                     recorders: None,
                     ws_url: None,
                     accounts: vec![AccountConfig {
                         username: "sipbot".to_string(),
-                        auth_username: None,
                         domain: "127.0.0.1".to_string(),
-                        password: None,
-                        proxy: None,
                         register: Some(false),
-                        from_user: None,
-                        target: None,
-                        record: None,
-                        srtp_enabled: None,
-                        webrtc_enabled: None,
-                        nack_enabled: None,
-                        jitter_buffer_enabled: None,
-                        reject_prob: None,
-                        cancel_prob: 0,
-                        early_media: None,
-                        ring: None,
-                        answer: None,
-                        hangup: None,
                         codecs: codecs.clone(),
-                        headers: None,
-                        refer_reject: None,
-                        audio_quality: None,
-                        ts_jump_tolerance_ms: DEFAULT_TS_JUMP_TOLERANCE_MS,
-                        dtmf_flows: None,
-                        reinvite_flows: None,
-                        info_flows: None,
+                        ..Default::default()
                     }],
                 }
             }
@@ -378,11 +348,13 @@ async fn main() -> Result<()> {
                     Some(sipbot::config::HangupConfig {
                         code: *code,
                         after_secs: None,
+                        mode: None,
                     })
                 } else if let Some(secs) = hangup {
                     Some(sipbot::config::HangupConfig {
                         code: 200,
                         after_secs: Some(*secs),
+                        mode: None,
                     })
                 } else {
                     None
@@ -398,6 +370,10 @@ async fn main() -> Result<()> {
 
                 Config {
                     addr: Some(addr.clone()),
+                    http_addr: None,
+                    media_dir: None,
+                    strategies: Vec::new(),
+                    records_dir: None,
                     external_ip: None,
                     recorders: None,
                     ws_url: None,
@@ -411,27 +387,16 @@ async fn main() -> Result<()> {
                         password: password.clone(),
                         proxy: reg_target,
                         register: Some(is_register),
-                        from_user: None,
-                        target: None,
-                        record: None,
                         srtp_enabled: Some(*srtp),
-                        webrtc_enabled: None,
                         nack_enabled: Some(*nack),
                         jitter_buffer_enabled: Some(*jitter),
                         reject_prob: *reject_prob,
-                        cancel_prob: 0,
-                        early_media: None,
                         ring: ring_config,
                         answer: answer_config,
                         hangup: hangup_config,
                         codecs: codecs.clone(),
                         headers: headers.clone(),
-                        refer_reject: None,
-                        audio_quality: None,
-                        ts_jump_tolerance_ms: DEFAULT_TS_JUMP_TOLERANCE_MS,
-                        dtmf_flows: None,
-                        reinvite_flows: None,
-                        info_flows: None,
+                        ..Default::default()
                     }],
                 }
             }
@@ -444,6 +409,15 @@ async fn main() -> Result<()> {
 
     if let Some(external_ip) = args.external {
         config.external_ip = Some(external_ip);
+    }
+
+    // serve mode: spawn bots + web UI, bypassing CLI override plumbing.
+    if let Commands::Serve { http } = &args.command {
+        if let Some(h) = http {
+            config.http_addr = Some(h.clone());
+        }
+        let cancel_token = CancellationToken::new();
+        return sipbot::web::run_serve(config, config_path, args.verbose, cancel_token).await;
     }
 
     let (
@@ -661,6 +635,37 @@ async fn main() -> Result<()> {
             None,
             None,
         ),
+        Commands::Serve { .. } => (
+            "serve",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            None,
+            false,
+            1,
+            1,
+            false,
+            None,
+            0,
+            None,
+            None,
+            None,
+            5,
+            None,
+            None,
+            false,
+            DEFAULT_TS_JUMP_TOLERANCE_MS,
+            None,
+            None,
+            None,
+        ),
     };
 
     if let Some(addr) = &addr_override {
@@ -787,6 +792,7 @@ async fn main() -> Result<()> {
                 account.hangup = Some(sipbot::config::HangupConfig {
                     code: 0,
                     after_secs: Some(hangup),
+                    mode: None,
                 });
             }
         }

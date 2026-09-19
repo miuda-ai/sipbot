@@ -392,4 +392,37 @@ impl CallStats {
         self.audio_quality_total_frames
             .fetch_add(frames, Ordering::Relaxed);
     }
+
+    /// JSON snapshot for the web UI (per-call media stats).
+    pub fn snapshot_json(&self) -> serde_json::Value {
+        let rx = self.rx_packets.load(Ordering::Relaxed);
+        let lost = self.rx_lost_packets.load(Ordering::Relaxed);
+        serde_json::json!({
+            "tx_packets": self.tx_packets.load(Ordering::Relaxed),
+            "tx_bytes": self.tx_bytes.load(Ordering::Relaxed),
+            "rx_packets": rx,
+            "rx_bytes": self.rx_bytes.load(Ordering::Relaxed),
+            "rx_lost": lost,
+            "loss_rate": self.average_loss_rate(),
+            "nack_sent": self.nack_sent.load(Ordering::Relaxed),
+            "nack_recv": self.nack_recv.load(Ordering::Relaxed),
+            "nack_recovered": self.nack_recovered.load(Ordering::Relaxed),
+            "seq_gap_events": self.seq_gap_events.load(Ordering::Relaxed),
+            "seq_gap_total": self.seq_gap_total.load(Ordering::Relaxed),
+            "seq_gap_max": self.seq_gap_max.load(Ordering::Relaxed),
+            "seq_reorder_events": self.seq_reorder_events.load(Ordering::Relaxed),
+            "ts_jump_events": self.ts_jump_events.load(Ordering::Relaxed),
+            "ts_jump_ms_total": self.ts_jump_ms_total.load(Ordering::Relaxed),
+            "ts_jump_ms_max": self.ts_jump_ms_max.load(Ordering::Relaxed),
+            "stream_switch_events": self.stream_switch_events.load(Ordering::Relaxed),
+            "rtcp_rtt_ms": self.average_rtcp_rtt_ms(),
+            "rtcp_rtt_samples": self.rtcp_rtt_samples.load(Ordering::Relaxed),
+            "rx_dtmf_events": self.rx_dtmf_events.load(Ordering::Relaxed),
+            "tx_dtmf_events": self.tx_dtmf_events.load(Ordering::Relaxed),
+            "setup_latency_ms": if self.setup_samples.load(Ordering::Relaxed) > 0 {
+                self.total_setup_latency_ms.load(Ordering::Relaxed) as f64
+                    / self.setup_samples.load(Ordering::Relaxed) as f64
+            } else { 0.0 },
+        })
+    }
 }
