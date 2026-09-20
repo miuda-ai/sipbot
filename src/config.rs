@@ -66,6 +66,9 @@ pub struct Config {
     /// serve mode: reusable answer strategies; accounts bind by name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub strategies: Vec<StrategyConfig>,
+    /// serve mode: named outbound-caller templates for `POST /api/calls`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outbound_profiles: Vec<OutboundProfile>,
 }
 
 impl Config {
@@ -137,6 +140,32 @@ impl Config {
             hangup: account.hangup.clone(),
         }
     }
+}
+
+/// A named outbound-caller template: defaults for `POST /api/calls`.
+/// Explicit request parameters override profile values.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct OutboundProfile {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codecs: Option<Vec<String>>,
+    /// play | echo
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wav_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dtmf_flows: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reinvite_flows: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_flows: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hangup_secs: Option<u64>,
 }
 
 /// A reusable answer-test strategy (serve mode). Accounts bind to a strategy
@@ -262,6 +291,10 @@ pub struct AccountConfig {
     /// strategy only applies to matching callers. Empty/None = match all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_caller: Option<String>,
+    /// Serve mode: disabled accounts are not spawned (hot-toggleable from
+    /// the UI to simulate e.g. an agent going off-duty).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
 
     // Stage 1: Early Media (183)
     pub early_media: Option<EarlyMediaConfig>,
@@ -431,7 +464,7 @@ pub fn parse_transfer_flows(input: &str) -> Result<Vec<TransferFlowEntry>> {
         if part.is_empty() {
             continue;
         }
-        let Some((delay_str, target)) = part.split_once(':') else {
+        let Some((delay_str, _)) = part.split_once(':') else {
             anyhow::bail!(
                 "Invalid transfer_flow entry '{}': expected <delay>:<sip-uri>",
                 part

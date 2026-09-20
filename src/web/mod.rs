@@ -56,6 +56,13 @@ pub fn spawn_bots(state: &Arc<state::ServeState>, verbose: bool) {
     let config = state.current_config();
     let mut used_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
     for account in &config.accounts {
+        if account.enabled == Some(false) {
+            info!(
+                "[{}] account disabled — not spawning (agent off duty)",
+                account.username
+            );
+            continue;
+        }
         let key = format!("{}@{}", account.username, account.domain);
         let token = CancellationToken::new();
         let run_token = token.clone();

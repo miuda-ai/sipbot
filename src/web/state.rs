@@ -105,7 +105,10 @@ pub struct CallRecord {
 
 impl CallRecord {
     pub fn to_json(&self) -> serde_json::Value {
-        let elapsed = self.ended_at_ms.unwrap_or_else(|| now_ms()) - self.started_at_ms;
+        let elapsed = self
+            .ended_at_ms
+            .unwrap_or_else(now_ms)
+            .saturating_sub(self.started_at_ms);
         serde_json::json!({
             "call_id": self.call_id,
             "direction": self.direction.map(|d| d.as_str()),
@@ -126,7 +129,10 @@ impl CallRecord {
     }
 
     pub fn to_json_full(&self) -> serde_json::Value {
-        let elapsed = self.ended_at_ms.unwrap_or_else(|| now_ms()) - self.started_at_ms;
+        let elapsed = self
+            .ended_at_ms
+            .unwrap_or_else(now_ms)
+            .saturating_sub(self.started_at_ms);
         let stats = self
             .stats
             .as_ref()
@@ -328,6 +334,45 @@ impl CallRegistry {
             .cloned()
     }
 
+    /// Remove one call from the registry and delete its persisted JSON
+    /// (plus any recording) from `dir`/`recordings`. Returns whether the
+    /// record existed.
+    pub fn remove(&self, call_id: &str, records_dir: &std::path::Path, recordings_dir: Option<&std::path::Path>) -> bool {
+        let removed = {
+            let mut calls = self.calls.lock().unwrap();
+            let before = calls.len();
+            calls.retain(|c| c.lock().unwrap().call_id != call_id);
+            calls.len() != before
+        };
+        // Delete persisted artifacts matching the sanitized call id.
+        let safe: String = call_id
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        if safe.len() >= 8 {
+            delete_matching_files(records_dir, &safe);
+            if let Some(rdir) = recordings_dir {
+                delete_matching_files(rdir, &safe);
+            }
+        }
+        removed
+    }
+
+    /// Clear every call from the registry and wipe persisted JSONs.
+    pub fn clear(&self, records_dir: &std::path::Path, recordings_dir: Option<&std::path::Path>) -> usize {
+        let count = {
+            let mut calls = self.calls.lock().unwrap();
+            let n = calls.len();
+            calls.clear();
+            n
+        };
+        delete_matching_files(records_dir, "");
+        if let Some(rdir) = recordings_dir {
+            delete_matching_files(rdir, "");
+        }
+        count
+    }
+
     /// Detect duplicate delivery: another inbound record for the same
     /// caller/callee pair that started within `window_ms` of this one
     /// (the registrar forked the INVITE to more than one contact).
@@ -495,8 +540,19 @@ pub struct ServeState {
     pub calls: Arc<CallRegistry>,
     pub events: broadcast::Sender<WsEvent>,
     pub cancel_token: CancellationToken,
+    /// Live outbound test calls: cancel token + identity so the UI hangup
+    /// endpoint can CANCEL a pending INVITE or hangup an answered call.
+    pub outbound_calls: Mutex<Vec<OutboundCallHandle>>,
     /// Live account bots (for hot reload).
     pub bots: Mutex<Vec<super::BotHandle>>,
+}
+
+/// One running outbound test call (ephemeral caller).
+pub struct OutboundCallHandle {
+    pub cancel: CancellationToken,
+    pub from_user: String,
+    pub target: String,
+    pub started_at_ms: u64,
 }
 
 impl ServeState {
@@ -509,6 +565,7 @@ impl ServeState {
             calls: Arc::new(CallRegistry::new()),
             events,
             cancel_token,
+            outbound_calls: Mutex::new(Vec::new()),
             bots: Mutex::new(Vec::new()),
         }
     }
@@ -544,4 +601,26 @@ fn default_config_path() -> PathBuf {
         return home.join(".sipbot.toml");
     }
     PathBuf::from(".sipbot.toml")
+}
+
+/// Delete files in `dir` whose names contain `needle` (all files when the
+/// needle is empty). Returns the number of files removed.
+fn delete_matching_files(dir: &std::path::Path, needle: &str) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if needle.is_empty() || name.contains(needle) {
+            if std::fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    removed
 }

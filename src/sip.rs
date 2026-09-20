@@ -450,6 +450,11 @@ impl CallRunner {
                                     media_task = self.handle_early_media(&media_session, &answer_sdp).await;
                                 }
                             }
+                        } else if let DialogState::Notify(_, _, handle) = &state {
+                            // RFC 3515 §2.4.4 / RFC 6665 §7.2.1: acknowledge
+                            // in-dialog NOTIFYs (e.g. REFER transfer progress)
+                            // with 200 — the app owns the response.
+                            let _ = handle.reply(StatusCode::OK).await;
                         }
 
                         if should_cancel {
@@ -1907,6 +1912,14 @@ impl SipBot {
                 info!("[{}] Received REFER", self.account.username);
                 self.handle_refer(transaction).await?;
             }
+            Method::Notify => {
+                // RFC 3515 §2.4.4 / RFC 6665 §7.2.1: NOTIFYs (e.g. REFER
+                // transfer progress on an implicit subscription) must be
+                // acknowledged with 200 OK, otherwise the transferor's
+                // transaction runs to Timer F (32s) and the transfer stalls.
+                info!("[{}] Received NOTIFY, replying 200 OK", self.account.username);
+                transaction.reply(StatusCode::OK).await?;
+            }
             _ => info!(
                 "[{}] Received other method: {:?}",
                 self.account.username, transaction.original.method
@@ -2039,6 +2052,12 @@ impl SipBot {
                                 }
                                 DialogState::Options(_, _, tx_handle) => {
                                     info!("[{}] Call is options", username_monitor);
+                                    tx_handle.reply(rsipstack::rsip::StatusCode::OK).await.ok();
+                                }
+                                DialogState::Notify(_, _, tx_handle) => {
+                                    // RFC 3515 §2.4.4 / RFC 6665 §7.2.1: the
+                                    // app owns the response to in-dialog
+                                    // NOTIFYs (REFER transfer progress).
                                     tx_handle.reply(rsipstack::rsip::StatusCode::OK).await.ok();
                                 }
                                 DialogState::Terminated(..) => {

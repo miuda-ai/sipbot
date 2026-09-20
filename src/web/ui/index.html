@@ -76,6 +76,9 @@
   <section id="tab-outbound" class="tab-page">
     <div class="toolbar"><h2>Outbound Test Call</h2><span class="muted">uses an ephemeral caller (random port)</span></div>
     <div class="form-card" id="outbound-form">
+      <label>Outbound profile
+        <select id="ob-profile"><option value="">(manual)</option></select>
+      </label>
       <label>Target URI<input id="ob-target" placeholder="sip:1001@127.0.0.1:35060"></label>
       <label>SIP proxy / server<input id="ob-proxy" placeholder="127.0.0.1:35060 — empty = direct P2P call"></label>
       <label>Caller user name<input id="ob-from" value="caller"></label>

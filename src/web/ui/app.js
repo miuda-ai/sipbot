@@ -21,12 +21,14 @@ let strategyNames = []; // for binding dropdowns
 
 async function loadAccounts() {
   try {
-    const [accData, stratData] = await Promise.all([
+    const [accData, stratData, cfgData] = await Promise.all([
       api("/api/accounts"),
       api("/api/strategies"),
+      api("/api/config"),
     ]);
     strategyNames = (stratData.strategies || []).map(s => s.name);
     refreshFilterOptions((accData.accounts || []).map(a => a.username), strategyNames);
+    refreshOutboundProfiles(cfgData.outbound_profiles || []);
     const list = $("#account-list");
     list.innerHTML = "";
     for (const a of accData.accounts || []) {
@@ -41,10 +43,16 @@ async function loadAccounts() {
         : (a.strategy_inline ? `<span class="badge warn">inline (toml)</span>` : "");
       const bindOptions = ["", ...strategyNames].map(n =>
         `<option value="${esc(n)}" ${n === (a.strategy || "") ? "selected" : ""}>${n ? esc(n) : "(unbound)"}</option>`).join("");
+      const enabled = a.enabled !== false;
+      const toggleBtn = enabled
+        ? `<button class="btn danger act-toggle" title="Disable account (simulate off duty)">Disable</button>`
+        : `<button class="btn primary act-toggle" title="Enable account">Enable</button>`;
+      const dimStyle = enabled ? "" : ` style="opacity:.45"`;
       const el = document.createElement("div");
       el.className = "card account-card";
+      if (!enabled) el.style.opacity = "0.5";
       el.innerHTML = `
-        <h3>${esc(a.username)}@${esc(a.domain)}</h3>
+        <h3>${esc(a.username)}@${esc(a.domain)}${enabled ? "" : ' <span class="badge err">off-duty</span>'}</h3>
         <div class="meta">
           <span class="badge info">${esc(a.transport)}</span>
           ${regBadge}
@@ -53,6 +61,7 @@ async function loadAccounts() {
         <div class="strategy">${esc(a.summary || "default answer")}</div>
         <div class="card-actions">
           <select class="bind-select" title="Bind strategy">${bindOptions}</select>
+          ${toggleBtn}
           <button class="btn act-copy" title="Duplicate account">Copy</button>
           <button class="btn act-edit" title="Edit account">Edit</button>
         </div>
@@ -60,6 +69,12 @@ async function loadAccounts() {
       $(".bind-select", el).addEventListener("change", async (ev) => {
         await postJSON("/api/accounts/bind", {
           username: a.username, domain: a.domain, strategy: ev.target.value,
+        });
+        loadAccounts();
+      });
+      $(".act-toggle", el).addEventListener("click", async () => {
+        await postJSON("/api/accounts/enabled", {
+          username: a.username, domain: a.domain, enabled: !enabled,
         });
         loadAccounts();
       });
@@ -482,21 +497,23 @@ function mediaValue(container, id) {
 async function initOutbound() {
   await buildMediaWidget($('[data-media="ob-wav"]'));
   $("#ob-submit").addEventListener("click", async () => {
+    const val = (id) => { const el = $(id); return el ? el.value.trim() : ""; };
     const body = {
-      target: $("#ob-target").value.trim(),
-      proxy: $("#ob-proxy").value.trim() || undefined,
-      from_user: $("#ob-from").value.trim() || "caller",
-      codecs: $("#ob-codecs").value.trim
-        ? $("#ob-codecs").value.split(",").map(s => s.trim()).filter(Boolean)
+      profile: $("#ob-profile")?.value || undefined,
+      target: val("#ob-target"),
+      proxy: val("#ob-proxy") || undefined,
+      from_user: val("#ob-from") || "caller",
+      codecs: val("#ob-codecs")
+        ? val("#ob-codecs").split(",").map(s => s.trim()).filter(Boolean)
         : undefined,
-      action: $("#ob-action").value,
+      action: $("#ob-action")?.value || "play",
       wav_file: mediaValue($("#outbound-form"), "ob-wav") || null,
-      hangup_secs: num($("#ob-hangup").value, 10),
-      dtmf_flows: $("#ob-dtmf").value.trim() || null,
-      reinvite_flows: $("#ob-reinvite").value.trim() || null,
-      transfer_flows: $("#ob-transfer").value.trim() || null,
-      total: num($("#ob-total").value, 1),
-      cps: num($("#ob-cps").value, 1),
+      hangup_secs: num($("#ob-hangup")?.value, 10),
+      dtmf_flows: val("#ob-dtmf") || null,
+      reinvite_flows: val("#ob-reinvite") || null,
+      transfer_flows: val("#ob-transfer") || null,
+      total: num($("#ob-total")?.value, 1),
+      cps: num($("#ob-cps")?.value, 1),
     };
     if (!body.target) { $("#ob-result").textContent = "target URI is required"; return; }
     try {
@@ -511,6 +528,30 @@ async function initOutbound() {
       $("#ob-result").textContent = "failed: " + e;
     }
   });
+}
+
+function refreshOutboundProfiles(profiles) {
+  const sel = $("#ob-profile");
+  if (!sel) return;
+  const cur = sel.value;
+  sel.innerHTML = `<option value="">(manual)</option>` +
+    profiles.map(p => `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join("");
+  if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
+  window.__obProfiles = profiles;
+}
+
+function applyOutboundProfile(name) {
+  const p = (window.__obProfiles || []).find(p => p.name === name);
+  if (!p) return;
+  const set = (id, v) => { const el = $(id); if (el) el.value = v || ""; };
+  set("#ob-target", p.target);
+  set("#ob-proxy", p.proxy);
+  set("#ob-codecs", (p.codecs || []).join(","));
+  set("#ob-action", p.action || "play");
+  set("#ob-dtmf", p.dtmf_flows);
+  set("#ob-reinvite", p.reinvite_flows);
+  set("#ob-transfer", p.transfer_flows);
+  if (p.hangup_secs != null) set("#ob-hangup", String(p.hangup_secs));
 }
 
 // --- Calls tab ---
@@ -599,6 +640,7 @@ function renderCallDetail(d) {
       <span class="muted mono">${esc(d.call_id)}</span>
       <span style="flex:1"></span>
       ${active ? `<button id="btn-hangup" class="btn danger">Hang up</button>` : ""}
+      <button id="btn-del-call" class="btn danger" title="Delete this call record">Delete</button>
     </div>
     ${issuesHtml}
     ${active ? `
@@ -648,6 +690,14 @@ function renderCallDetail(d) {
   const btn = $("#btn-hangup");
   if (btn) btn.addEventListener("click", async () => {
     await api(`/api/calls/${encodeURIComponent(d.call_id)}/hangup`, { method: "POST" });
+  });
+  const delBtn = $("#btn-del-call");
+  if (delBtn) delBtn.addEventListener("click", async () => {
+    if (!confirm("Delete this call record?")) return;
+    await api(`/api/calls/${encodeURIComponent(d.call_id)}`, { method: "DELETE" });
+    selectedCallId = null;
+    loadCalls();
+    el.innerHTML = `<div class="placeholder">call deleted</div>`;
   });
   $$(".btn.dtmf", el).forEach(b => b.addEventListener("click", async () => {
     await api(`/api/calls/${encodeURIComponent(d.call_id)}/dtmf`, {
@@ -797,6 +847,14 @@ function connectWs() {
 }
 
 // --- utils ---
+function num(v, dflt) {
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : dflt;
+}
+function collectValue(sel) {
+  const el = $(sel);
+  return el ? el.value : "";
+}
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -835,6 +893,15 @@ loadCalls();
 for (const id of ["f-state", "f-account", "f-strategy"]) {
   document.getElementById(id)?.addEventListener("change", loadCalls);
 }
+document.getElementById("ob-profile")?.addEventListener("change", (ev) => {
+  applyOutboundProfile(ev.target.value);
+});
+document.getElementById("btn-clear-calls")?.addEventListener("click", async () => {
+  if (!confirm("Delete ALL call records (including recordings)?")) return;
+  await api("/api/calls", { method: "DELETE" });
+  selectedCallId = null;
+  loadCalls();
+});
 initOutbound();
 initStrategyTemplates();
 initAddAccount();

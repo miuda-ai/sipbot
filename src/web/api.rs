@@ -1,4 +1,4 @@
-use super::state::ServeState;
+use super::state::{now_ms, ServeState};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -17,11 +17,12 @@ pub fn router(state: Arc<ServeState>) -> Router {
         .route("/api/accounts", get(get_accounts))
         .route("/api/accounts/copy", post(post_account_copy))
         .route("/api/accounts/bind", post(post_account_bind))
+        .route("/api/accounts/enabled", post(post_account_enabled))
         .route("/api/strategies", get(get_strategies))
         .route("/api/strategies/copy", post(post_strategy_copy))
         .route("/api/strategies/{name}", axum::routing::delete(delete_strategy))
-        .route("/api/calls", get(get_calls).post(post_call_outbound))
-        .route("/api/calls/{call_id}", get(get_call_detail))
+        .route("/api/calls", get(get_calls).post(post_call_outbound).delete(delete_all_calls))
+        .route("/api/calls/{call_id}", get(get_call_detail).delete(delete_call))
         .route("/api/calls/{call_id}/hangup", post(post_call_hangup))
         .route("/api/calls/{call_id}/dtmf", post(post_call_dtmf))
         .route("/api/recordings", get(get_recordings))
@@ -39,21 +40,33 @@ pub fn router(state: Arc<ServeState>) -> Router {
 
 async fn ui_index() -> impl IntoResponse {
     (
-        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (axum::http::header::CACHE_CONTROL, "no-store, must-revalidate"),
+            (axum::http::header::PRAGMA, "no-cache"),
+        ],
         super::ui::INDEX_HTML,
     )
 }
 
 async fn ui_app_js() -> impl IntoResponse {
     (
-        [(axum::http::header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        [
+            (axum::http::header::CONTENT_TYPE, "application/javascript; charset=utf-8"),
+            (axum::http::header::CACHE_CONTROL, "no-store, must-revalidate"),
+            (axum::http::header::PRAGMA, "no-cache"),
+        ],
         super::ui::APP_JS,
     )
 }
 
 async fn ui_style_css() -> impl IntoResponse {
     (
-        [(axum::http::header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        [
+            (axum::http::header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (axum::http::header::CACHE_CONTROL, "no-store, must-revalidate"),
+            (axum::http::header::PRAGMA, "no-cache"),
+        ],
         super::ui::STYLE_CSS,
     )
 }
@@ -81,13 +94,6 @@ async fn post_call_outbound(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    if target.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "missing target" })),
-        )
-            .into_response();
-    }
     let from_user = body
         .get("from_user")
         .and_then(|v| v.as_str())
@@ -122,6 +128,12 @@ async fn post_call_outbound(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .filter(|s| !s.trim().is_empty());
+    // Named outbound profile (serve config [[outbound_profiles]]): provides
+    // defaults; explicit request fields override profile values.
+    let profile_name = body
+        .get("profile")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     // Optional SIP proxy + credentials so the ephemeral caller can traverse
     // a SIP server (e.g. rustpbx) instead of INVITEing the domain directly.
     let proxy = body
@@ -158,6 +170,53 @@ async fn post_call_outbound(
         }
         .filter(|list: &Vec<String>| !list.is_empty())
     });
+    let profile = profile_name.as_deref().and_then(|name| {
+        state
+            .current_config()
+            .outbound_profiles
+            .iter()
+            .find(|p| p.name == name)
+            .cloned()
+    });
+    if profile_name.is_some() && profile.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("unknown profile: {}", profile_name.unwrap()) })),
+        )
+            .into_response();
+    }
+    let pick = |explicit: Option<String>, p: Option<&String>| match explicit {
+        Some(v) if !v.trim().is_empty() => Some(v),
+        _ => p.cloned(),
+    };
+    let target = pick(
+        Some(target.clone()),
+        profile.as_ref().and_then(|p| p.target.as_ref()),
+    )
+    .unwrap_or_else(|| target.clone());
+    if target.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "missing target (no profile and no target given)" })),
+        )
+            .into_response();
+    }
+    let proxy = pick(proxy, profile.as_ref().and_then(|p| p.proxy.as_ref()));
+    let dtmf_flows = pick(dtmf_flows, profile.as_ref().and_then(|p| p.dtmf_flows.as_ref()));
+    let reinvite_flows = pick(
+        reinvite_flows,
+        profile.as_ref().and_then(|p| p.reinvite_flows.as_ref()),
+    );
+    let transfer_flows = pick(
+        transfer_flows,
+        profile.as_ref().and_then(|p| p.transfer_flows.as_ref()),
+    );
+    let action =
+        pick(Some(action), profile.as_ref().and_then(|p| p.action.as_ref()))
+            .unwrap_or_else(|| "play".to_string());
+    let hangup_secs = hangup_secs.or(profile.as_ref().and_then(|p| p.hangup_secs));
+    let codecs = codecs.or_else(|| profile.as_ref().and_then(|p| p.codecs.clone()));
+    let wav_file = pick(wav_file, profile.as_ref().and_then(|p| p.wav_file.as_ref()));
     let codecs = codecs.unwrap_or_else(|| {
         vec!["pcmu".to_string(), "pcma".to_string(), "g722".to_string()]
     });
@@ -185,6 +244,9 @@ async fn post_call_outbound(
         domain: domain.clone(),
         password,
         proxy: proxy.clone(),
+        // Register so the server's locator can resolve this caller for
+        // mid-dialog requests (REFER NOTIFYs etc.).
+        register: proxy.as_ref().map(|_| true),
         target: Some(target.clone()),
         answer: answer_config,
         hangup: hangup_secs.map(|secs| crate::config::HangupConfig {
@@ -204,15 +266,19 @@ async fn post_call_outbound(
         addr: Some("0.0.0.0:0".to_string()),
         external_ip: state.current_config().external_ip,
         recorders: state.current_config().recorders,
+        outbound_profiles: state.current_config().outbound_profiles.clone(),
         ..Default::default()
     };
 
+    // Per-call cancel token: lets the UI CANCEL a pending INVITE or send
+    // BYE for an answered outbound test call (POST /api/calls/{id}/hangup).
+    let call_cancel = tokio_util::sync::CancellationToken::new();
     let mut bot = crate::sip::SipBot::new(
         account,
         global_config,
         std::sync::Arc::new(crate::stats::CallStats::new()),
         true,
-        state.cancel_token.child_token(),
+        call_cancel.child_token(),
     );
     bot.trace_inspector = Some(super::inspector::TraceInspector::new(
         state.calls.clone(),
@@ -224,17 +290,32 @@ async fn post_call_outbound(
     bot.call_registry = Some(state.calls.clone());
     bot.ws_events = Some(state.events.clone());
 
+    {
+        let mut running = state.outbound_calls.lock().unwrap();
+        running.retain(|h| now_ms().saturating_sub(h.started_at_ms) < 600_000);
+        running.push(super::state::OutboundCallHandle {
+            cancel: call_cancel,
+            from_user: from_user.clone(),
+            target: target.clone(),
+            started_at_ms: now_ms(),
+        });
+    }
+    let cleanup_from = from_user.clone();
+    let cleanup_target = target.clone();
+    let state_for_cleanup = state.clone();
     tokio::spawn(async move {
         if let Err(e) = bot.run_call(total, cps).await {
             tracing::error!("outbound test call error: {:?}", e);
         }
+        let mut running = state_for_cleanup.outbound_calls.lock().unwrap();
+        running.retain(|h| h.from_user != cleanup_from || h.target != cleanup_target);
     });
 
     Json(
         serde_json::json!({
             "ok": true,
-            "from": from_user,
-            "target": target,
+            "from": from_user.clone(),
+            "target": target.clone(),
             "action": action,
             "total": total,
             "cps": cps,
@@ -263,6 +344,7 @@ async fn get_accounts(State(state): State<Arc<ServeState>>) -> impl IntoResponse
                 "username": a.username,
                 "domain": a.domain,
                 "register": a.register.unwrap_or(false),
+                "enabled": a.enabled != Some(false),
                 "transport": a.transport.clone().unwrap_or_else(|| "udp".to_string()),
                 "transport_addr": a.transport_addr,
                 "transport_ws_url": a.transport_ws_url,
@@ -430,6 +512,31 @@ async fn post_account_copy(
     .into_response()
 }
 
+/// POST /api/accounts/enabled {username, domain, enabled} — hot-toggle an
+/// account (e.g. simulate an agent going off duty).
+async fn post_account_enabled(
+    State(state): State<Arc<ServeState>>,
+    Json(body): Json<serde_json::Value>,
+) -> axum::response::Response {
+    let username = body.get("username").and_then(|v| v.as_str()).unwrap_or("");
+    let domain = body.get("domain").and_then(|v| v.as_str()).unwrap_or("");
+    let Some(enabled) = body.get("enabled").and_then(|v| v.as_bool()) else {
+        return bad_request("missing enabled");
+    };
+    let mut config = state.current_config();
+    let Some(account) = config
+        .accounts
+        .iter_mut()
+        .find(|a| a.username == username && a.domain == domain)
+    else {
+        return not_found("account not found");
+    };
+    account.enabled = Some(enabled);
+    commit_config(&state, config).await;
+    Json(serde_json::json!({ "ok": true, "username": username, "enabled": enabled }))
+        .into_response()
+}
+
 /// POST /api/accounts/bind {username, domain, strategy}
 async fn post_account_bind(
     State(state): State<Arc<ServeState>>,
@@ -583,11 +690,71 @@ async fn post_call_hangup(
                     token.cancel();
                     Json(serde_json::json!({ "ok": true })).into_response()
                 }
-                _ => (
-                    StatusCode::CONFLICT,
-                    Json(serde_json::json!({ "error": "call not controllable" })),
-                )
-                    .into_response(),
+                _ => {
+                    // Outbound caller legs carry no inbound control token —
+                    // match the record against running outbound test calls
+                    // and cancel the caller task (CANCEL pending INVITE /
+                    // BYE an answered call).
+                    let (caller, callee, is_active) = {
+                        let r = record.lock().unwrap();
+                        (
+                            r.caller.clone(),
+                            r.callee.clone(),
+                            !matches!(
+                                r.state,
+                                Some(crate::web::state::CallState::Terminated)
+                                    | Some(crate::web::state::CallState::Rejected)
+                                    | Some(crate::web::state::CallState::Failed)
+                            ),
+                        )
+                    };
+                    if !is_active {
+                        return (
+                            StatusCode::CONFLICT,
+                            Json(serde_json::json!({ "error": "call already ended" })),
+                        )
+                            .into_response();
+                    }
+                    let caller_user = caller.split('@').next().unwrap_or("").to_string();
+                    let mut matched = false;
+                    {
+                        let running = state.outbound_calls.lock().unwrap();
+                        for h in running.iter() {
+                            if h.from_user != caller_user {
+                                continue;
+                            }
+                            let target_user = h.target.trim_start_matches("sip:");
+                            let target_user = target_user.split('@').next().unwrap_or("");
+                            let callee_user = callee.split('@').next().unwrap_or("");
+                            let callee_host = callee.split('@').nth(1).unwrap_or("");
+                            let target_host = h
+                                .target
+                                .split('@')
+                                .nth(1)
+                                .unwrap_or("")
+                                .split(';')
+                                .next()
+                                .unwrap_or("");
+                            let host_ok = callee_host.is_empty()
+                                || target_host.is_empty()
+                                || callee_host.starts_with(target_host.split(':').next().unwrap_or(""));
+                            if callee_user == target_user && host_ok {
+                                h.cancel.cancel();
+                                matched = true;
+                                break;
+                            }
+                        }
+                    }
+                    if matched {
+                        Json(serde_json::json!({ "ok": true, "cancelled": true })).into_response()
+                    } else {
+                        (
+                            StatusCode::CONFLICT,
+                            Json(serde_json::json!({ "error": "call not controllable" })),
+                        )
+                            .into_response()
+                    }
+                }
             }
         }
         None => (
@@ -596,6 +763,43 @@ async fn post_call_hangup(
         )
             .into_response(),
     }
+}
+
+/// DELETE /api/calls/{call_id} — drop one call record and its artifacts.
+async fn delete_call(
+    State(state): State<Arc<ServeState>>,
+    Path(call_id): Path<String>,
+) -> axum::response::Response {
+    let call_id = call_id.trim();
+    if call_id.is_empty() {
+        return bad_request("missing call id");
+    }
+    let records_dir = std::path::PathBuf::from(state.current_config().records_directory());
+    let recordings_dir = state
+        .current_config()
+        .recorders
+        .clone()
+        .map(std::path::PathBuf::from);
+    let removed = state
+        .calls
+        .remove(&call_id, &records_dir, recordings_dir.as_deref());
+    if removed {
+        Json(serde_json::json!({ "ok": true, "deleted": call_id })).into_response()
+    } else {
+        not_found("call not found")
+    }
+}
+
+/// DELETE /api/calls — clear every call record (and persisted artifacts).
+async fn delete_all_calls(State(state): State<Arc<ServeState>>) -> axum::response::Response {
+    let records_dir = std::path::PathBuf::from(state.current_config().records_directory());
+    let recordings_dir = state
+        .current_config()
+        .recorders
+        .clone()
+        .map(std::path::PathBuf::from);
+    let cleared = state.calls.clear(&records_dir, recordings_dir.as_deref());
+    Json(serde_json::json!({ "ok": true, "cleared": cleared })).into_response()
 }
 
 async fn post_call_dtmf(
