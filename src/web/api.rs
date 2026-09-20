@@ -109,6 +109,20 @@ async fn post_call_outbound(
         .get("dtmf_flows")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    // Optional SIP proxy + credentials so the ephemeral caller can traverse
+    // a SIP server (e.g. rustpbx) instead of INVITEing the domain directly.
+    let proxy = body
+        .get("proxy")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let auth_user = body
+        .get("auth_user")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let password = body
+        .get("password")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     // Parse target host to use as domain.
     let target_stripped = target.trim_start_matches("sip:");
@@ -129,7 +143,10 @@ async fn post_call_outbound(
 
     let account = crate::config::AccountConfig {
         username: from_user.clone(),
+        auth_username: auth_user,
         domain: domain.clone(),
+        password,
+        proxy,
         target: Some(target.clone()),
         answer: answer_config,
         hangup: hangup_secs.map(|secs| crate::config::HangupConfig {
