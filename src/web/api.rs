@@ -123,6 +123,31 @@ async fn post_call_outbound(
         .get("password")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    // Optional codec preference: JSON array or comma-separated string
+    // (e.g. "g729,pcmu"). Defaults to pcma/pcmu/g722.
+    let codecs: Option<Vec<String>> = body.get("codecs").and_then(|v| {
+        let parse_list = |s: &str| -> Vec<String> {
+            s.split(',')
+                .map(|c| c.trim().to_lowercase())
+                .filter(|c| !c.is_empty())
+                .collect()
+        };
+        match v {
+            serde_json::Value::Array(items) => Some(
+                items
+                    .iter()
+                    .filter_map(|i| i.as_str().map(|s| s.trim().to_lowercase()))
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            ),
+            serde_json::Value::String(s) => Some(parse_list(s)),
+            _ => None,
+        }
+        .filter(|list: &Vec<String>| !list.is_empty())
+    });
+    let codecs = codecs.unwrap_or_else(|| {
+        vec!["pcmu".to_string(), "pcma".to_string(), "g722".to_string()]
+    });
 
     // Parse target host to use as domain.
     let target_stripped = target.trim_start_matches("sip:");
@@ -155,7 +180,7 @@ async fn post_call_outbound(
             mode: None,
         }),
         dtmf_flows,
-        codecs: Some(vec!["pcmu".to_string(), "pcma".to_string(), "g722".to_string()]),
+        codecs: Some(codecs.clone()),
         ..Default::default()
     };
 
@@ -198,6 +223,7 @@ async fn post_call_outbound(
             "action": action,
             "total": total,
             "cps": cps,
+            "codecs": codecs,
         }),
     )
         .into_response()

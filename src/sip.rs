@@ -3012,9 +3012,21 @@ fn expected_call_ms(account: &crate::config::AccountConfig) -> Option<u64> {
     };
     match account.hangup.as_ref().map(|h| h.effective_mode()) {
         Some(crate::config::HangupMode::After(secs)) => {
-            ms += audio_ms.min((secs as f64) * 1000.0);
+            // The call ends at whichever comes first: media completion or
+            // the timer. Echo/local answers have no fixed media length, so
+            // only the timer bounds the call.
+            ms += if audio_ms > 0.0 {
+                audio_ms.min((secs as f64) * 1000.0)
+            } else {
+                (secs as f64) * 1000.0
+            };
         }
-        Some(crate::config::HangupMode::Playback) => ms += audio_ms,
+        Some(crate::config::HangupMode::Playback) => {
+            if audio_ms <= 0.0 {
+                return None; // nothing to expect from
+            }
+            ms += audio_ms;
+        }
         _ => return None,
     }
     Some(ms as u64)
@@ -3032,38 +3044,26 @@ fn evaluate_call_health(r: &mut crate::web::state::CallRecord, account: &crate::
         return;
     }
     if r.state == Some(CallState::Terminated) {
-        // One-way media: we transmitted RTP but never received any.
-        if let Some(stats) = &r.stats {
-            let snap = stats.snapshot_json();
-            let rx = snap.get("rx_packets").and_then(|v| v.as_u64()).unwrap_or(0);
-            let tx = snap.get("tx_packets").and_then(|v| v.as_u64()).unwrap_or(0);
-            if tx > 50 && rx == 0 {
-                r.issues.push(format!(
-                    "one-way media: sent {tx} RTP packets but received 0 (media path broken)"
-                ));
-            }
-        }
-        // Hangup ownership: a playback-hangup call must end with our own BYE.
-        if let Some(h) = &account.hangup {
-            if h.effective_mode() == crate::config::HangupMode::Playback
-                && r.sip_trace
-                    .iter()
-                    .rev()
-                    .take(4)
-                    .any(|m| m.dir == "in" && m.summary.starts_with("BYE"))
-            {
-                r.issues.push(
-                    "remote BYE ended a playback-hangup call — the bot never sent its own BYE (playback stalled?)"
-                        .to_string(),
-                );
-            }
-        }
-        // Duration deviation vs the strategy expectation.
+        // Hangup ownership + duration deviation vs the strategy expectation.
+        // Hanging up early is normal caller behaviour — only flag calls that
+        // ran well past what the strategy implies (stalled playback, lost
+        // BYE), including the case where the remote had to end it.
         if let Some(expected) = expected_call_ms(account) {
             let dur = r.ended_at_ms.unwrap_or(0).saturating_sub(r.started_at_ms);
             if dur > expected + 4000 {
+                let remote_bye = r
+                    .sip_trace
+                    .iter()
+                    .rev()
+                    .take(4)
+                    .any(|m| m.dir == "in" && m.summary.starts_with("BYE"));
+                let why = if remote_bye {
+                    "remote had to hang up — bot BYE never sent (playback stalled?)"
+                } else {
+                    "stalled playback or remote held the call"
+                };
                 r.issues.push(format!(
-                    "call ran {dur}ms, expected ~{expected}ms (stalled playback or remote held the call)"
+                    "call ran {dur}ms, expected ~{expected}ms — {why}"
                 ));
             }
         }

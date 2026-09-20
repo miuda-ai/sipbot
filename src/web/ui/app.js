@@ -485,6 +485,9 @@ async function initOutbound() {
     const body = {
       target: $("#ob-target").value.trim(),
       from_user: $("#ob-from").value.trim() || "caller",
+      codecs: $("#ob-codecs").value.trim
+        ? $("#ob-codecs").value.split(",").map(s => s.trim()).filter(Boolean)
+        : undefined,
       action: $("#ob-action").value,
       wav_file: mediaValue($("#outbound-form"), "ob-wav") || null,
       hangup_secs: num($("#ob-hangup").value, 10),
