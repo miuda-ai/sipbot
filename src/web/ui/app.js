@@ -554,7 +554,7 @@ async function loadCalls() {
         <td>${c.direction === "outbound" ? "↗" : "↙"}</td>
         <td>${esc(shortUser(c.caller))}</td>
         <td>${esc(shortUser(c.callee))}</td>
-        <td><span class="state-pill ${c.state || ""}">${stateLabel(c.state)}</span></td>
+        <td><span class="state-pill ${c.state || ""}">${stateLabel(c.state)}</span>${c.issues && c.issues.length ? ` <span class="warn-badge" title="${esc(c.issues.join("\n"))}">⚠${c.issues.length}</span>` : ""}</td>
         <td>${fmtDur(c.duration_ms)}</td>
       `;
       tr.addEventListener("click", () => selectCall(c.call_id));
@@ -579,6 +579,11 @@ async function selectCall(callId) {
 function renderCallDetail(d) {
   const el = $("#call-detail");
   const active = ["answered", "early_media", "ringing", "trying"].includes(d.state);
+  const issuesHtml = d.issues && d.issues.length ? `
+    <div class="panel issues-panel">
+      <h3>⚠ Acceptance checks — ${d.issues.length} issue${d.issues.length > 1 ? "s" : ""}</h3>
+      ${d.issues.map(i => `<div class="issue-row">⚠ ${esc(i)}</div>`).join("")}
+    </div>` : "";
   el.innerHTML = `
     <div class="toolbar">
       <h2>${esc(shortUser(d.caller))} → ${esc(shortUser(d.callee))}</h2>
@@ -589,6 +594,7 @@ function renderCallDetail(d) {
       <span style="flex:1"></span>
       ${active ? `<button id="btn-hangup" class="btn danger">Hang up</button>` : ""}
     </div>
+    ${issuesHtml}
     ${active ? `
     <div class="dtmf-bar">
       ${"123456789*0#".split("").map(k => `<button class="btn dtmf" data-d="${k}">${k}</button>`).join("")}

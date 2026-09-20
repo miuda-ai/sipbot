@@ -223,3 +223,14 @@ select.filter {
   border-radius: 5px; padding: 5px 8px; font-size: 12px; max-width: 160px;
 }
 select.filter:focus { outline: 1px solid var(--accent); }
+
+/* acceptance-check issue markers */
+.warn-badge {
+  display: inline-block; margin-left: 6px; padding: 0 6px;
+  font-size: 11px; font-weight: 600; color: #8a5b00;
+  background: #ffd66e; border-radius: 8px; cursor: help;
+}
+.issues-panel { border-left: 3px solid #ffb020; }
+.issues-panel h3 { color: #8a5b00; }
+.issue-row { padding: 4px 0; font-size: 13px; color: var(--muted); border-bottom: 1px dashed var(--border); }
+.issue-row:last-child { border-bottom: none; }

@@ -88,6 +88,9 @@ pub struct CallRecord {
     pub jump_events: Vec<JumpEvent>,
     pub dtmf_events: Vec<DtmfEventLog>,
     pub recording: Option<String>,
+    /// Acceptance-check findings for this call (fork duplicates, one-way
+    /// media, hangup ownership mismatches, duration deviations...).
+    pub issues: Vec<String>,
     /// UI control channel: cancelling it requests a server-side BYE.
     pub control: Option<tokio_util::sync::CancellationToken>,
     /// UI DTMF: digits sent here are transmitted on the current media session.
@@ -117,6 +120,7 @@ impl CallRecord {
             "end_reason": self.end_reason,
             "codec": self.codec,
             "recording": self.recording,
+            "issues": self.issues.clone(),
             "trace_len": self.sip_trace.len(),
         })
     }
@@ -142,6 +146,7 @@ impl CallRecord {
             "end_reason": self.end_reason,
             "codec": self.codec,
             "recording": self.recording,
+            "issues": self.issues.clone(),
             "sip_trace": self.sip_trace,
             "sdp_offer": self.sdp_offer,
             "sdp_183": self.sdp_183,
@@ -197,6 +202,15 @@ impl CallRecord {
                 .and_then(|x| serde_json::from_value(x.clone()).ok())
                 .unwrap_or_default(),
             recording: v.get("recording").and_then(|x| x.as_str()).map(|s| s.to_string()),
+            issues: v
+                .get("issues")
+                .and_then(|x| x.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|i| i.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default(),
             control: None,
             dtmf_tx: None,
             stats: None,
@@ -312,6 +326,38 @@ impl CallRegistry {
             .iter()
             .find(|c| c.lock().unwrap().call_id == call_id)
             .cloned()
+    }
+
+    /// Detect duplicate delivery: another inbound record for the same
+    /// caller/callee pair that started within `window_ms` of this one
+    /// (the registrar forked the INVITE to more than one contact).
+    pub fn find_duplicate_inbound(
+        &self,
+        call_id: &str,
+        caller: &str,
+        callee_user: &str,
+        started_at_ms: u64,
+        window_ms: u64,
+    ) -> Option<String> {
+        let calls = self.calls.lock().unwrap();
+        calls.iter().find_map(|c| {
+            let r = c.lock().unwrap();
+            if r.call_id == call_id || r.direction != Some(CallDirection::Inbound) {
+                return None;
+            }
+            if r.caller != caller {
+                return None;
+            }
+            let this_user = r.callee.split('@').next().unwrap_or("");
+            if this_user != callee_user {
+                return None;
+            }
+            if r.started_at_ms.abs_diff(started_at_ms) <= window_ms {
+                Some(r.call_id.clone())
+            } else {
+                None
+            }
+        })
     }
 
     /// Summaries, newest first (sorted by started_at_ms, descending), with

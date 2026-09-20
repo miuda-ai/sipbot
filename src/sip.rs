@@ -2008,17 +2008,42 @@ impl SipBot {
                 let call_record = call_registry
                     .as_ref()
                     .map(|reg| reg.get_or_create(&call_id_str));
+                let mut fork_other: Option<String> = None;
                 if let Some(rec) = &call_record {
-                    let mut r = rec.lock().unwrap();
-                    r.direction = Some(crate::web::state::CallDirection::Inbound);
-                    r.caller = caller.clone();
-                    r.callee = callee.clone();
-                    r.account = account.username.clone();
-                    r.strategy = account.strategy.clone();
-                    r.stats = Some(call_stats.clone());
-                    if let Some(p) = &recording_path {
-                        r.recording = Some(p.display().to_string());
+                    let started = {
+                        let mut r = rec.lock().unwrap();
+                        r.direction = Some(crate::web::state::CallDirection::Inbound);
+                        r.caller = caller.clone();
+                        r.callee = callee.clone();
+                        r.account = account.username.clone();
+                        r.strategy = account.strategy.clone();
+                        r.stats = Some(call_stats.clone());
+                        if let Some(p) = &recording_path {
+                            r.recording = Some(p.display().to_string());
+                        }
+                        r.started_at_ms
+                    };
+                    // Acceptance check: duplicate delivery — the registrar
+                    // forked this INVITE to more than one registered contact
+                    // (stale/duplicate AOR entries). Runs OUTSIDE the record
+                    // lock: the scan locks every record incl. this one.
+                    if let Some(reg) = call_registry.as_ref() {
+                        let callee_user = callee.split('@').next().unwrap_or("").to_string();
+                        fork_other = reg.find_duplicate_inbound(
+                            &call_id_str,
+                            &caller,
+                            &callee_user,
+                            started,
+                            4000,
+                        );
                     }
+                }
+                if let (Some(rec), Some(other)) = (&call_record, fork_other) {
+                    let short: String = other.chars().take(13).collect();
+                    let callee_user = callee.split('@').next().unwrap_or("");
+                    rec.lock().unwrap().issues.push(format!(
+                        "duplicate delivery: a parallel INVITE for {callee_user} arrived as {short}… — server forked to multiple contacts"
+                    ));
                 }
                 let dtmf_observer: Arc<CallDtmfObserver> = Arc::new(CallDtmfObserver {
                     record: call_record.clone(),
@@ -2055,6 +2080,7 @@ impl SipBot {
                         if r.end_reason.is_none() {
                             r.end_reason = Some(reason);
                         }
+                        evaluate_call_health(&mut r, &account);
                     }
                 };
 
@@ -2904,6 +2930,14 @@ impl SipBot {
                     s.stop().await;
                 }
 
+                // Acceptance checks for the main (answered) call path — the
+                // early-exit paths run them inside finish_record().
+                if let Some(rec) = &call_record {
+                    let mut r = rec.lock().unwrap();
+                    r.ended_at_ms = r.ended_at_ms.or(Some(crate::web::state::now_ms()));
+                    evaluate_call_health(&mut r, &account);
+                }
+
                 if matches!(hangup_mode, crate::config::HangupMode::Remote) {
                     info!(
                         "[{}] Remote hangup mode: skipping BYE (peer should hang up)",
@@ -2946,6 +2980,94 @@ impl SipBot {
 fn normalize_sip_addr(addr: &str) -> String {
     let stripped = addr.strip_prefix("sip:").unwrap_or(addr);
     format!("sip:{}", stripped)
+}
+
+/// WAV file duration in seconds (header scan).
+fn wav_duration_secs(path: &str) -> Option<f64> {
+    let reader = hound::WavReader::open(path).ok()?;
+    let rate = reader.spec().sample_rate as f64;
+    Some(reader.duration() as f64 / rate)
+}
+
+/// Expected call duration (ms) for strategies the bot itself ends
+/// (hangup after/playback). None = no expectation (remote hangup, echo
+/// without a timer, missing media files).
+fn expected_call_ms(account: &crate::config::AccountConfig) -> Option<u64> {
+    let mut ms = 0.0f64;
+    if let Some(ring) = &account.ring {
+        match ring.ringback.as_deref() {
+            Some("") => {
+                // built-in ringing.wav: 16-bit mono 8kHz
+                ms += (RINGING_WAV.len() as f64 / 2.0 / 8000.0) * 1000.0;
+            }
+            Some(p) if !p.is_empty() => ms += wav_duration_secs(p).map(|d| d * 1000.0)?,
+            _ => ms += (ring.duration_secs.unwrap_or(0) as f64) * 1000.0,
+        }
+    }
+    let audio_ms = match &account.answer {
+        Some(crate::config::AnswerConfig::Play { wav_file }) => {
+            wav_duration_secs(wav_file).map(|d| d * 1000.0)?
+        }
+        _ => 0.0,
+    };
+    match account.hangup.as_ref().map(|h| h.effective_mode()) {
+        Some(crate::config::HangupMode::After(secs)) => {
+            ms += audio_ms.min((secs as f64) * 1000.0);
+        }
+        Some(crate::config::HangupMode::Playback) => ms += audio_ms,
+        _ => return None,
+    }
+    Some(ms as u64)
+}
+
+/// Post-call acceptance checks — append findings to `r.issues` so the UI can
+/// flag abnormal calls (fork duplicates are detected at INVITE time).
+fn evaluate_call_health(r: &mut crate::web::state::CallRecord, account: &crate::config::AccountConfig) {
+    use crate::web::state::CallState;
+    let finished = matches!(
+        r.state,
+        Some(CallState::Terminated) | Some(CallState::Rejected) | Some(CallState::Failed)
+    );
+    if !finished {
+        return;
+    }
+    if r.state == Some(CallState::Terminated) {
+        // One-way media: we transmitted RTP but never received any.
+        if let Some(stats) = &r.stats {
+            let snap = stats.snapshot_json();
+            let rx = snap.get("rx_packets").and_then(|v| v.as_u64()).unwrap_or(0);
+            let tx = snap.get("tx_packets").and_then(|v| v.as_u64()).unwrap_or(0);
+            if tx > 50 && rx == 0 {
+                r.issues.push(format!(
+                    "one-way media: sent {tx} RTP packets but received 0 (media path broken)"
+                ));
+            }
+        }
+        // Hangup ownership: a playback-hangup call must end with our own BYE.
+        if let Some(h) = &account.hangup {
+            if h.effective_mode() == crate::config::HangupMode::Playback
+                && r.sip_trace
+                    .iter()
+                    .rev()
+                    .take(4)
+                    .any(|m| m.dir == "in" && m.summary.starts_with("BYE"))
+            {
+                r.issues.push(
+                    "remote BYE ended a playback-hangup call — the bot never sent its own BYE (playback stalled?)"
+                        .to_string(),
+                );
+            }
+        }
+        // Duration deviation vs the strategy expectation.
+        if let Some(expected) = expected_call_ms(account) {
+            let dur = r.ended_at_ms.unwrap_or(0).saturating_sub(r.started_at_ms);
+            if dur > expected + 4000 {
+                r.issues.push(format!(
+                    "call ran {dur}ms, expected ~{expected}ms (stalled playback or remote held the call)"
+                ));
+            }
+        }
+    }
 }
 
 /// Extract the user part from a URI string (`sip:1001@host` → `1001`).
