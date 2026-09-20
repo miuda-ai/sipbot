@@ -32,6 +32,19 @@ impl TraceInspector {
     }
 
     fn record(&self, dir: &str, msg: &SipMessage, peer: Option<String>) {
+        // Skip registration/keep-alive traffic — never create call records for it.
+        let is_reg_or_options = match msg {
+            SipMessage::Request(r) => matches!(r.method, Method::Register | Method::Options),
+            SipMessage::Response(r) => r
+                .cseq_header()
+                .ok()
+                .and_then(|c| c.method().ok())
+                .map(|m| matches!(m, Method::Register | Method::Options))
+                .unwrap_or(false),
+        };
+        if is_reg_or_options {
+            return;
+        }
         let Ok(call_id_header) = msg.call_id_header() else {
             return;
         };

@@ -74,6 +74,8 @@ pub struct CallRecord {
     pub caller: String,
     pub callee: String,
     pub account: String,
+    /// Bound strategy name (serve mode) used by the answering bot.
+    pub strategy: Option<String>,
     pub state: Option<CallState>,
     pub started_at_ms: u64,
     pub ended_at_ms: Option<u64>,
@@ -107,7 +109,10 @@ impl CallRecord {
             "caller": self.caller,
             "callee": self.callee,
             "account": self.account,
+            "strategy": self.strategy,
             "state": self.state.map(state_str),
+            "started_at_ms": self.started_at_ms,
+            "ended_at_ms": self.ended_at_ms,
             "duration_ms": elapsed,
             "end_reason": self.end_reason,
             "codec": self.codec,
@@ -129,7 +134,10 @@ impl CallRecord {
             "caller": self.caller,
             "callee": self.callee,
             "account": self.account,
+            "strategy": self.strategy,
             "state": self.state.map(state_str),
+            "started_at_ms": self.started_at_ms,
+            "ended_at_ms": self.ended_at_ms,
             "duration_ms": elapsed,
             "end_reason": self.end_reason,
             "codec": self.codec,
@@ -158,6 +166,7 @@ impl CallRecord {
             caller: v.get("caller").and_then(|x| x.as_str()).unwrap_or("").to_string(),
             callee: v.get("callee").and_then(|x| x.as_str()).unwrap_or("").to_string(),
             account: v.get("account").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            strategy: v.get("strategy").and_then(|x| x.as_str()).map(|s| s.to_string()),
             state: v.get("state").and_then(|s| s.as_str()).and_then(|s| match s {
                 "trying" => Some(CallState::Trying),
                 "ringing" => Some(CallState::Ringing),
@@ -168,8 +177,8 @@ impl CallRecord {
                 "failed" => Some(CallState::Failed),
                 _ => None,
             }),
-            started_at_ms: 0,
-            ended_at_ms: None,
+            started_at_ms: v.get("started_at_ms").and_then(|x| x.as_u64()).unwrap_or(0),
+            ended_at_ms: v.get("ended_at_ms").and_then(|x| x.as_u64()),
             end_reason: v.get("end_reason").and_then(|x| x.as_str()).map(|s| s.to_string()),
             sip_trace: v
                 .get("sip_trace")
@@ -305,14 +314,48 @@ impl CallRegistry {
             .cloned()
     }
 
-    /// Summaries, newest first.
-    pub fn summaries(&self, limit: usize) -> Vec<serde_json::Value> {
+    /// Summaries, newest first (sorted by started_at_ms, descending), with
+    /// optional filters: state group (`incall`/`ended`/`rejected`), account,
+    /// strategy.
+    pub fn summaries(
+        &self,
+        limit: usize,
+        state_filter: Option<&str>,
+        account: Option<&str>,
+        strategy: Option<&str>,
+    ) -> Vec<serde_json::Value> {
         let calls = self.calls.lock().unwrap();
-        calls
+        let mut items: Vec<(u64, serde_json::Value)> = calls
             .iter()
-            .take(limit)
-            .map(|c| c.lock().unwrap().to_json())
-            .collect()
+            .filter_map(|c| {
+                let r = c.lock().unwrap();
+                if let Some(sf) = state_filter {
+                    let s = r.state.map(state_str).unwrap_or_default();
+                    let group: &str = match s {
+                        "trying" | "ringing" | "early_media" | "answered" => "incall",
+                        "rejected" => "rejected",
+                        "terminated" | "failed" => "ended",
+                        _ => "incall",
+                    };
+                    if group != sf {
+                        return None;
+                    }
+                }
+                if let Some(acc) = account {
+                    if !acc.is_empty() && r.account != acc {
+                        return None;
+                    }
+                }
+                if let Some(st) = strategy {
+                    if !st.is_empty() && r.strategy.as_deref() != Some(st) {
+                        return None;
+                    }
+                }
+                Some((r.started_at_ms, r.to_json()))
+            })
+            .collect();
+        items.sort_by(|a, b| b.0.cmp(&a.0));
+        items.into_iter().take(limit).map(|(_, v)| v).collect()
     }
 
     pub fn active_count(&self) -> usize {

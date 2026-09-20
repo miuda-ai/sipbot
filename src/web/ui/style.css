@@ -216,3 +216,10 @@ label.inline input[type="checkbox"] {
 .tpl-bar .tpl { padding: 3px 10px; font-size: 12px; }
 .modal-body.narrow { width: min(460px, 94vw); }
 .btn.danger { color: var(--red); border-color: var(--red); }
+
+/* call list filters */
+select.filter {
+  background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 5px; padding: 5px 8px; font-size: 12px; max-width: 160px;
+}
+select.filter:focus { outline: 1px solid var(--accent); }

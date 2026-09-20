@@ -49,6 +49,15 @@
         <div class="toolbar">
           <h2>Calls</h2>
           <span id="call-count" class="muted"></span>
+          <span style="flex:1"></span>
+          <select id="f-state" class="filter">
+            <option value="">All states</option>
+            <option value="incall">In call</option>
+            <option value="ended">Ended</option>
+            <option value="rejected">Rejected</option>
+          </select>
+          <select id="f-account" class="filter"><option value="">All accounts</option></select>
+          <select id="f-strategy" class="filter"><option value="">All strategies</option></select>
         </div>
         <table class="call-table" id="call-table">
           <thead>

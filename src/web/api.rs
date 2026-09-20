@@ -1,6 +1,6 @@
 use super::state::ServeState;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json},
     routing::{get, post},
@@ -490,10 +490,22 @@ fn not_found(msg: &str) -> axum::response::Response {
 
 async fn get_calls(
     State(state): State<Arc<ServeState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
+    let sf = params
+        .get("state")
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| matches!(s.as_str(), "incall" | "ended" | "rejected"));
+    let account = params.get("account").map(|s| s.trim().to_string());
+    let strategy = params.get("strategy").map(|s| s.trim().to_string());
     Json(serde_json::json!({
         "active": state.calls.active_count(),
-        "calls": state.calls.summaries(200),
+        "calls": state.calls.summaries(
+            200,
+            sf.as_deref(),
+            account.as_deref(),
+            strategy.as_deref(),
+        ),
     }))
 }
 

@@ -26,6 +26,7 @@ async function loadAccounts() {
       api("/api/strategies"),
     ]);
     strategyNames = (stratData.strategies || []).map(s => s.name);
+    refreshFilterOptions((accData.accounts || []).map(a => a.username), strategyNames);
     const list = $("#account-list");
     list.innerHTML = "";
     for (const a of accData.accounts || []) {
@@ -510,13 +511,42 @@ async function initOutbound() {
 let selectedCallId = null;
 let wsConnected = false;
 
+function filterParams() {
+  const p = new URLSearchParams();
+  const st = $("#f-state")?.value || "";
+  const acc = $("#f-account")?.value || "";
+  const strat = $("#f-strategy")?.value || "";
+  if (st) p.set("state", st);
+  if (acc) p.set("account", acc);
+  if (strat) p.set("strategy", strat);
+  const q = p.toString();
+  return q ? `?${q}` : "";
+}
+
+function refreshFilterOptions(accounts, strategies) {
+  const accSel = $("#f-account");
+  const stratSel = $("#f-strategy");
+  if (accSel) {
+    const cur = accSel.value;
+    accSel.innerHTML = `<option value="">All accounts</option>` +
+      (accounts || []).map(a => `<option value="${esc(a)}">${esc(a)}</option>`).join("");
+    if ([...accSel.options].some(o => o.value === cur)) accSel.value = cur;
+  }
+  if (stratSel) {
+    const cur = stratSel.value;
+    stratSel.innerHTML = `<option value="">All strategies</option>` +
+      (strategies || []).map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join("");
+    if ([...stratSel.options].some(o => o.value === cur)) stratSel.value = cur;
+  }
+}
+
 async function loadCalls() {
   try {
-    const data = await api("/api/calls");
+    const data = await api("/api/calls" + filterParams());
     $("#call-count").textContent = `${data.active || 0} active`;
     const tbody = $("#call-table tbody");
     tbody.innerHTML = "";
-    for (const c of (data.calls || []).slice().reverse()) {
+    for (const c of (data.calls || [])) {
       const tr = document.createElement("tr");
       if (c.call_id === selectedCallId) tr.classList.add("selected");
       tr.innerHTML = `
@@ -779,14 +809,20 @@ function fmtBytes(b) {
   return `${b} B`;
 }
 function fmtTime(c) {
-  // derive a stable pseudo-time from duration for display; real time comes from server clock
-  return c.duration_ms != null ? "" : "-";
+  if (!c.started_at_ms) return "-";
+  const d = new Date(c.started_at_ms);
+  const p = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
+         `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
 // ── boot ──
 loadAccounts();
 loadStrategies();
 loadCalls();
+for (const id of ["f-state", "f-account", "f-strategy"]) {
+  document.getElementById(id)?.addEventListener("change", loadCalls);
+}
 initOutbound();
 initStrategyTemplates();
 initAddAccount();

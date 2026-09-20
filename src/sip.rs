@@ -1980,6 +1980,7 @@ impl SipBot {
                     r.caller = caller.clone();
                     r.callee = callee.clone();
                     r.account = account.username.clone();
+                    r.strategy = account.strategy.clone();
                     r.stats = Some(call_stats.clone());
                     if let Some(p) = &recording_path {
                         r.recording = Some(p.display().to_string());
