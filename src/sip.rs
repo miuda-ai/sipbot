@@ -1020,6 +1020,40 @@ impl SipBot {
         };
         self.registration = Some(Registration::new(endpoint.inner.clone(), credential));
 
+        // Pin a stable registration Contact (username@advertised-ip:port).
+        // Otherwise rsipstack rebuilds the Contact per attempt from the 401
+        // response's received/rport (loopback source when registering via a
+        // local proxy) or the Via host, so the Contact flaps between the
+        // loopback and external addresses and the registrar accumulates two
+        // AOR entries — incoming calls then fork to both contacts.
+        {
+            let username = self.account.username.clone();
+            let addrs = endpoint.inner.transport_layer.get_addrs();
+            if let Some(first_addr) = addrs.first() {
+                if let Ok(sock) = first_addr.get_socketaddr() {
+                    let host = self
+                        .global_config
+                        .external_ip
+                        .clone()
+                        .unwrap_or_else(|| sock.ip().to_string());
+                    let contact_str = format!("sip:{}@{}:{}", username, host, sock.port());
+                    if let Ok(contact_uri) = rsipstack::rsip::Uri::try_from(contact_str.as_str()) {
+                        if let Some(ref mut reg) = self.registration {
+                            reg.contact = Some(rsipstack::rsip::typed::Contact {
+                                display_name: None,
+                                uri: contact_uri,
+                                params: vec![],
+                            });
+                            info!(
+                                "[{}] Registration contact pinned: {}",
+                                username, contact_str
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // Add +sip.ice Contact param (RFC 5656) when WebRTC is enabled over UDP.
         // For WS transport the server auto-detects WebRTC from the Via/Contact transport.
         if !uses_ws && self.account.webrtc_enabled.unwrap_or(false) {

@@ -2150,7 +2150,7 @@ impl MediaSession {
 
         let mut reader = hound::WavReader::open(file_path).context("Failed to open WAV file")?;
         let samples = self.load_codec_samples(&username, &mut reader)?;
-        self.run_playback(username, samples, recording_path, keep_alive, true)
+        self.run_playback(username, samples, recording_path, keep_alive, keep_alive)
             .await
     }
 
@@ -2181,7 +2181,7 @@ impl MediaSession {
         let mut reader = hound::WavReader::new(Cursor::new(wav_bytes))
             .context("Failed to read WAV bytes")?;
         let samples = self.load_codec_samples(&username, &mut reader)?;
-        self.run_playback(username, samples, recording_path, keep_alive, true)
+        self.run_playback(username, samples, recording_path, keep_alive, keep_alive)
             .await
     }
 
