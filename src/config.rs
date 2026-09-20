@@ -132,6 +132,7 @@ impl Config {
             jump_codecs: account.jump_codecs.clone(),
             dtmf_flows: account.dtmf_flows.clone(),
             reinvite_flows: account.reinvite_flows.clone(),
+            transfer_flows: account.transfer_flows.clone(),
             info_flows: account.info_flows.clone(),
             hangup: account.hangup.clone(),
         }
@@ -185,6 +186,9 @@ pub struct StrategyConfig {
     /// Re-INVITE flow after answer: "5s:hold,10s:resume"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reinvite_flows: Option<String>,
+    /// Transfer (REFER) flow after answer: "5s:sip:4001@host,10s:sip:ivr@host"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_flows: Option<String>,
     /// SIP INFO flow after answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub info_flows: Option<String>,
@@ -301,6 +305,10 @@ pub struct AccountConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reinvite_flows: Option<String>,
 
+    /// Transfer (REFER) flow after answer: "5s:sip:4001@host"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_flows: Option<String>,
+
     /// SIP INFO flow after answer: "3s:application/vnd.rustpbx+json:{\"action\":\"ivr.exec\"};5s:application/dtmf-relay:Signal=5\r\nDuration=100\r\n"
     /// Entries are semicolon-separated. Each entry: <delay>:<content_type>:<body>
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -404,6 +412,52 @@ pub fn parse_reinvite_flows(input: &str) -> Result<Vec<ReinviteFlowEntry>> {
         };
         let action: ReinviteAction = action_str.parse()?;
         entries.push(ReinviteFlowEntry { delay, action });
+    }
+    Ok(entries)
+}
+
+#[derive(Debug, Clone)]
+pub struct TransferFlowEntry {
+    pub delay: std::time::Duration,
+    /// SIP URI the call is transferred to (Refer-To target).
+    pub target: String,
+}
+
+/// Parse a transfer (REFER) flow spec: `"5s:sip:4001@host,10s:sip:ivr@host"`.
+pub fn parse_transfer_flows(input: &str) -> Result<Vec<TransferFlowEntry>> {
+    let mut entries = Vec::new();
+    for part in input.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let Some((delay_str, target)) = part.split_once(':') else {
+            anyhow::bail!(
+                "Invalid transfer_flow entry '{}': expected <delay>:<sip-uri>",
+                part
+            );
+        };
+        // The target URI itself contains ':' — rejoin everything after the
+        // first colon.
+        let target = part[delay_str.len() + 1..].trim();
+        let delay_str = delay_str.trim();
+        let num: f64 = if let Some(stripped) = delay_str.strip_suffix('s') {
+            stripped
+                .trim()
+                .parse()
+                .with_context(|| format!("Invalid delay '{}'", delay_str))?
+        } else {
+            delay_str
+                .parse()
+                .with_context(|| format!("Invalid delay '{}'", delay_str))?
+        };
+        if target.is_empty() {
+            anyhow::bail!("Invalid transfer_flow entry '{}': empty target", part);
+        }
+        entries.push(TransferFlowEntry {
+            delay: std::time::Duration::from_secs_f64(num),
+            target: target.to_string(),
+        });
     }
     Ok(entries)
 }

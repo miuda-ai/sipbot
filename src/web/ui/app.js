@@ -484,6 +484,7 @@ async function initOutbound() {
   $("#ob-submit").addEventListener("click", async () => {
     const body = {
       target: $("#ob-target").value.trim(),
+      proxy: $("#ob-proxy").value.trim() || undefined,
       from_user: $("#ob-from").value.trim() || "caller",
       codecs: $("#ob-codecs").value.trim
         ? $("#ob-codecs").value.split(",").map(s => s.trim()).filter(Boolean)
@@ -492,6 +493,8 @@ async function initOutbound() {
       wav_file: mediaValue($("#outbound-form"), "ob-wav") || null,
       hangup_secs: num($("#ob-hangup").value, 10),
       dtmf_flows: $("#ob-dtmf").value.trim() || null,
+      reinvite_flows: $("#ob-reinvite").value.trim() || null,
+      transfer_flows: $("#ob-transfer").value.trim() || null,
       total: num($("#ob-total").value, 1),
       cps: num($("#ob-cps").value, 1),
     };

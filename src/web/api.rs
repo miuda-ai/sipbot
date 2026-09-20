@@ -109,6 +109,19 @@ async fn post_call_outbound(
         .get("dtmf_flows")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    // Hold/resume re-INVITE flow after answer: "5s:hold,10s:resume"
+    let reinvite_flows = body
+        .get("reinvite_flows")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.trim().is_empty());
+    // Transfer (REFER) flow after answer: "5s:sip:4001@host" — the caller
+    // asks the far end to move the call to the target (voicemail/IVR/...).
+    let transfer_flows = body
+        .get("transfer_flows")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.trim().is_empty());
     // Optional SIP proxy + credentials so the ephemeral caller can traverse
     // a SIP server (e.g. rustpbx) instead of INVITEing the domain directly.
     let proxy = body
@@ -171,7 +184,7 @@ async fn post_call_outbound(
         auth_username: auth_user,
         domain: domain.clone(),
         password,
-        proxy,
+        proxy: proxy.clone(),
         target: Some(target.clone()),
         answer: answer_config,
         hangup: hangup_secs.map(|secs| crate::config::HangupConfig {
@@ -180,6 +193,8 @@ async fn post_call_outbound(
             mode: None,
         }),
         dtmf_flows,
+        reinvite_flows: reinvite_flows.clone(),
+        transfer_flows: transfer_flows.clone(),
         codecs: Some(codecs.clone()),
         ..Default::default()
     };
@@ -223,6 +238,10 @@ async fn post_call_outbound(
             "action": action,
             "total": total,
             "cps": cps,
+            "codecs": codecs,
+            "reinvite_flows": reinvite_flows.clone(),
+            "transfer_flows": transfer_flows.clone(),
+            "proxy": proxy.clone(),
             "codecs": codecs,
         }),
     )

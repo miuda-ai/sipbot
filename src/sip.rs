@@ -599,8 +599,7 @@ impl CallRunner {
             .account
             .reinvite_flows
             .as_deref()
-            .and_then(|s| crate::config::parse_reinvite_flows(s).ok());
-        let reinvite_media = media_session.clone();
+            .and_then(|s| crate::config::parse_reinvite_flows(s).ok());        let reinvite_media = media_session.clone();
         let reinvite_dialog = dialog.clone();
         let reinvite_username = self.account.username.clone();
         let reinvite_cancel = self.cancel_token.clone();
@@ -686,6 +685,64 @@ impl CallRunner {
             }
         };
 
+        // Transfer (REFER) flow: after the configured delay, send an
+        // in-dialog REFER moving the call to the target URI. The far end
+        // (SIP server / callee) is expected to follow the Refer-To.
+        let transfer_flows = self
+            .account
+            .transfer_flows
+            .as_deref()
+            .and_then(|s| crate::config::parse_transfer_flows(s).ok());
+        let refer_dialog = dialog.clone();
+        let refer_username = self.account.username.clone();
+        let refer_cancel = self.cancel_token.clone();
+        let refer_future = async move {
+            if let Some(ref flows) = transfer_flows {
+                info!(
+                    "[{}] Transfer (REFER) flow: {} entries scheduled",
+                    refer_username,
+                    flows.len()
+                );
+                for entry in flows {
+                    tokio::select! {
+                        _ = tokio::time::sleep(entry.delay) => {}
+                        _ = refer_cancel.cancelled() => {
+                            info!("[{}] Transfer flow cancelled", refer_username);
+                            return;
+                        }
+                    }
+                    info!(
+                        "[{}] Sending REFER -> {} (after {:.1}s)",
+                        refer_username,
+                        entry.target,
+                        entry.delay.as_secs_f64()
+                    );
+                    match rsipstack::rsip::Uri::try_from(entry.target.as_str()) {
+                        Ok(uri) => {
+                            let refer_to = rsipstack::sip::ReferTo::from(uri);
+                            match refer_dialog.refer(refer_to, None, None).await {
+                                Ok(Some(resp)) => info!(
+                                    "[{}] REFER responded: {}",
+                                    refer_username,
+                                    resp.status_code()
+                                ),
+                                Ok(None) => {
+                                    warn!("[{}] REFER got no response", refer_username)
+                                }
+                                Err(e) => {
+                                    warn!("[{}] REFER failed: {:?}", refer_username, e)
+                                }
+                            }
+                        }
+                        Err(e) => warn!(
+                            "[{}] Invalid transfer target '{}': {:?}",
+                            refer_username, entry.target, e
+                        ),
+                    }
+                }
+            }
+        };
+
         let info_flows = self
             .account
             .info_flows
@@ -751,6 +808,7 @@ impl CallRunner {
             let play_handle = tokio::spawn(play_future);
             let dtmf_handle = tokio::spawn(dtmf_future);
             let reinvite_handle = tokio::spawn(reinvite_future);
+            let refer_handle = tokio::spawn(refer_future);
             let info_handle = tokio::spawn(info_future);
 
             tokio::select! {
@@ -761,6 +819,7 @@ impl CallRunner {
                     play_handle.abort();
                     dtmf_handle.abort();
                     reinvite_handle.abort();
+                    refer_handle.abort();
                     info_handle.abort();
                     return Ok(());
                 }
@@ -771,6 +830,7 @@ impl CallRunner {
             play_handle.abort();
             dtmf_handle.abort();
             reinvite_handle.abort();
+            refer_handle.abort();
             info_handle.abort();
         } else {
             info!(
@@ -779,6 +839,7 @@ impl CallRunner {
             );
             let dtmf_handle = tokio::spawn(dtmf_future);
             let reinvite_handle = tokio::spawn(reinvite_future);
+            let refer_handle = tokio::spawn(refer_future);
             let info_handle = tokio::spawn(info_future);
             tokio::select! {
                 _ = play_future => {
@@ -787,6 +848,7 @@ impl CallRunner {
                 _ = monitor_future => {
                     dtmf_handle.abort();
                     reinvite_handle.abort();
+                    refer_handle.abort();
                     info_handle.abort();
                     return Ok(());
                 }
@@ -796,6 +858,7 @@ impl CallRunner {
             }
             dtmf_handle.abort();
             reinvite_handle.abort();
+            refer_handle.abort();
             info_handle.abort();
         }
 
