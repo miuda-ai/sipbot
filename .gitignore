@@ -4,3 +4,4 @@ Cargo.lock
 .github
 /recordings
 /records
+/serve.toml
