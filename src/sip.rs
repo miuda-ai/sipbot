@@ -3071,6 +3071,63 @@ impl SipBot {
                     }
                 };
 
+                // Transfer (REFER) flow after answer — mirrors the outbound
+                // flow so inbound (wait/serve) bots can simulate an INVITE-mode
+                // carrier handing the call off via an in-dialog REFER.
+                let transfer_flows = account
+                    .transfer_flows
+                    .as_deref()
+                    .and_then(|s| crate::config::parse_transfer_flows(s).ok());
+                let refer_dialog = server_dialog_clone.clone();
+                let refer_username = account.username.clone();
+                let refer_cancel = cancel_token.clone();
+                tokio::spawn(async move {
+                    if let Some(ref flows) = transfer_flows {
+                        info!(
+                            "[{}] Transfer (REFER) flow: {} entries scheduled",
+                            refer_username,
+                            flows.len()
+                        );
+                        for entry in flows {
+                            tokio::select! {
+                                _ = tokio::time::sleep(entry.delay) => {}
+                                _ = refer_cancel.cancelled() => {
+                                    info!("[{}] Transfer flow cancelled", refer_username);
+                                    return;
+                                }
+                            }
+                            info!(
+                                "[{}] Sending REFER -> {} (after {:.1}s)",
+                                refer_username,
+                                entry.target,
+                                entry.delay.as_secs_f64()
+                            );
+                            match rsipstack::rsip::Uri::try_from(entry.target.as_str()) {
+                                Ok(uri) => {
+                                    let refer_to = rsipstack::sip::ReferTo::from(uri);
+                                    match refer_dialog.refer(refer_to, None, None).await {
+                                        Ok(Some(resp)) => info!(
+                                            "[{}] REFER responded: {}",
+                                            refer_username,
+                                            resp.status_code()
+                                        ),
+                                        Ok(None) => {
+                                            warn!("[{}] REFER got no response", refer_username)
+                                        }
+                                        Err(e) => {
+                                            warn!("[{}] REFER failed: {:?}", refer_username, e)
+                                        }
+                                    }
+                                }
+                                Err(e) => warn!(
+                                    "[{}] Invalid transfer target '{}': {:?}",
+                                    refer_username, entry.target, e
+                                ),
+                            }
+                        }
+                    }
+                });
+
                 let wait_timeout = match hangup_mode {
                     crate::config::HangupMode::After(secs) => Some(secs),
                     _ => None,
