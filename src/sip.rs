@@ -804,6 +804,54 @@ impl CallRunner {
             }
         };
 
+        // CLI-level single REFER (`--refer-to`), independent of the
+        // transfer_flows mechanism above.
+        let refer_to_target = self.account.refer_to.clone();
+        let refer_to_delay = self.account.refer_delay_secs.unwrap_or(1);
+        let refer_to_dialog = dialog.clone();
+        let refer_to_username = self.account.username.clone();
+        let refer_to_domain = self.account.domain.clone();
+        let refer_to_cancel = self.cancel_token.clone();
+        let refer_to_future = async move {
+            if let Some(ref target) = refer_to_target {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(refer_to_delay)) => {}
+                    _ = refer_to_cancel.cancelled() => {
+                        info!("[{}] REFER flow cancelled", refer_to_username);
+                        return;
+                    }
+                }
+                info!(
+                    "[{}] Sending REFER to {} (after {:.1}s)",
+                    refer_to_username,
+                    target,
+                    refer_to_delay as f64
+                );
+                let headers = vec![
+                    Header::ReferTo(target.clone().into()),
+                    Header::Other(
+                        "Referred-By".into(),
+                        format!("<sip:{}@{}>", refer_to_username, refer_to_domain),
+                    ),
+                ];
+                match refer_to_dialog.request(Method::Refer, Some(headers), None).await {
+                    Ok(Some(resp)) => {
+                        info!(
+                            "[{}] REFER response: {}",
+                            refer_to_username,
+                            resp.status_code()
+                        );
+                    }
+                    Ok(None) => {
+                        warn!("[{}] REFER got no response", refer_to_username);
+                    }
+                    Err(e) => {
+                        warn!("[{}] REFER failed: {:?}", refer_to_username, e);
+                    }
+                }
+            }
+        };
+
         if let Some(secs) = hangup_secs {
             info!(
                 "[{}] Call established. Waiting for {} seconds (or Ctrl-C) before hanging up...",
@@ -814,6 +862,7 @@ impl CallRunner {
             let dtmf_handle = tokio::spawn(dtmf_future);
             let reinvite_handle = tokio::spawn(reinvite_future);
             let refer_handle = tokio::spawn(refer_future);
+            let refer_to_handle = tokio::spawn(refer_to_future);
             let info_handle = tokio::spawn(info_future);
 
             tokio::select! {
@@ -825,6 +874,7 @@ impl CallRunner {
                     dtmf_handle.abort();
                     reinvite_handle.abort();
                     refer_handle.abort();
+                    refer_to_handle.abort();
                     info_handle.abort();
                     return Ok(());
                 }
@@ -836,6 +886,7 @@ impl CallRunner {
             dtmf_handle.abort();
             reinvite_handle.abort();
             refer_handle.abort();
+            refer_to_handle.abort();
             info_handle.abort();
         } else {
             info!(
@@ -845,6 +896,7 @@ impl CallRunner {
             let dtmf_handle = tokio::spawn(dtmf_future);
             let reinvite_handle = tokio::spawn(reinvite_future);
             let refer_handle = tokio::spawn(refer_future);
+            let refer_to_handle = tokio::spawn(refer_to_future);
             let info_handle = tokio::spawn(info_future);
             tokio::select! {
                 _ = play_future => {
@@ -854,6 +906,7 @@ impl CallRunner {
                     dtmf_handle.abort();
                     reinvite_handle.abort();
                     refer_handle.abort();
+                    refer_to_handle.abort();
                     info_handle.abort();
                     return Ok(());
                 }
@@ -864,6 +917,7 @@ impl CallRunner {
             dtmf_handle.abort();
             reinvite_handle.abort();
             refer_handle.abort();
+            refer_to_handle.abort();
             info_handle.abort();
         }
 
@@ -1917,7 +1971,43 @@ impl SipBot {
                 // transfer progress on an implicit subscription) must be
                 // acknowledged with 200 OK, otherwise the transferor's
                 // transaction runs to Timer F (32s) and the transfer stalls.
-                info!("[{}] Received NOTIFY, replying 200 OK", self.account.username);
+                info!("[{}] Received NOTIFY", self.account.username);
+                let sub_state = transaction.original.headers.iter().find_map(|h| match h {
+                    Header::SubscriptionState(s) => Some(s.value().to_string()),
+                    Header::Other(name, value) => {
+                        if name.to_string().eq_ignore_ascii_case("subscription-state") {
+                            Some(value.to_string())
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                });
+                let body_first = String::from_utf8_lossy(transaction.original.body())
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                match sub_state.as_deref() {
+                    Some(s) if s.starts_with("terminated") => {
+                        // Assertable marker for transfer e2e tests.
+                        info!(
+                            "[{}] REFER completed with {} ({})",
+                            self.account.username,
+                            body_first,
+                            s
+                        );
+                    }
+                    Some(s) => {
+                        info!(
+                            "[{}] REFER in progress: {} ({})",
+                            self.account.username,
+                            body_first,
+                            s
+                        );
+                    }
+                    None => {}
+                }
                 transaction.reply(StatusCode::OK).await?;
             }
             _ => info!(

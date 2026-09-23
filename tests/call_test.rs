@@ -16,6 +16,7 @@ async fn test_call_flow() -> Result<()> {
     // 1. Configure Server (Wait)
     let server_addr = "127.0.0.1:5080";
     let server_config = Config {
+        outbound_profiles: Vec::new(),
         http_addr: None,
         media_dir: None,
         records_dir: None,
@@ -36,6 +37,7 @@ async fn test_call_flow() -> Result<()> {
     // 2. Configure Client (Call)
     let client_addr = "127.0.0.1:5081";
     let client_config = Config {
+        outbound_profiles: Vec::new(),
         http_addr: None,
         media_dir: None,
         records_dir: None,
@@ -122,6 +124,7 @@ async fn test_options_flow() -> Result<()> {
     // 1. Configure Server (Wait)
     let server_addr = "127.0.0.1:5070";
     let server_config = Config {
+        outbound_profiles: Vec::new(),
         http_addr: None,
         media_dir: None,
         records_dir: None,
@@ -141,6 +144,7 @@ async fn test_options_flow() -> Result<()> {
     // 2. Configure Client (Options)
     let client_addr = "127.0.0.1:5071";
     let client_config = Config {
+        outbound_profiles: Vec::new(),
         http_addr: None,
         media_dir: None,
         records_dir: None,
@@ -216,6 +220,7 @@ async fn test_wait_echo_tx_rx_stats() -> Result<()> {
     // 1. Configure Server (Wait + Echo)
     let server_addr = "127.0.0.1:5090";
     let server_config = Config {
+        outbound_profiles: Vec::new(),
         http_addr: None,
         media_dir: None,
         records_dir: None,
@@ -236,6 +241,7 @@ async fn test_wait_echo_tx_rx_stats() -> Result<()> {
     // 2. Configure Client (Call)
     let client_addr = "127.0.0.1:5091";
     let client_config = Config {
+        outbound_profiles: Vec::new(),
         http_addr: None,
         media_dir: None,
         records_dir: None,

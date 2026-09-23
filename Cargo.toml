@@ -1,6 +1,6 @@
 [package]
 name = "sipbot"
-version = "0.2.63"
+version = "0.2.64"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 repository = "https://github.com/miuda-ai/sipbot"
@@ -16,7 +16,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "1.1.2"
 tracing = "0.1"
 anyhow = "1.0"
-rsipstack = "0.6.10"
+rsipstack = "0.6.11"
 tokio-util = "0.7"
 rustrtc = "0.3.138"
 audio-codec = "0.4.7"
@@ -36,3 +36,4 @@ serde_json = "1"
 [features]
 default = ["local-device"]
 local-device = ["dep:cpal", "dep:ringbuf"]
+

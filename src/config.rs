@@ -321,6 +321,13 @@ pub struct AccountConfig {
 
     // REFER handling (for transfer testing)
     pub refer_reject: Option<u16>, // If set, reject REFER with this status code (e.g., 405)
+    /// Call mode: send an in-dialog REFER to this URI after the call is
+    /// established (transfer-initiation testing, RFC 3515).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refer_to: Option<String>,
+    /// Delay in seconds after call establishment before the REFER is sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refer_delay_secs: Option<u64>,
 
     // Audio quality analysis configuration
     pub audio_quality: Option<AudioQualityConfig>,

@@ -122,6 +122,12 @@ enum Commands {
         /// Entries are semicolon-separated. Each: <delay>:<content_type>:<body>. Use \n for newlines in body.
         #[arg(long)]
         info_flows: Option<String>,
+        /// Send an in-dialog REFER to this URI after the call is established (transfer test)
+        #[arg(long)]
+        refer_to: Option<String>,
+        /// Delay in seconds before the REFER is sent (default 1)
+        #[arg(long, default_value = "1")]
+        refer_delay: u64,
     },
     /// Wait for incoming calls
     Wait {
@@ -482,6 +488,7 @@ async fn main() -> Result<()> {
                 reinvite_flows,
                 info_flows,
                 jump_warn_ms,
+                ..
             } => {
                 let is_register = register.is_some() || password.is_some();
                 let reg_target = if let Some(r) = register {
@@ -686,6 +693,15 @@ async fn main() -> Result<()> {
         _ => None,
     };
 
+    let refer_override: Option<(String, u64)> = match &args.command {
+        Commands::Call {
+            refer_to,
+            refer_delay,
+            ..
+        } => refer_to.clone().map(|t| (t, *refer_delay)),
+        _ => None,
+    };
+
     let mut handles = vec![];
     let mut abort_handles = vec![];
     let global_config = config.clone();
@@ -863,6 +879,11 @@ async fn main() -> Result<()> {
 
         if let Some(code) = refer_reject_override {
             account.refer_reject = Some(code);
+        }
+
+        if let Some((ref target, delay)) = refer_override {
+            account.refer_to = Some(target.clone());
+            account.refer_delay_secs = Some(delay);
         }
 
         let verbose = args.verbose;
