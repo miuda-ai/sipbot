@@ -8,7 +8,7 @@ use rsipstack::dialog::DialogId;
 use rsipstack::dialog::dialog::{Dialog, DialogState};
 use rsipstack::rsip::headers::ToTypedHeader;
 use rsipstack::rsip::message::HeadersExt;
-use rsipstack::rsip::{Header, Method, StatusCode, Transport, Uri};
+use rsipstack::rsip::{Header, Method, Scheme, StatusCode, Transport, Uri};
 use rsipstack::sip::{Host, HostWithPort};
 use rsipstack::{
     EndpointBuilder,
@@ -21,7 +21,7 @@ use rsipstack::{
         key::{TransactionKey, TransactionRole},
         transaction::Transaction,
     },
-    transport::{SipAddr, SipConnection, TransportLayer, tcp_listener::TcpListenerConnection, udp::UdpConnection},
+    transport::{SipAddr, SipConnection, TlsConfig, TransportLayer, tcp_listener::TcpListenerConnection, udp::UdpConnection},
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -32,6 +32,47 @@ use tracing::{debug, error, info, warn};
 
 const ANSWER_WAV: &[u8] = include_bytes!("../wavs/play.wav");
 const RINGING_WAV: &[u8] = include_bytes!("../wavs/ringing.wav");
+
+/// Build the TLS (SIPS) client config with CA roots for peer verification.
+fn load_tls_client_config(account: &AccountConfig, global: &Config) -> Result<TlsConfig> {
+    let ca_path = account
+        .tls_ca
+        .clone()
+        .or_else(|| global.tls_ca.clone())
+        .or_else(|| std::env::var("SIPBOT_TLS_CA").ok());
+    let ca = match ca_path {
+        Some(p) => std::fs::read(&p).with_context(|| format!("read tls_ca bundle {p}"))?,
+        None => system_ca_bundle()
+            .context("no CA bundle found for TLS; set `tls_ca` or SIPBOT_TLS_CA")?,
+    };
+    Ok(TlsConfig {
+        ca_certs: Some(ca),
+        sni_hostname: account.tls_sni.clone(),
+        ..Default::default()
+    })
+}
+
+/// Best-effort system CA bundle path (PEM).
+fn system_ca_bundle() -> Option<Vec<u8>> {
+    const PATHS: &[&str] = &[
+        "/etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu
+        "/etc/ssl/cert.pem",                  // macOS / Alpine
+        "/etc/pki/tls/certs/ca-bundle.crt",   // RHEL/CentOS
+        "/etc/ssl/ca-bundle.pem",             // openSUSE
+    ];
+    PATHS.iter().find_map(|p| std::fs::read(p).ok())
+}
+
+/// Whether a target/URI requests SIPS (TLS) transport.
+fn wants_tls(to: &Uri, target: &str, account: &AccountConfig) -> bool {
+    matches!(to.scheme, Some(Scheme::Sips))
+        || target.contains("transport=tls")
+        || account
+            .transport
+            .as_deref()
+            .and_then(crate::config::TransportKind::parse)
+            .is_some_and(|k| k.is_tls())
+}
 
 #[derive(Clone)]
 struct CallRunner {
@@ -324,6 +365,31 @@ impl CallRunner {
             format!("sip:{}@{}", self.account.username, self.account.domain).try_into()?
         };
         let to: rsipstack::rsip::Uri = target_uri.as_str().try_into()?;
+
+        // SIPS (`sips:`) or `;transport=tls` ⇒ TLS transport (default port 5061).
+        let mut destination = if let Some(proxy) = &self.account.proxy {
+            SipAddr::try_from(&Uri::try_from(normalize_sip_addr(proxy).as_str())?)?
+        } else {
+            SipAddr::try_from(&to)?
+        };
+        if wants_tls(&to, &target_uri, &self.account) {
+            destination.r#type = Some(Transport::Tls);
+        }
+        if destination.r#type == Some(Transport::Tls) && destination.addr.port.is_none() {
+            destination.addr.port = Some(5061.into());
+        }
+        // Pre-establish the TLS connection so the local transport address is
+        // known before building Contact/Via (mirrors the WS flow).
+        if destination.r#type == Some(Transport::Tls) {
+            let (_conn, addr) = dialog_layer
+                .endpoint
+                .transport_layer
+                .lookup(&destination, None)
+                .await
+                .with_context(|| format!("TLS connect to {}", destination))?;
+            debug!("[{}] TLS connected to {}", self.account.username, addr);
+        }
+
         let contact =
             dialog_layer.build_local_contact(Some(self.account.username.clone()), None)?;
 
@@ -378,13 +444,6 @@ impl CallRunner {
             })
         } else {
             None
-        };
-
-        let destination = if let Some(proxy) = &self.account.proxy {
-            let proxy_uri = Uri::try_from(normalize_sip_addr(proxy).as_str())?;
-            SipAddr::try_from(&proxy_uri)?
-        } else {
-            SipAddr::try_from(&to)?
         };
 
         let mut custom_headers = vec![];
@@ -1000,6 +1059,14 @@ impl SipBot {
         }
 
         let transport_layer = TransportLayer::new(self.transport_token.clone());
+        // SIPS/TLS client roots (always configured; only used for tls targets).
+        match load_tls_client_config(&self.account, &self.global_config) {
+            Ok(tls) => transport_layer.set_tls_config(tls),
+            Err(e) => debug!(
+                "[{}] TLS client config unavailable: {}",
+                self.account.username, e
+            ),
+        }
         // Account-level transport (serve mode): udp | tcp | ws | wss.
         // Falls back to global ws_url (legacy) then udp.
         let transport_kind = self

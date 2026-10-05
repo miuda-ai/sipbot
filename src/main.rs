@@ -33,6 +33,11 @@ struct Args {
     /// Implicitly enables WebRTC mode.
     #[arg(long, global = true)]
     ws_url: Option<String>,
+
+    /// Path to a PEM CA bundle used to verify SIPS/TLS peers
+    /// (default: system bundle; env SIPBOT_TLS_CA also works).
+    #[arg(long, global = true)]
+    tls_ca: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -268,6 +273,7 @@ async fn main() -> Result<()> {
                     external_ip: None,
                     recorders: None,
                     ws_url: None,
+                    tls_ca: args.tls_ca.clone(),
                     accounts: vec![AccountConfig {
                         username: "sipbot".to_string(),
                         domain: "127.0.0.1".to_string(),
@@ -296,6 +302,7 @@ async fn main() -> Result<()> {
                     external_ip: None,
                     recorders: None,
                     ws_url: None,
+                    tls_ca: args.tls_ca.clone(),
                     accounts: vec![AccountConfig {
                         username: "sipbot".to_string(),
                         domain: "127.0.0.1".to_string(),
@@ -386,6 +393,7 @@ async fn main() -> Result<()> {
                     external_ip: None,
                     recorders: None,
                     ws_url: None,
+                    tls_ca: args.tls_ca.clone(),
                     accounts: vec![AccountConfig {
                         username: username.clone().unwrap_or("sipbot".to_string()),
                         auth_username: auth_user.clone(),

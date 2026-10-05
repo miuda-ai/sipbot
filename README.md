@@ -24,6 +24,7 @@ The media transport uses [rustrtc](https://github.com/restsend/rustrtc).
 - **Hold/Resume (Re-INVITE)**: Automatically send hold/resume re-INVITEs at scheduled times. Supports `--reinvite-flows "5s:hold,10s:resume"` — ideal for testing RFC 3264 SDP direction negotiation and RTP silence during hold.
 - **Audio Quality Analysis**: Per-call audio quality monitoring with RMS, clipping, DC offset, zero-crossing rate, spectral tilt, shrill/muffled classification, and sample-rate mismatch detection.
 - **Registration**: Supports SIP registration with authentication (WIP).
+- **Transports**: `udp` / `tcp` bind locally; `ws` / `wss` and **SIPS (SIP over TLS)** connect out. Use a `sips:` target (or `;transport=tls`) for TLS; the peer is verified against the system CA store (override with `--tls-ca <pem>` or `SIPBOT_TLS_CA`).
 
 ## Quick start
 
@@ -76,6 +77,7 @@ cargo run -- call -t sip:user@domain -u sipbot --play audio.wav --hangup 10 --to
 - `--csv-output <FILE>`: Output periodic statistics to CSV file.
 - `--csv-interval <SECONDS>`: CSV output interval in seconds (default: 5).
 - `--from <USER>`: From URI user part for outbound calls (e.g., anonymous).
+- `--tls-ca <PEM>`: CA bundle used to verify SIPS/TLS peers (default: system trust store; env `SIPBOT_TLS_CA` also honored).
 - `-H, --header <HEADER>`: Add custom SIP header (e.g., `-H 'X-Custom: value'`). Can be used multiple times.
 - `--dtmf-flows <FLOW>`: Scheduled DTMF flow after answer (e.g., `"1s:2,1.5s:#"` sends `2` after 1s, `#` after 1.5s).
 - `--reinvite-flows <FLOW>`: Scheduled re-INVITE flow after answer (e.g., `"5s:hold,10s:resume"` sends hold after 5s, resume after 10s).
@@ -202,7 +204,7 @@ domain = "127.0.0.1"
 password = "123456"
 register = true
 strategy = "彩铃-报号-跳变"
-# transport = "udp"              # udp | tcp | ws | wss
+# transport = "udp"              # udp | tcp | tls | ws | wss
 # transport_addr = "0.0.0.0:35061"  # omit → auto port allocation
 # transport_ws_url = "wss://host:8443/ws"
 
@@ -342,6 +344,25 @@ sipbot call -t sip:user@domain -u sipbot --hangup 30 --audio-quality
 # Wait for calls with audio quality monitoring
 sipbot wait --username quality-bot --echo --audio-quality
 ```
+
+### 10. SIPS (SIP over TLS)
+
+Encrypted signaling (SIP over TLS, default port 5061). A `sips:` target selects
+TLS automatically; an explicit `;transport=tls` parameter does the same:
+
+```bash
+# WebRTC call over SIPS signaling
+sipbot call -t sips:webrtc-echo@example.com --webrtc
+
+# same, explicit transport parameter
+sipbot call -t 'sip:webrtc-echo@example.com;transport=tls'
+
+# custom CA bundle (self-signed / private CA); defaults to the system store
+sipbot call -t sips:example.com --tls-ca /path/to/ca.pem
+```
+
+In `serve` mode, a per-account `transport = "tls"` routes that account's
+signaling over TLS.
 
 ## Configuration
 

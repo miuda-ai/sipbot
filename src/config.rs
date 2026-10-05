@@ -10,13 +10,15 @@ fn default_ts_jump_tolerance_ms() -> u32 {
     DEFAULT_TS_JUMP_TOLERANCE_MS
 }
 
-/// Account transport type. `udp`/`tcp` bind locally, `ws`/`wss` connect out.
+/// Account transport type. `udp`/`tcp` bind locally, `tls` connects out
+/// (SIPS), `ws`/`wss` connect out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum TransportKind {
     #[default]
     Udp,
     Tcp,
+    Tls,
     Ws,
     Wss,
 }
@@ -26,6 +28,7 @@ impl TransportKind {
         match self {
             TransportKind::Udp => "udp",
             TransportKind::Tcp => "tcp",
+            TransportKind::Tls => "tls",
             TransportKind::Ws => "ws",
             TransportKind::Wss => "wss",
         }
@@ -35,10 +38,15 @@ impl TransportKind {
         match s.trim().to_lowercase().as_str() {
             "udp" => Some(TransportKind::Udp),
             "tcp" => Some(TransportKind::Tcp),
+            "tls" | "sips" => Some(TransportKind::Tls),
             "ws" => Some(TransportKind::Ws),
             "wss" => Some(TransportKind::Wss),
             _ => None,
         }
+    }
+
+    pub fn is_tls(&self) -> bool {
+        matches!(self, TransportKind::Tls)
     }
 }
 
@@ -52,6 +60,10 @@ pub struct Config {
     pub recorders: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ws_url: Option<String>,
+    /// Path to a PEM CA bundle used to verify SIPS/TLS peers (client side).
+    /// Defaults to the system bundle; override with `SIPBOT_TLS_CA`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ca: Option<String>,
     /// serve mode: HTTP listen address for the web UI/API (e.g. "0.0.0.0:8080").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_addr: Option<String>,
@@ -283,6 +295,12 @@ pub struct AccountConfig {
     /// Outbound WS/WSS URL override for ws/wss (defaults to global ws_url)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport_ws_url: Option<String>,
+    /// Per-account PEM CA bundle for SIPS/TLS (defaults to global `tls_ca`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ca: Option<String>,
+    /// SNI hostname override for SIPS/TLS client connections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_sni: Option<String>,
     /// Bound strategy name (from `[[strategies]]`). When unset, legacy
     /// inline strategy fields on the account still apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]

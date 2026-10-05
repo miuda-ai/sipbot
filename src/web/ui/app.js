@@ -162,7 +162,7 @@ async function openAccountModal(account) {
     <label class="inline"><input type="checkbox" id="a-register" ${acc.register ? "checked" : ""}> Register to server</label>
     <label>Transport
       <select id="a-transport">
-        ${["udp","tcp","ws","wss"].map(t => `<option value="${t}" ${(acc.transport || "udp") === t ? "selected" : ""}>${t.toUpperCase()}</option>`).join("")}
+        ${["udp","tcp","tls","ws","wss"].map(t => `<option value="${t}" ${(acc.transport || "udp") === t ? "selected" : ""}>${t.toUpperCase()}</option>`).join("")}
       </select>
     </label>
     <label>Bind address (udp/tcp)<input id="a-transport-addr" placeholder="empty = global ${esc(config.addr || "0.0.0.0:35060")}" value="${esc(acc.transport_addr || "")}"></label>
@@ -206,7 +206,7 @@ function initAddAccount() {
       <label>Registrar / proxy<input id="a-proxy" placeholder="host:port (optional)"></label>
       <label class="inline"><input type="checkbox" id="a-register" checked> Register to server</label>
       <label>Transport
-        <select id="a-transport">${["udp","tcp","ws","wss"].map(t => `<option value="${t}">${t.toUpperCase()}</option>`).join("")}</select>
+        <select id="a-transport">${["udp","tcp","tls","ws","wss"].map(t => `<option value="${t}">${t.toUpperCase()}</option>`).join("")}</select>
       </label>
       <label>Bind address (udp/tcp)<input id="a-transport-addr" placeholder="empty = global"></label>
       <label>WS URL (ws/wss)<input id="a-transport-ws" placeholder="wss://host/ws"></label>
