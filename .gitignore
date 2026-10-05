@@ -5,3 +5,6 @@ Cargo.lock
 /recordings
 /records
 /serve.toml
+# packet captures are diagnostics and can contain private call data — never ship them
+*.pcap
+*.pcapng
