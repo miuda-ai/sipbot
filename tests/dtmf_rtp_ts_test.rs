@@ -207,6 +207,31 @@ async fn dtmf_does_not_jump_outgoing_rtp_timestamp() {
             d,
             tolerance
         );
+        // Regression: the first audio packet after the DTMF burst must never
+        // carry a timestamp *behind* the event packet. The old code advanced
+        // the event timestamp by wall-clock elapsed on top of the already
+        // marked "next frame" grid slot, so this packet stepped backwards and
+        // Wireshark flagged the stream.
+        let signed = next.wrapping_sub(dtmf_ts);
+        assert!(
+            signed < clock,
+            "audio after DTMF stepped backwards / overshot: next={} dtmf={} delta={}",
+            next,
+            dtmf_ts,
+            signed
+        );
+    }
+
+    // The wire sequence numbers must stay contiguous across the DTMF burst
+    // (telephone-event packets occupy sequence numbers too).
+    for w in packets.windows(2) {
+        assert_eq!(
+            w[1].seq.wrapping_sub(w[0].seq),
+            1,
+            "wire seq gap across DTMF: seq {} -> {}",
+            w[0].seq,
+            w[1].seq
+        );
     }
 
     // Whole-stream sanity: consecutive audio packets must never jump more than

@@ -385,6 +385,26 @@ fn session_rtp_ts_mark(
     *state.lock().unwrap() = Some((ts, std::time::Instant::now()));
 }
 
+/// Read the current locally generated RTP timeline *without* advancing it by
+/// wall-clock elapsed time.
+///
+/// The playback paths mark the state with the timestamp of the **next** audio
+/// frame right after enqueuing the current one (see `play_*`). So the marked
+/// value already sits on the audio grid one frame ahead. `send_dtmf` must use
+/// that value as-is: adding the elapsed time again (as
+/// [`session_rtp_ts_start`] does for a *new* playback session) pushes the
+/// telephone-event timestamp past the next audio packet. Wireshark then sees
+/// the timestamp step backwards on the first audio packet after the DTMF
+/// burst (RFC 3550 receivers log the same glitch).
+fn session_rtp_ts_peek(
+    state: &Arc<std::sync::Mutex<Option<(u32, std::time::Instant)>>>,
+) -> u32 {
+    match *state.lock().unwrap() {
+        Some((ts, _)) => ts,
+        None => random_u32(),
+    }
+}
+
 /// Build the RFC 4733 start/end telephone-event frames for a single digit.
 ///
 /// Both packets carry the *same* RTP timestamp `ts` (RFC 4733 §2.5) taken
@@ -903,7 +923,10 @@ impl MediaSession {
             .telephone_event_clock_rate
             .load(Ordering::Relaxed)
             .max(1);
-        let ts = session_rtp_ts_start(&self.rtp_ts_state, clock_rate);
+        // Peek (don't advance by elapsed) so the event timestamp lands on the
+        // audio grid instead of overshooting the next audio packet. See
+        // `session_rtp_ts_peek`.
+        let ts = session_rtp_ts_peek(&self.rtp_ts_state);
 
         let (start_frame, end_frame) = build_dtmf_frames(event, pt, clock_rate, ts);
         self.audio_source.send(MediaSample::Audio(start_frame))?;
@@ -1763,6 +1786,17 @@ impl MediaSession {
             // restarting from a random base (see `send_dtmf`).
             if let MediaSample::Audio(ref frame) = sample {
                 session_rtp_ts_mark(rtp_ts_state, frame.rtp_timestamp);
+            }
+            // Drop the inbound sequence number before re-sending. rustrtc's
+            // sender treats any frame carrying a `sequence_number` as
+            // "application controlled" and then skips its timestamp-offset
+            // rewriting for it, while the DTMF frames (no sequence number) go
+            // through that path. Mixing the two makes DTMF jump by a random
+            // timestamp offset relative to the echoed audio. Clearing it keeps
+            // echo audio and DTMF on one offset. The wire sequence number is
+            // always re-stamped by the sender, so this is safe.
+            if let MediaSample::Audio(ref mut frame) = sample {
+                frame.sequence_number = None;
             }
             if let Err(e) = audio_source.send(sample) {
                 tracing::error!("[{}] Failed to send echo sample: {:?}", username, e);
@@ -3570,25 +3604,30 @@ a=sendrecv\r\n";
     }
 
     #[test]
-    fn test_send_dtmf_continues_audio_timeline() {
-        // Reproduces the bug scenario at the state-machine level: an outgoing
-        // audio frame marks the shared timestamp, then DTMF must continue from
-        // it (never a fresh random value, which rustrtc reads as a source
-        // switch and turns into a huge wire jump).
+    fn test_send_dtmf_peeks_next_audio_grid_without_overshoot() {
+        // Playback marks the *next* audio frame's timestamp right after
+        // enqueuing the current frame (T). DTMF must reuse that grid slot
+        // (T + 160) rather than adding wall-clock elapsed time on top of it
+        // (T + 160 + elapsed), which would make the following audio packet
+        // (T + 160) step backwards in Wireshark's RTP analysis.
         let state = Arc::new(std::sync::Mutex::new(None));
-        let audio_ts: u32 = 7_000_000;
-        session_rtp_ts_mark(&state, audio_ts);
+        let sent_ts: u32 = 7_000_000;
+        let next_ts = sent_ts.wrapping_add(160);
+        session_rtp_ts_mark(&state, next_ts);
 
-        let dtmf_ts = session_rtp_ts_start(&state, 8000);
-        let (start, _end) = build_dtmf_frames(1, 101, 8000, dtmf_ts);
+        let dtmf_ts = session_rtp_ts_peek(&state);
+        assert_eq!(dtmf_ts, next_ts, "DTMF must sit exactly on the next audio grid");
 
-        // The event timestamp is close to the last audio timestamp (only the
-        // sub-millisecond idle gap may have elapsed), not a huge random jump.
-        let delta = start.rtp_timestamp.wrapping_sub(audio_ts);
+        // The next audio frame carries `next_ts` as well: no backward step.
+        assert_eq!(next_ts.wrapping_sub(dtmf_ts), 0);
+
+        // A fresh playback session still advances across the real idle gap.
+        let started = session_rtp_ts_start(&state, 8000);
         assert!(
-            delta < 8000,
-            "DTMF ts must continue the audio timeline, delta={}",
-            delta
+            started.wrapping_sub(next_ts) < 160,
+            "session start should continue, not jump: {} vs {}",
+            started,
+            next_ts
         );
     }
 
