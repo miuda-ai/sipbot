@@ -385,6 +385,45 @@ fn session_rtp_ts_mark(
     *state.lock().unwrap() = Some((ts, std::time::Instant::now()));
 }
 
+/// Build the RFC 4733 start/end telephone-event frames for a single digit.
+///
+/// Both packets carry the *same* RTP timestamp `ts` (RFC 4733 §2.5) taken
+/// from the audio stream's timeline, so rustrtc's per-stream timestamp-offset
+/// state machine does not mistake them for a source switch. The end packet's
+/// `duration` field is expressed in event-clock ticks (60 ms by default).
+fn build_dtmf_frames(event: u8, pt: u8, clock_rate: u32, ts: u32) -> (AudioFrame, AudioFrame) {
+    let clock_rate = clock_rate.max(1);
+    let end_duration: u16 = (clock_rate / 1000 * 60).min(u16::MAX as u32) as u16;
+
+    let start = AudioFrame {
+        rtp_timestamp: ts,
+        data: Bytes::copy_from_slice(&dtmf::encode_dtmf(dtmf::DtmfEvent {
+            event,
+            end: false,
+            volume: 10,
+            duration: 0,
+        })),
+        clock_rate,
+        payload_type: Some(pt),
+        marker: true,
+        ..Default::default()
+    };
+    let end = AudioFrame {
+        rtp_timestamp: ts,
+        data: Bytes::copy_from_slice(&dtmf::encode_dtmf(dtmf::DtmfEvent {
+            event,
+            end: true,
+            volume: 10,
+            duration: end_duration,
+        })),
+        clock_rate,
+        payload_type: Some(pt),
+        marker: false,
+        ..Default::default()
+    };
+    (start, end)
+}
+
 impl MediaSession {
     async fn try_track_record_mid(&self, mid: &str) -> bool {
         let mut mids = self.tracked_mids.lock().await;
@@ -859,36 +898,20 @@ impl MediaSession {
         let Some(event) = dtmf::digit_to_event(digit) else {
             return Ok(());
         };
-        let start_ev = dtmf::DtmfEvent {
-            event,
-            end: false,
-            volume: 10,
-            duration: 0,
-        };
-        let start_frame = MediaSample::Audio(AudioFrame {
-            rtp_timestamp: random_u32(),
-            data: Bytes::copy_from_slice(&dtmf::encode_dtmf(start_ev)),
-            clock_rate: dtmf::DTMF_CLOCK_RATE,
-            payload_type: Some(pt),
-            marker: true,
-            ..Default::default()
-        });
-        self.audio_source.send(start_frame)?;
-        let end_ev = dtmf::DtmfEvent {
-            event,
-            end: true,
-            volume: 10,
-            duration: 480,
-        };
-        let end_frame = MediaSample::Audio(AudioFrame {
-            rtp_timestamp: random_u32(),
-            data: Bytes::copy_from_slice(&dtmf::encode_dtmf(end_ev)),
-            clock_rate: dtmf::DTMF_CLOCK_RATE,
-            payload_type: Some(pt),
-            marker: false,
-            ..Default::default()
-        });
-        self.audio_source.send(end_frame)?;
+
+        let clock_rate = self
+            .telephone_event_clock_rate
+            .load(Ordering::Relaxed)
+            .max(1);
+        let ts = session_rtp_ts_start(&self.rtp_ts_state, clock_rate);
+
+        let (start_frame, end_frame) = build_dtmf_frames(event, pt, clock_rate, ts);
+        self.audio_source.send(MediaSample::Audio(start_frame))?;
+        self.audio_source.send(MediaSample::Audio(end_frame))?;
+
+        // Advance the shared timeline so later DTMF / sessions continue from
+        // this event instead of replaying the same timestamp.
+        session_rtp_ts_mark(&self.rtp_ts_state, ts);
         self.stats.inc_tx_dtmf();
         self.dtmf_notify.notify("tx", digit, true);
         info!("[DTMF] Sent digit '{}' (event={})", digit, event);
@@ -1366,6 +1389,7 @@ impl MediaSession {
                                         &audio_silent,
                                         ts_jump_tolerance_ms,
                                         &session.dtmf_notify,
+                                        &session.rtp_ts_state,
                                     )
                                     .await;
                                 }
@@ -1450,6 +1474,7 @@ impl MediaSession {
                                             &audio_silent,
                                             ts_jump_tolerance_ms,
                                             &session.dtmf_notify,
+                                            &session.rtp_ts_state,
                                         )
                                         .await;
                                     }
@@ -1567,6 +1592,7 @@ impl MediaSession {
         audio_silent: &Arc<std::sync::atomic::AtomicBool>,
         tolerance_ms: u32,
         dtmf_notify: &DtmfNotifier,
+        rtp_ts_state: &Arc<std::sync::Mutex<Option<(u32, std::time::Instant)>>>,
     ) {
         // Check for DTMF telephone-event packets
         if let MediaSample::Audio(ref frame) = sample {
@@ -1731,8 +1757,16 @@ impl MediaSession {
         // Echo (skip if audio is silenced due to hold)
         if audio_silent.load(std::sync::atomic::Ordering::Relaxed) {
             tracing::debug!("[{}] Audio silent, skipping echo", username);
-        } else if let Err(e) = audio_source.send(sample) {
-            tracing::error!("[{}] Failed to send echo sample: {:?}", username, e);
+        } else {
+            // Track the outbound timeline with the echoed timestamp so DTMF
+            // sent during an echo call continues the stream instead of
+            // restarting from a random base (see `send_dtmf`).
+            if let MediaSample::Audio(ref frame) = sample {
+                session_rtp_ts_mark(rtp_ts_state, frame.rtp_timestamp);
+            }
+            if let Err(e) = audio_source.send(sample) {
+                tracing::error!("[{}] Failed to send echo sample: {:?}", username, e);
+            }
         }
     }
 
@@ -3488,6 +3522,73 @@ a=sendrecv\r\n";
             diff >= 960,
             "ts should advance by the idle gap, got diff={}",
             diff
+        );
+    }
+
+    #[test]
+    fn test_build_dtmf_frames_share_timestamp_and_clock() {
+        // Event for digit '5' is index 5 in the DTMF table.
+        let event = dtmf::digit_to_event('5').unwrap();
+        let ts: u32 = 0x1234_5678;
+        let (start, end) = build_dtmf_frames(event, 101, 48000, ts);
+
+        // RFC 4733: both packets of one event share the same timestamp.
+        assert_eq!(start.rtp_timestamp, ts);
+        assert_eq!(end.rtp_timestamp, ts);
+
+        // The timestamp/clock must follow the negotiated telephone-event rate.
+        assert_eq!(start.clock_rate, 48000);
+        assert_eq!(end.clock_rate, 48000);
+
+        // Payload type must be the negotiated telephone-event PT, and only the
+        // start packet sets the marker bit.
+        assert_eq!(start.payload_type, Some(101));
+        assert_eq!(end.payload_type, Some(101));
+        assert!(start.marker);
+        assert!(!end.marker);
+
+        // Round-trip: same digit, start then end.
+        let s = dtmf::decode_dtmf(&start.data).expect("decode start");
+        let e = dtmf::decode_dtmf(&end.data).expect("decode end");
+        assert_eq!(s.event, event);
+        assert!(!s.end);
+        assert_eq!(e.event, event);
+        assert!(e.end);
+        // 60 ms expressed in 48 kHz ticks (was hard-coded 480 @ 8 kHz).
+        assert_eq!(e.duration, 2880);
+    }
+
+    #[test]
+    fn test_build_dtmf_frames_8k_duration() {
+        let event = dtmf::digit_to_event('#').unwrap();
+        let (start, end) = build_dtmf_frames(event, 101, 8000, 1000);
+        assert_eq!(start.rtp_timestamp, 1000);
+        assert_eq!(end.rtp_timestamp, 1000);
+        assert_eq!(end.clock_rate, 8000);
+        let e = dtmf::decode_dtmf(&end.data).unwrap();
+        assert_eq!(e.duration, 480, "60ms @ 8kHz must stay 480");
+    }
+
+    #[test]
+    fn test_send_dtmf_continues_audio_timeline() {
+        // Reproduces the bug scenario at the state-machine level: an outgoing
+        // audio frame marks the shared timestamp, then DTMF must continue from
+        // it (never a fresh random value, which rustrtc reads as a source
+        // switch and turns into a huge wire jump).
+        let state = Arc::new(std::sync::Mutex::new(None));
+        let audio_ts: u32 = 7_000_000;
+        session_rtp_ts_mark(&state, audio_ts);
+
+        let dtmf_ts = session_rtp_ts_start(&state, 8000);
+        let (start, _end) = build_dtmf_frames(1, 101, 8000, dtmf_ts);
+
+        // The event timestamp is close to the last audio timestamp (only the
+        // sub-millisecond idle gap may have elapsed), not a huge random jump.
+        let delta = start.rtp_timestamp.wrapping_sub(audio_ts);
+        assert!(
+            delta < 8000,
+            "DTMF ts must continue the audio timeline, delta={}",
+            delta
         );
     }
 
