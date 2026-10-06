@@ -25,7 +25,11 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, state: Arc<ServeSta
             match event_rx.recv().await {
                 Ok(event) => {
                     let json = serde_json::to_string(&event).unwrap_or_default();
-                    if tx.send(axum::extract::ws::Message::Text(json.into())).await.is_err() {
+                    if tx
+                        .send(axum::extract::ws::Message::Text(json.into()))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }

@@ -239,9 +239,15 @@ impl AudioQualityAnalyzer {
         let avg_clip = self.total_clipping_ratio / self.total_frames.max(1) as f64;
         format!(
             "AudioQuality: frames={}, mismatch={}, shrill={}, muffled={}, clipping_frames={}, silence_frames={}, avg_rms={:.1}, avg_tilt={:.3}, avg_clip={:.2}",
-            self.total_frames, self.mismatch_count, self.shrill_count,
-            self.muffled_count, self.clipping_frames, self.silence_frames,
-            avg_rms, avg_tilt, avg_clip * 100.0
+            self.total_frames,
+            self.mismatch_count,
+            self.shrill_count,
+            self.muffled_count,
+            self.clipping_frames,
+            self.silence_frames,
+            avg_rms,
+            avg_tilt,
+            avg_clip * 100.0
         )
     }
 
@@ -255,7 +261,12 @@ impl AudioQualityAnalyzer {
     }
 }
 
-fn report_periodic(enabled: bool, frame_count: usize, interval: usize, report: &AudioQualityReport) {
+fn report_periodic(
+    enabled: bool,
+    frame_count: usize,
+    interval: usize,
+    report: &AudioQualityReport,
+) {
     if enabled && frame_count % interval == 0 {
         tracing::debug!(
             "[AudioQuality] frame={} rms={:.1} tilt={:.3} zcr={:.3} clip={:.2} dc={:.1} {}",
@@ -279,7 +290,9 @@ mod tests {
         (0..n)
             .map(|i| {
                 let t = i as f64 / sr as f64;
-                (std::f64::consts::TAU * freq * t).sin().mul_add(16000.0, 0.0) as i16
+                (std::f64::consts::TAU * freq * t)
+                    .sin()
+                    .mul_add(16000.0, 0.0) as i16
             })
             .collect()
     }

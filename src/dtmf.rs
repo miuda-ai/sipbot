@@ -1,5 +1,3 @@
-
-
 pub const DTMF_TELEPHONE_EVENT_PT: u8 = 101;
 pub const DTMF_CLOCK_RATE: u32 = 8000;
 pub const DTMF_EVENT_DURATION_INC: u16 = 160;
@@ -9,7 +7,10 @@ const DTMF_DIGITS: &[char] = &[
 ];
 
 pub fn digit_to_event(digit: char) -> Option<u8> {
-    DTMF_DIGITS.iter().position(|&d| d == digit).map(|i| i as u8)
+    DTMF_DIGITS
+        .iter()
+        .position(|&d| d == digit)
+        .map(|i| i as u8)
 }
 
 pub fn event_to_digit(event: u8) -> Option<char> {
@@ -258,8 +259,14 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                TelephoneEventInfo { pt: 110, clock_rate: 48000 },
-                TelephoneEventInfo { pt: 126, clock_rate: 8000 },
+                TelephoneEventInfo {
+                    pt: 110,
+                    clock_rate: 48000
+                },
+                TelephoneEventInfo {
+                    pt: 126,
+                    clock_rate: 8000
+                },
             ]
         );
     }
@@ -269,7 +276,6 @@ mod tests {
         let sdp = "a=rtpmap:0 PCMU/8000\n";
         assert!(parse_telephone_events(sdp).is_empty());
     }
-
 
     #[test]
     fn test_fmtp_line() {
@@ -314,10 +320,30 @@ mod tests {
     #[test]
     fn test_multiple_packets_sequence() {
         let events = vec![
-            DtmfEvent { event: 1, end: false, volume: 10, duration: 0 },
-            DtmfEvent { event: 1, end: false, volume: 10, duration: 160 },
-            DtmfEvent { event: 1, end: false, volume: 10, duration: 320 },
-            DtmfEvent { event: 1, end: true, volume: 10, duration: 480 },
+            DtmfEvent {
+                event: 1,
+                end: false,
+                volume: 10,
+                duration: 0,
+            },
+            DtmfEvent {
+                event: 1,
+                end: false,
+                volume: 10,
+                duration: 160,
+            },
+            DtmfEvent {
+                event: 1,
+                end: false,
+                volume: 10,
+                duration: 320,
+            },
+            DtmfEvent {
+                event: 1,
+                end: true,
+                volume: 10,
+                duration: 480,
+            },
         ];
         for ev in &events {
             let encoded = encode_dtmf(ev.clone());

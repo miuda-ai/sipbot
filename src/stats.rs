@@ -193,8 +193,7 @@ impl CallStats {
         let aq_clipping = self.audio_quality_clipping_frames.load(Ordering::Relaxed);
         let aq_shrill = self.audio_quality_shrill_count.load(Ordering::Relaxed);
         let aq_muffled = self.audio_quality_muffled_count.load(Ordering::Relaxed);
-        let has_audio =
-            aq_total > 0 && (aq_silence as f64 / aq_total.max(1) as f64) < 0.95;
+        let has_audio = aq_total > 0 && (aq_silence as f64 / aq_total.max(1) as f64) < 0.95;
         let rx_dtmf = self.rx_dtmf_events.load(Ordering::Relaxed);
         let tx_dtmf = self.tx_dtmf_events.load(Ordering::Relaxed);
 

@@ -1,10 +1,10 @@
-use super::state::{now_ms, ServeState};
+use super::state::{ServeState, now_ms};
 use axum::{
+    Router,
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json},
     routing::{get, post},
-    Router,
 };
 use std::sync::Arc;
 
@@ -20,9 +20,20 @@ pub fn router(state: Arc<ServeState>) -> Router {
         .route("/api/accounts/enabled", post(post_account_enabled))
         .route("/api/strategies", get(get_strategies))
         .route("/api/strategies/copy", post(post_strategy_copy))
-        .route("/api/strategies/{name}", axum::routing::delete(delete_strategy))
-        .route("/api/calls", get(get_calls).post(post_call_outbound).delete(delete_all_calls))
-        .route("/api/calls/{call_id}", get(get_call_detail).delete(delete_call))
+        .route(
+            "/api/strategies/{name}",
+            axum::routing::delete(delete_strategy),
+        )
+        .route(
+            "/api/calls",
+            get(get_calls)
+                .post(post_call_outbound)
+                .delete(delete_all_calls),
+        )
+        .route(
+            "/api/calls/{call_id}",
+            get(get_call_detail).delete(delete_call),
+        )
         .route("/api/calls/{call_id}/hangup", post(post_call_hangup))
         .route("/api/calls/{call_id}/dtmf", post(post_call_dtmf))
         .route("/api/recordings", get(get_recordings))
@@ -42,7 +53,10 @@ async fn ui_index() -> impl IntoResponse {
     (
         [
             (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            (axum::http::header::CACHE_CONTROL, "no-store, must-revalidate"),
+            (
+                axum::http::header::CACHE_CONTROL,
+                "no-store, must-revalidate",
+            ),
             (axum::http::header::PRAGMA, "no-cache"),
         ],
         super::ui::INDEX_HTML,
@@ -52,8 +66,14 @@ async fn ui_index() -> impl IntoResponse {
 async fn ui_app_js() -> impl IntoResponse {
     (
         [
-            (axum::http::header::CONTENT_TYPE, "application/javascript; charset=utf-8"),
-            (axum::http::header::CACHE_CONTROL, "no-store, must-revalidate"),
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            ),
+            (
+                axum::http::header::CACHE_CONTROL,
+                "no-store, must-revalidate",
+            ),
             (axum::http::header::PRAGMA, "no-cache"),
         ],
         super::ui::APP_JS,
@@ -64,7 +84,10 @@ async fn ui_style_css() -> impl IntoResponse {
     (
         [
             (axum::http::header::CONTENT_TYPE, "text/css; charset=utf-8"),
-            (axum::http::header::CACHE_CONTROL, "no-store, must-revalidate"),
+            (
+                axum::http::header::CACHE_CONTROL,
+                "no-store, must-revalidate",
+            ),
             (axum::http::header::PRAGMA, "no-cache"),
         ],
         super::ui::STYLE_CSS,
@@ -109,7 +132,11 @@ async fn post_call_outbound(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     let hangup_secs = body.get("hangup_secs").and_then(|v| v.as_u64());
-    let total = body.get("total").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as u32;
+    let total = body
+        .get("total")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1)
+        .max(1) as u32;
     let cps = body.get("cps").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as u32;
     let dtmf_flows = body
         .get("dtmf_flows")
@@ -202,7 +229,10 @@ async fn post_call_outbound(
             .into_response();
     }
     let proxy = pick(proxy, profile.as_ref().and_then(|p| p.proxy.as_ref()));
-    let dtmf_flows = pick(dtmf_flows, profile.as_ref().and_then(|p| p.dtmf_flows.as_ref()));
+    let dtmf_flows = pick(
+        dtmf_flows,
+        profile.as_ref().and_then(|p| p.dtmf_flows.as_ref()),
+    );
     let reinvite_flows = pick(
         reinvite_flows,
         profile.as_ref().and_then(|p| p.reinvite_flows.as_ref()),
@@ -211,15 +241,16 @@ async fn post_call_outbound(
         transfer_flows,
         profile.as_ref().and_then(|p| p.transfer_flows.as_ref()),
     );
-    let action =
-        pick(Some(action), profile.as_ref().and_then(|p| p.action.as_ref()))
-            .unwrap_or_else(|| "play".to_string());
+    let action = pick(
+        Some(action),
+        profile.as_ref().and_then(|p| p.action.as_ref()),
+    )
+    .unwrap_or_else(|| "play".to_string());
     let hangup_secs = hangup_secs.or(profile.as_ref().and_then(|p| p.hangup_secs));
     let codecs = codecs.or_else(|| profile.as_ref().and_then(|p| p.codecs.clone()));
     let wav_file = pick(wav_file, profile.as_ref().and_then(|p| p.wav_file.as_ref()));
-    let codecs = codecs.unwrap_or_else(|| {
-        vec!["pcmu".to_string(), "pcma".to_string(), "g722".to_string()]
-    });
+    let codecs =
+        codecs.unwrap_or_else(|| vec!["pcmu".to_string(), "pcma".to_string(), "g722".to_string()]);
 
     // Parse target host to use as domain.
     let target_stripped = target.trim_start_matches("sip:");
@@ -311,22 +342,20 @@ async fn post_call_outbound(
         running.retain(|h| h.from_user != cleanup_from || h.target != cleanup_target);
     });
 
-    Json(
-        serde_json::json!({
-            "ok": true,
-            "from": from_user.clone(),
-            "target": target.clone(),
-            "action": action,
-            "total": total,
-            "cps": cps,
-            "codecs": codecs,
-            "reinvite_flows": reinvite_flows.clone(),
-            "transfer_flows": transfer_flows.clone(),
-            "proxy": proxy.clone(),
-            "codecs": codecs,
-        }),
-    )
-        .into_response()
+    Json(serde_json::json!({
+        "ok": true,
+        "from": from_user.clone(),
+        "target": target.clone(),
+        "action": action,
+        "total": total,
+        "cps": cps,
+        "codecs": codecs,
+        "reinvite_flows": reinvite_flows.clone(),
+        "transfer_flows": transfer_flows.clone(),
+        "proxy": proxy.clone(),
+        "codecs": codecs,
+    }))
+    .into_response()
 }
 
 async fn get_accounts(State(state): State<Arc<ServeState>>) -> impl IntoResponse {
@@ -502,13 +531,11 @@ async fn post_account_copy(
     copy.username = new_username.clone();
     config.accounts.push(copy);
     commit_config(&state, config).await;
-    Json(
-        serde_json::json!({
-            "ok": true,
-            "username": new_username,
-            "strategy": body.get("strategy").and_then(|v| v.as_str()),
-        }),
-    )
+    Json(serde_json::json!({
+        "ok": true,
+        "username": new_username,
+        "strategy": body.get("strategy").and_then(|v| v.as_str()),
+    }))
     .into_response()
 }
 
@@ -582,12 +609,7 @@ fn unique_strategy_name(config: &crate::config::Config, source: &str) -> String 
 }
 
 fn unique_username(config: &crate::config::Config, source: &str) -> String {
-    let taken = |u: &str| {
-        config
-            .accounts
-            .iter()
-            .any(|a| a.username == u)
-    };
+    let taken = |u: &str| config.accounts.iter().any(|a| a.username == u);
     if source.chars().all(|c| c.is_ascii_digit()) && !source.is_empty() {
         // numeric: find next free integer
         let base: u64 = source.parse().unwrap_or(0);
@@ -638,7 +660,6 @@ fn not_found(msg: &str) -> axum::response::Response {
     )
         .into_response()
 }
-
 
 async fn get_calls(
     State(state): State<Arc<ServeState>>,
@@ -737,7 +758,8 @@ async fn post_call_hangup(
                                 .unwrap_or("");
                             let host_ok = callee_host.is_empty()
                                 || target_host.is_empty()
-                                || callee_host.starts_with(target_host.split(':').next().unwrap_or(""));
+                                || callee_host
+                                    .starts_with(target_host.split(':').next().unwrap_or(""));
                             if callee_user == target_user && host_ok {
                                 h.cancel.cancel();
                                 matched = true;
@@ -888,10 +910,7 @@ async fn get_recording_file(
         Ok(bytes) => (
             [
                 (axum::http::header::CONTENT_TYPE, "audio/wav"),
-                (
-                    axum::http::header::CONTENT_DISPOSITION,
-                    "inline",
-                ),
+                (axum::http::header::CONTENT_DISPOSITION, "inline"),
             ],
             bytes,
         )
@@ -899,7 +918,6 @@ async fn get_recording_file(
         Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }
-
 
 async fn fallback_not_found() -> impl IntoResponse {
     (StatusCode::NOT_FOUND, "not found")

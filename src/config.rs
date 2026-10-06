@@ -135,7 +135,10 @@ impl Config {
         }
         // Legacy inline fields → synthetic strategy
         StrategyConfig {
-            name: account.strategy.clone().unwrap_or_else(|| "inline".to_string()),
+            name: account
+                .strategy
+                .clone()
+                .unwrap_or_else(|| "inline".to_string()),
             match_caller: account.match_caller.clone(),
             codecs: account.codecs.clone(),
             early_media: account.early_media.clone(),
@@ -270,18 +273,18 @@ pub struct AccountConfig {
     pub password: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
-    pub register: Option<bool>,              // Default to true if missing
+    pub register: Option<bool>, // Default to true if missing
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub from_user: Option<String>,            // Optional From URI user part (for outbound calls without registration)
-    pub target: Option<String>,              // Target URI for outbound calls
-    pub record: Option<String>,              // Recording file path
-    pub srtp_enabled: Option<bool>,          // Enable SRTP/SDES
-    pub webrtc_enabled: Option<bool>,        // Enable WebRTC media (ICE+DTLS) + +sip.ice contact
-    pub nack_enabled: Option<bool>,          // Enable NACK
+    pub from_user: Option<String>, // Optional From URI user part (for outbound calls without registration)
+    pub target: Option<String>,       // Target URI for outbound calls
+    pub record: Option<String>,       // Recording file path
+    pub srtp_enabled: Option<bool>,   // Enable SRTP/SDES
+    pub webrtc_enabled: Option<bool>, // Enable WebRTC media (ICE+DTLS) + +sip.ice contact
+    pub nack_enabled: Option<bool>,   // Enable NACK
     pub jitter_buffer_enabled: Option<bool>, // Enable Jitter Buffer
-    pub reject_prob: Option<u8>,             // Reject probability (1-99%)
-    pub codecs: Option<Vec<String>>,         // Preferred codecs (opus, g722, g729, pcmu, pcma)
-    pub headers: Option<Vec<String>>,        // Custom SIP headers (e.g., "X-Custom: value")
+    pub reject_prob: Option<u8>,      // Reject probability (1-99%)
+    pub codecs: Option<Vec<String>>,  // Preferred codecs (opus, g722, g729, pcmu, pcma)
+    pub headers: Option<Vec<String>>, // Custom SIP headers (e.g., "X-Custom: value")
     #[serde(default)]
     pub cancel_prob: u8, // Cancel probability (1-99%)
 
@@ -352,7 +355,10 @@ pub struct AccountConfig {
 
     /// RTP timestamp-jump tolerance in milliseconds for the seq/ts jump
     /// (audio-glitch) statistics. Defaults to 50.
-    #[serde(default = "default_ts_jump_tolerance_ms", skip_serializing_if="is_default_u32")]
+    #[serde(
+        default = "default_ts_jump_tolerance_ms",
+        skip_serializing_if = "is_default_u32"
+    )]
     pub ts_jump_tolerance_ms: u32,
 
     /// DTMF flow after answer: "1s:2,1.5s:#" means send '2' after 1s, then '#' after 1.5s
@@ -391,7 +397,10 @@ pub fn parse_dtmf_flows(input: &str) -> Result<Vec<DtmfFlowEntry>> {
             continue;
         }
         let Some((delay_str, digit_str)) = part.split_once(':') else {
-            anyhow::bail!("Invalid dtmf_flow entry '{}': expected <delay>:<digit>", part);
+            anyhow::bail!(
+                "Invalid dtmf_flow entry '{}': expected <delay>:<digit>",
+                part
+            );
         };
         let delay_str = delay_str.trim();
         let digit_str = digit_str.trim();
@@ -411,7 +420,9 @@ pub fn parse_dtmf_flows(input: &str) -> Result<Vec<DtmfFlowEntry>> {
             .next()
             .with_context(|| format!("Missing digit in '{}'", part))?;
         anyhow::ensure!(
-            digit.is_ascii_digit() || digit == '*' || digit == '#'
+            digit.is_ascii_digit()
+                || digit == '*'
+                || digit == '#'
                 || ('A'..='D').contains(&digit)
                 || ('a'..='d').contains(&digit),
             "Invalid DTMF digit '{}'",
@@ -434,7 +445,10 @@ impl std::str::FromStr for ReinviteAction {
         match s.trim().to_lowercase().as_str() {
             "hold" => Ok(ReinviteAction::Hold),
             "resume" => Ok(ReinviteAction::Resume),
-            _ => anyhow::bail!("Invalid reinvite action '{}': expected 'hold' or 'resume'", s),
+            _ => anyhow::bail!(
+                "Invalid reinvite action '{}': expected 'hold' or 'resume'",
+                s
+            ),
         }
     }
 }
@@ -453,7 +467,10 @@ pub fn parse_reinvite_flows(input: &str) -> Result<Vec<ReinviteFlowEntry>> {
             continue;
         }
         let Some((delay_str, action_str)) = part.split_once(':') else {
-            anyhow::bail!("Invalid reinvite_flow entry '{}': expected <delay>:<action>", part);
+            anyhow::bail!(
+                "Invalid reinvite_flow entry '{}': expected <delay>:<action>",
+                part
+            );
         };
         let delay_str = delay_str.trim();
         let action_str = action_str.trim();
@@ -543,11 +560,17 @@ pub fn parse_info_flows(input: &str) -> Result<Vec<InfoFlowEntry>> {
         }
         // Find the first colon (delay boundary)
         let Some((delay_str, rest)) = part.split_once(':') else {
-            anyhow::bail!("Invalid info_flow entry '{}': expected <delay>:<content_type>:<body>", part);
+            anyhow::bail!(
+                "Invalid info_flow entry '{}': expected <delay>:<content_type>:<body>",
+                part
+            );
         };
         // Find the second colon (content_type / body boundary)
         let Some((content_type_str, body_str)) = rest.split_once(':') else {
-            anyhow::bail!("Invalid info_flow entry '{}': expected <delay>:<content_type>:<body>", part);
+            anyhow::bail!(
+                "Invalid info_flow entry '{}': expected <delay>:<content_type>:<body>",
+                part
+            );
         };
         let delay_str = delay_str.trim();
         let content_type = content_type_str.trim().to_string();
@@ -563,7 +586,11 @@ pub fn parse_info_flows(input: &str) -> Result<Vec<InfoFlowEntry>> {
                 .with_context(|| format!("Invalid delay '{}'", delay_str))?;
             std::time::Duration::from_secs_f64(num)
         };
-        anyhow::ensure!(!content_type.is_empty(), "Empty content_type in info_flow '{}'", part);
+        anyhow::ensure!(
+            !content_type.is_empty(),
+            "Empty content_type in info_flow '{}'",
+            part
+        );
         entries.push(InfoFlowEntry {
             delay,
             content_type,
@@ -578,7 +605,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_dtmf_flows_basic() {        let entries = parse_dtmf_flows("1s:2,1.5s:#").unwrap();
+    fn test_parse_dtmf_flows_basic() {
+        let entries = parse_dtmf_flows("1s:2,1.5s:#").unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].digit, '2');
         assert_eq!(entries[0].delay, std::time::Duration::from_millis(1000));
@@ -673,8 +701,7 @@ mod tests {
 
     #[test]
     fn test_parse_info_flows_single() {
-        let entries =
-            parse_info_flows("0.5:application/json:{\"key\":\"value\"}").unwrap();
+        let entries = parse_info_flows("0.5:application/json:{\"key\":\"value\"}").unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].delay, std::time::Duration::from_millis(500));
         assert_eq!(entries[0].content_type, "application/json");
@@ -756,8 +783,14 @@ domain = "127.0.0.1"
         s.apply_to(&mut account);
         assert_eq!(account.sdp_jump, Some(true));
         assert_eq!(account.dtmf_flows.as_deref(), Some("1s:2"));
-        assert_eq!(account.hangup.as_ref().unwrap().mode.as_deref(), Some("remote"));
-        assert_eq!(account.ring.as_ref().unwrap().ringback.as_deref(), Some("wavs/crbt.wav"));
+        assert_eq!(
+            account.hangup.as_ref().unwrap().mode.as_deref(),
+            Some("remote")
+        );
+        assert_eq!(
+            account.ring.as_ref().unwrap().ringback.as_deref(),
+            Some("wavs/crbt.wav")
+        );
     }
 
     #[test]
@@ -829,7 +862,10 @@ pub struct AnnounceConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct HangupConfig {
-    #[serde(default = "default_hangup_code", skip_serializing_if = "is_default_hangup_code")]
+    #[serde(
+        default = "default_hangup_code",
+        skip_serializing_if = "is_default_hangup_code"
+    )]
     pub code: u16, // SIP Code (e.g., 603, 486). If 0/200 and answered, send BYE.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_secs: Option<u64>, // Delay before hanging up
@@ -853,9 +889,7 @@ impl HangupConfig {
         match self.mode.as_deref().map(|s| s.trim().to_lowercase()) {
             Some(m) if m == "remote" => HangupMode::Remote,
             Some(m) if m == "playback" => HangupMode::Playback,
-            Some(m) if m == "after" => {
-                HangupMode::After(self.after_secs.unwrap_or(0).max(1))
-            }
+            Some(m) if m == "after" => HangupMode::After(self.after_secs.unwrap_or(0).max(1)),
             // Legacy semantics: after_secs present => After; none => Playback
             _ => match self.after_secs {
                 Some(secs) => HangupMode::After(secs),

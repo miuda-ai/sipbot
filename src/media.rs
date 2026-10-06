@@ -45,11 +45,7 @@ fn new_resampler(input_rate: usize, output_rate: usize) -> Option<Resampler<'sta
 /// and Opus receivers adapt to the per-packet channel count carried in the
 /// TOC byte, so mono packets are decoded fine.
 fn encode_channels(ct: CodecType, negotiated: u16) -> u16 {
-    if ct == CodecType::Opus {
-        1
-    } else {
-        negotiated
-    }
+    if ct == CodecType::Opus { 1 } else { negotiated }
 }
 
 fn create_encoder_for(ct: CodecType, channels: u16) -> Box<dyn audio_codec::Encoder> {
@@ -382,10 +378,7 @@ fn session_rtp_ts_start(
     }
 }
 
-fn session_rtp_ts_mark(
-    state: &Arc<std::sync::Mutex<Option<(u32, std::time::Instant)>>>,
-    ts: u32,
-) {
+fn session_rtp_ts_mark(state: &Arc<std::sync::Mutex<Option<(u32, std::time::Instant)>>>, ts: u32) {
     *state.lock().unwrap() = Some((ts, std::time::Instant::now()));
 }
 
@@ -400,9 +393,7 @@ fn session_rtp_ts_mark(
 /// telephone-event timestamp past the next audio packet. Wireshark then sees
 /// the timestamp step backwards on the first audio packet after the DTMF
 /// burst (RFC 3550 receivers log the same glitch).
-fn session_rtp_ts_peek(
-    state: &Arc<std::sync::Mutex<Option<(u32, std::time::Instant)>>>,
-) -> u32 {
+fn session_rtp_ts_peek(state: &Arc<std::sync::Mutex<Option<(u32, std::time::Instant)>>>) -> u32 {
     match *state.lock().unwrap() {
         Some((ts, _)) => ts,
         None => random_u32(),
@@ -548,8 +539,7 @@ impl MediaSession {
             if let Some(rest) = line.to_lowercase().strip_prefix("a=rtpmap:") {
                 if let Some((pt_str, codec_spec)) = rest.trim().split_once(' ') {
                     if let Ok(pt) = pt_str.parse::<u8>() {
-                        let codec_name =
-                            codec_spec.split('/').next().unwrap_or("").to_uppercase();
+                        let codec_name = codec_spec.split('/').next().unwrap_or("").to_uppercase();
                         remote_pt_map.insert(codec_name, pt);
                     }
                 }
@@ -1044,7 +1034,11 @@ impl MediaSession {
         self.audio_silent.store(silent, Ordering::Relaxed);
         info!(
             "[MediaSession] Audio silent set to {}",
-            if silent { "true (muted)" } else { "false (unmuted)" }
+            if silent {
+                "true (muted)"
+            } else {
+                "false (unmuted)"
+            }
         );
     }
 
@@ -1075,7 +1069,8 @@ impl MediaSession {
     }
 
     pub async fn set_remote_answer(&self, remote_sdp: &str) -> Result<String> {
-        self.set_remote_answer_typed(remote_sdp, SdpType::Answer).await
+        self.set_remote_answer_typed(remote_sdp, SdpType::Answer)
+            .await
     }
 
     /// Apply a remote answer SDP. When `provisional` is true the SDP is
@@ -1216,12 +1211,10 @@ impl MediaSession {
     /// the remote plays as early media (ringback, busy, reject, ... tones).
     ///
     /// Idempotent: transceivers already tracked for recording are skipped.
-    pub async fn start_rx_observer(
-        &self,
-        username: String,
-    ) -> tokio::task::JoinHandle<()> {
+    pub async fn start_rx_observer(&self, username: String) -> tokio::task::JoinHandle<()> {
         let child_token = self.cancel_token.child_token();
-        self.setup_transceivers_for_recording(child_token.clone()).await;
+        self.setup_transceivers_for_recording(child_token.clone())
+            .await;
         self.spawn_track_event_handler(username, child_token)
     }
 
@@ -2048,10 +2041,7 @@ impl MediaSession {
             let mut encoder = create_encoder_for(ct, target_channels);
 
             let mut resampler = if input_sample_rate != target_sample_rate || input_channels != 1 {
-                new_resampler(
-                    input_sample_rate as usize,
-                    target_sample_rate as usize,
-                )
+                new_resampler(input_sample_rate as usize, target_sample_rate as usize)
             } else {
                 None
             };
@@ -2250,8 +2240,8 @@ impl MediaSession {
     ) -> Result<()> {
         info!("[{}] Playing embedded wav...", username);
 
-        let mut reader = hound::WavReader::new(Cursor::new(wav_bytes))
-            .context("Failed to read WAV bytes")?;
+        let mut reader =
+            hound::WavReader::new(Cursor::new(wav_bytes)).context("Failed to read WAV bytes")?;
         let samples = self.load_codec_samples(&username, &mut reader)?;
         self.run_playback(username, samples, recording_path, keep_alive, keep_alive)
             .await
@@ -2266,8 +2256,8 @@ impl MediaSession {
     ) -> Result<()> {
         info!("[{}] Playing embedded wav (once)...", username);
 
-        let mut reader = hound::WavReader::new(Cursor::new(wav_bytes))
-            .context("Failed to read WAV bytes")?;
+        let mut reader =
+            hound::WavReader::new(Cursor::new(wav_bytes)).context("Failed to read WAV bytes")?;
         let samples = self.load_codec_samples(&username, &mut reader)?;
         self.run_playback(username, samples, recording_path, false, false)
             .await
@@ -2815,9 +2805,7 @@ fn inject_telephone_event_sdp(sdp: &str, info: dtmf::TelephoneEventInfo) -> Stri
 
         // Insert the telephone-event rtpmap/fmtp once, after the last codec
         // rtpmap line (appending after every rtpmap line would duplicate it).
-        let insert_idx = last_rtpmap_idx
-            .map(|i| i + 1)
-            .unwrap_or(mline_idx + 1);
+        let insert_idx = last_rtpmap_idx.map(|i| i + 1).unwrap_or(mline_idx + 1);
         lines.splice(
             insert_idx..insert_idx,
             [
@@ -2846,7 +2834,10 @@ fn spawn_track_recorder(
     // Yield to the echo/bridge loop when it owns RX processing — otherwise
     // both loops decode the same track and write the recorder twice (halved
     // pitch, duplicated echo frames).
-    if session.echo_active.load(std::sync::atomic::Ordering::SeqCst) {
+    if session
+        .echo_active
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
         info!("RX record loop yielding: echo/bridge loop active");
         return;
     }
@@ -3240,10 +3231,8 @@ async fn process_recorded_sample(
                         };
 
                         if need_new {
-                            *output_resampler = new_resampler(
-                                actual_sample_rate as usize,
-                                target_rate as usize,
-                            );
+                            *output_resampler =
+                                new_resampler(actual_sample_rate as usize, target_rate as usize);
                         }
 
                         if let Some(resampler) = output_resampler.as_mut() {
@@ -3366,21 +3355,20 @@ mod tests {
         assert!(sdp.to_lowercase().contains("pcmu"));
 
         // Check if we can create an answer session
-        let (_answer_session, answer_sdp, _) =
-            MediaSession::new(
-                &sdp,
-                false,
-                false,
-                false,
-                false,
-                None,
-                codecs,
-                stats,
-                None,
-                DEFAULT_TS_JUMP_TOLERANCE_MS,
-            )
-            .await
-                .unwrap();
+        let (_answer_session, answer_sdp, _) = MediaSession::new(
+            &sdp,
+            false,
+            false,
+            false,
+            false,
+            None,
+            codecs,
+            stats,
+            None,
+            DEFAULT_TS_JUMP_TOLERANCE_MS,
+        )
+        .await
+        .unwrap();
         assert!(answer_sdp.contains("m=audio"));
         assert!(answer_sdp.contains("a=sendrecv"));
     }
@@ -3492,21 +3480,20 @@ a=sendrecv\r\n";
     #[tokio::test]
     async fn test_echo_tracking_independent_from_recorder_tracking() {
         let stats = Arc::new(CallStats::new());
-        let (session, _sdp) =
-            MediaSession::new_offer(
-                false,
-                false,
-                false,
-                false,
-                None,
-                None,
-                false,
-                stats,
-                None,
-                DEFAULT_TS_JUMP_TOLERANCE_MS,
-            )
-                .await
-                .unwrap();
+        let (session, _sdp) = MediaSession::new_offer(
+            false,
+            false,
+            false,
+            false,
+            None,
+            None,
+            false,
+            stats,
+            None,
+            DEFAULT_TS_JUMP_TOLERANCE_MS,
+        )
+        .await
+        .unwrap();
 
         assert!(session.try_track_record_mid("audio-0").await);
         assert!(!session.try_track_record_mid("audio-0").await);
@@ -3538,7 +3525,8 @@ a=sendrecv\r\n";
     fn test_order_caps_by_remote_offer_rtpmap_fallback() {
         // Static PT (0) is in the m-line; dynamic caps not listed there fall
         // back to rtpmap order, and unknown caps stay last (stable).
-        let remote = "v=0\r\nm=audio 4000 RTP/AVP 0 8\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\n";
+        let remote =
+            "v=0\r\nm=audio 4000 RTP/AVP 0 8\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\n";
         let mut caps = vec![AudioCapability::pcma(), AudioCapability::pcmu()];
         order_caps_by_remote_offer(&mut caps, remote);
         assert_eq!(caps[0].codec_name.to_lowercase(), "pcmu");
@@ -3620,7 +3608,10 @@ a=sendrecv\r\n";
         session_rtp_ts_mark(&state, next_ts);
 
         let dtmf_ts = session_rtp_ts_peek(&state);
-        assert_eq!(dtmf_ts, next_ts, "DTMF must sit exactly on the next audio grid");
+        assert_eq!(
+            dtmf_ts, next_ts,
+            "DTMF must sit exactly on the next audio grid"
+        );
 
         // The next audio frame carries `next_ts` as well: no backward step.
         assert_eq!(next_ts.wrapping_sub(dtmf_ts), 0);
@@ -3641,7 +3632,10 @@ a=sendrecv\r\n";
         let fmtp = caps[0].fmtp.as_deref().unwrap_or_default();
         assert!(fmtp.contains("sprop-stereo=0"), "fmtp: {}", fmtp);
         assert!(fmtp.contains("stereo=1"), "fmtp: {}", fmtp);
-        assert_eq!(caps[0].channels, 2, "rtpmap channels must stay opus/48000/2");
+        assert_eq!(
+            caps[0].channels, 2,
+            "rtpmap channels must stay opus/48000/2"
+        );
     }
 
     #[test]
@@ -3649,7 +3643,10 @@ a=sendrecv\r\n";
         let sdp = "v=0\nm=audio 4000 RTP/AVP 0 8\nc=IN IP4 127.0.0.1\na=rtpmap:0 PCMU/8000\n";
         let result = inject_telephone_event_sdp(
             sdp,
-            dtmf::TelephoneEventInfo { pt: 101, clock_rate: 8000 },
+            dtmf::TelephoneEventInfo {
+                pt: 101,
+                clock_rate: 8000,
+            },
         );
         assert!(result.contains("telephone-event"));
         assert!(result.contains("a=rtpmap:101 telephone-event/8000"));
@@ -3663,7 +3660,10 @@ a=sendrecv\r\n";
         let sdp = "v=0\nm=audio 5000 RTP/AVP 111\nc=IN IP4 127.0.0.1\na=rtpmap:111 opus/48000/2\n";
         let result = inject_telephone_event_sdp(
             sdp,
-            dtmf::TelephoneEventInfo { pt: 110, clock_rate: 48000 },
+            dtmf::TelephoneEventInfo {
+                pt: 110,
+                clock_rate: 48000,
+            },
         );
         assert!(result.contains("a=rtpmap:110 telephone-event/48000"));
         assert!(result.contains("m=audio 5000 RTP/AVP 111 110"));
@@ -3674,7 +3674,10 @@ a=sendrecv\r\n";
         let sdp = "v=0\nm=audio 4000 RTP/AVP 0 101\nc=IN IP4 127.0.0.1\na=rtpmap:0 PCMU/8000\na=rtpmap:101 telephone-event/8000\n";
         let result = inject_telephone_event_sdp(
             sdp,
-            dtmf::TelephoneEventInfo { pt: 101, clock_rate: 8000 },
+            dtmf::TelephoneEventInfo {
+                pt: 101,
+                clock_rate: 8000,
+            },
         );
         // Count occurrences of telephone-event in result (should be exactly 1)
         let count = result.matches("telephone-event").count();
@@ -3693,7 +3696,10 @@ a=sendrecv\r\n";
             a=rtpmap:0 PCMU/8000\na=rtpmap:8 PCMA/8000\n";
         let result = inject_telephone_event_sdp(
             sdp,
-            dtmf::TelephoneEventInfo { pt: 101, clock_rate: 8000 },
+            dtmf::TelephoneEventInfo {
+                pt: 101,
+                clock_rate: 8000,
+            },
         );
         assert_eq!(result.matches("telephone-event").count(), 1);
         assert_eq!(result.matches("a=fmtp:101 0-16").count(), 1);
@@ -3729,21 +3735,20 @@ a=sendrecv\r\n";
     async fn test_media_session_offer_contains_telephone_event() {
         let stats = Arc::new(CallStats::new());
         let codecs = Some(vec!["pcmu".to_string()]);
-        let (_session, sdp) =
-            MediaSession::new_offer(
-                false,
-                false,
-                false,
-                false,
-                None,
-                codecs,
-                true,
-                stats,
-                None,
-                DEFAULT_TS_JUMP_TOLERANCE_MS,
-            )
-                .await
-                .unwrap();
+        let (_session, sdp) = MediaSession::new_offer(
+            false,
+            false,
+            false,
+            false,
+            None,
+            codecs,
+            true,
+            stats,
+            None,
+            DEFAULT_TS_JUMP_TOLERANCE_MS,
+        )
+        .await
+        .unwrap();
         // The SDP should contain telephone-event capability
         assert!(
             sdp.to_lowercase().contains("telephone-event"),
@@ -3770,21 +3775,20 @@ a=sendrecv\r\n";
         )
         .await
         .unwrap();
-        let (_answerer, answer_sdp, _) =
-            MediaSession::new(
-                &offer_sdp,
-                false,
-                false,
-                false,
-                false,
-                None,
-                None,
-                stats,
-                None,
-                DEFAULT_TS_JUMP_TOLERANCE_MS,
-            )
-                .await
-                .unwrap();
+        let (_answerer, answer_sdp, _) = MediaSession::new(
+            &offer_sdp,
+            false,
+            false,
+            false,
+            false,
+            None,
+            None,
+            stats,
+            None,
+            DEFAULT_TS_JUMP_TOLERANCE_MS,
+        )
+        .await
+        .unwrap();
         assert!(
             answer_sdp.to_lowercase().contains("telephone-event"),
             "Answer SDP should contain telephone-event. SDP: {}",

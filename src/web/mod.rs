@@ -28,8 +28,8 @@ pub async fn run_serve(
     verbose: bool,
     cancel_token: CancellationToken,
 ) -> Result<()> {
-    let state = state::ServeState::new(config.clone(), cancel_token.clone())
-        .with_config_path(config_path);
+    let state =
+        state::ServeState::new(config.clone(), cancel_token.clone()).with_config_path(config_path);
     let state = Arc::new(state);
 
     // Load persisted call history (survives restarts).
@@ -114,11 +114,11 @@ pub fn spawn_bots(state: &Arc<state::ServeState>, verbose: bool) {
             }
         })
         .abort_handle();
-        state.bots.lock().unwrap().push(BotHandle {
-            key,
-            token,
-            abort,
-        });
+        state
+            .bots
+            .lock()
+            .unwrap()
+            .push(BotHandle { key, token, abort });
     }
 }
 
@@ -133,9 +133,7 @@ fn pick_free_bind_addr(
     for _ in 0..50 {
         if !used.contains(&addr.port()) {
             let probe_ok = match kind {
-                crate::config::TransportKind::Tcp => {
-                    std::net::TcpListener::bind(addr).is_ok()
-                }
+                crate::config::TransportKind::Tcp => std::net::TcpListener::bind(addr).is_ok(),
                 _ => std::net::UdpSocket::bind(addr).is_ok(),
             };
             if probe_ok {

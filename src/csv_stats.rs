@@ -107,11 +107,26 @@ impl CsvStatsRecorder {
         let nack_recovered = self.stats.nack_recovered.load(Ordering::Relaxed);
 
         // Audio quality + DTMF stats
-        let aq_silence = self.stats.audio_quality_silence_frames.load(Ordering::Relaxed);
-        let aq_clipping = self.stats.audio_quality_clipping_frames.load(Ordering::Relaxed);
-        let aq_total = self.stats.audio_quality_total_frames.load(Ordering::Relaxed);
-        let aq_shrill = self.stats.audio_quality_shrill_count.load(Ordering::Relaxed);
-        let aq_muffled = self.stats.audio_quality_muffled_count.load(Ordering::Relaxed);
+        let aq_silence = self
+            .stats
+            .audio_quality_silence_frames
+            .load(Ordering::Relaxed);
+        let aq_clipping = self
+            .stats
+            .audio_quality_clipping_frames
+            .load(Ordering::Relaxed);
+        let aq_total = self
+            .stats
+            .audio_quality_total_frames
+            .load(Ordering::Relaxed);
+        let aq_shrill = self
+            .stats
+            .audio_quality_shrill_count
+            .load(Ordering::Relaxed);
+        let aq_muffled = self
+            .stats
+            .audio_quality_muffled_count
+            .load(Ordering::Relaxed);
         let rx_dtmf = self.stats.rx_dtmf_events.load(Ordering::Relaxed);
         let tx_dtmf = self.stats.tx_dtmf_events.load(Ordering::Relaxed);
 

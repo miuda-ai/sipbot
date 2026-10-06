@@ -169,36 +169,72 @@ impl CallRecord {
         let call_id = v.get("call_id")?.as_str()?.to_string();
         Some(CallRecord {
             call_id,
-            direction: v.get("direction").and_then(|d| d.as_str()).and_then(|d| match d {
-                "inbound" => Some(CallDirection::Inbound),
-                "outbound" => Some(CallDirection::Outbound),
-                _ => None,
-            }),
-            caller: v.get("caller").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            callee: v.get("callee").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            account: v.get("account").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            strategy: v.get("strategy").and_then(|x| x.as_str()).map(|s| s.to_string()),
-            state: v.get("state").and_then(|s| s.as_str()).and_then(|s| match s {
-                "trying" => Some(CallState::Trying),
-                "ringing" => Some(CallState::Ringing),
-                "early_media" => Some(CallState::EarlyMedia),
-                "answered" => Some(CallState::Answered),
-                "terminated" => Some(CallState::Terminated),
-                "rejected" => Some(CallState::Rejected),
-                "failed" => Some(CallState::Failed),
-                _ => None,
-            }),
+            direction: v
+                .get("direction")
+                .and_then(|d| d.as_str())
+                .and_then(|d| match d {
+                    "inbound" => Some(CallDirection::Inbound),
+                    "outbound" => Some(CallDirection::Outbound),
+                    _ => None,
+                }),
+            caller: v
+                .get("caller")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            callee: v
+                .get("callee")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            account: v
+                .get("account")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            strategy: v
+                .get("strategy")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string()),
+            state: v
+                .get("state")
+                .and_then(|s| s.as_str())
+                .and_then(|s| match s {
+                    "trying" => Some(CallState::Trying),
+                    "ringing" => Some(CallState::Ringing),
+                    "early_media" => Some(CallState::EarlyMedia),
+                    "answered" => Some(CallState::Answered),
+                    "terminated" => Some(CallState::Terminated),
+                    "rejected" => Some(CallState::Rejected),
+                    "failed" => Some(CallState::Failed),
+                    _ => None,
+                }),
             started_at_ms: v.get("started_at_ms").and_then(|x| x.as_u64()).unwrap_or(0),
             ended_at_ms: v.get("ended_at_ms").and_then(|x| x.as_u64()),
-            end_reason: v.get("end_reason").and_then(|x| x.as_str()).map(|s| s.to_string()),
+            end_reason: v
+                .get("end_reason")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string()),
             sip_trace: v
                 .get("sip_trace")
                 .and_then(|x| serde_json::from_value(x.clone()).ok())
                 .unwrap_or_default(),
-            sdp_offer: v.get("sdp_offer").and_then(|x| x.as_str()).map(|s| s.to_string()),
-            sdp_183: v.get("sdp_183").and_then(|x| x.as_str()).map(|s| s.to_string()),
-            sdp_200: v.get("sdp_200").and_then(|x| x.as_str()).map(|s| s.to_string()),
-            codec: v.get("codec").and_then(|x| x.as_str()).map(|s| s.to_string()),
+            sdp_offer: v
+                .get("sdp_offer")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string()),
+            sdp_183: v
+                .get("sdp_183")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string()),
+            sdp_200: v
+                .get("sdp_200")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string()),
+            codec: v
+                .get("codec")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string()),
             jump_events: v
                 .get("jump_events")
                 .and_then(|x| serde_json::from_value(x.clone()).ok())
@@ -207,7 +243,10 @@ impl CallRecord {
                 .get("dtmf_events")
                 .and_then(|x| serde_json::from_value(x.clone()).ok())
                 .unwrap_or_default(),
-            recording: v.get("recording").and_then(|x| x.as_str()).map(|s| s.to_string()),
+            recording: v
+                .get("recording")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string()),
             issues: v
                 .get("issues")
                 .and_then(|x| x.as_array())
@@ -232,7 +271,10 @@ impl CallRecord {
                 .and_then(|d| d.as_u64())
                 .unwrap_or_else(now_ms);
             r.started_at_ms = ended.saturating_sub(duration);
-            if matches!(r.state, Some(CallState::Terminated) | Some(CallState::Rejected)) {
+            if matches!(
+                r.state,
+                Some(CallState::Terminated) | Some(CallState::Rejected)
+            ) {
                 r.ended_at_ms = Some(ended);
             }
             r
@@ -316,7 +358,10 @@ impl CallRegistry {
         // Trim terminated calls beyond the cap.
         while calls.len() > MAX_CALLS {
             if let Some(idx) = calls.iter().rposition(|c| {
-                matches!(c.lock().unwrap().state, Some(CallState::Terminated) | Some(CallState::Rejected))
+                matches!(
+                    c.lock().unwrap().state,
+                    Some(CallState::Terminated) | Some(CallState::Rejected)
+                )
             }) {
                 calls.remove(idx);
             } else {
@@ -337,7 +382,12 @@ impl CallRegistry {
     /// Remove one call from the registry and delete its persisted JSON
     /// (plus any recording) from `dir`/`recordings`. Returns whether the
     /// record existed.
-    pub fn remove(&self, call_id: &str, records_dir: &std::path::Path, recordings_dir: Option<&std::path::Path>) -> bool {
+    pub fn remove(
+        &self,
+        call_id: &str,
+        records_dir: &std::path::Path,
+        recordings_dir: Option<&std::path::Path>,
+    ) -> bool {
         let removed = {
             let mut calls = self.calls.lock().unwrap();
             let before = calls.len();
@@ -359,7 +409,11 @@ impl CallRegistry {
     }
 
     /// Clear every call from the registry and wipe persisted JSONs.
-    pub fn clear(&self, records_dir: &std::path::Path, recordings_dir: Option<&std::path::Path>) -> usize {
+    pub fn clear(
+        &self,
+        records_dir: &std::path::Path,
+        recordings_dir: Option<&std::path::Path>,
+    ) -> usize {
         let count = {
             let mut calls = self.calls.lock().unwrap();
             let n = calls.len();
@@ -453,7 +507,12 @@ impl CallRegistry {
         let calls = self.calls.lock().unwrap();
         calls
             .iter()
-            .filter(|c| !matches!(c.lock().unwrap().state, Some(CallState::Terminated) | Some(CallState::Rejected)))
+            .filter(|c| {
+                !matches!(
+                    c.lock().unwrap().state,
+                    Some(CallState::Terminated) | Some(CallState::Rejected)
+                )
+            })
             .count()
     }
 
@@ -522,7 +581,10 @@ impl CallRegistry {
                 continue;
             };
             let mut calls = self.calls.lock().unwrap();
-            if calls.iter().any(|c| c.lock().unwrap().call_id == record.call_id) {
+            if calls
+                .iter()
+                .any(|c| c.lock().unwrap().call_id == record.call_id)
+            {
                 continue;
             }
             calls.push_back(Arc::new(Mutex::new(record)));

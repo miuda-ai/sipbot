@@ -378,7 +378,11 @@ async fn main() -> Result<()> {
                 let is_register = register.is_some() || password.is_some();
                 info!("Parsed config: nack={}, jitter={}", *nack, *jitter);
                 let reg_target = if let Some(r) = register {
-                    if r.is_empty() { None } else { Some(r.trim_start_matches("sip:").to_string()) }
+                    if r.is_empty() {
+                        None
+                    } else {
+                        Some(r.trim_start_matches("sip:").to_string())
+                    }
                 } else {
                     None
                 };
@@ -468,73 +472,77 @@ async fn main() -> Result<()> {
         reinvite_flows_override,
         info_flows_override,
     ) = match &args.command {
-            Commands::Call {
-                target,
-                username,
-                auth_user,
-                password,
-                register,
-                from,
-                hangup,
-                play,
-                local,
-                record,
-                srtp,
-                webrtc,
-                nack,
-                jitter,
-                total,
-                cps,
-                cancel_prob,
-                codecs,
-                audio_quality,
-                headers,
-                csv_output,
-                csv_interval,
-                addr,
-                dtmf_flows,
-                reinvite_flows,
-                info_flows,
-                jump_warn_ms,
-                ..
-            } => {
-                let is_register = register.is_some() || password.is_some();
-                let reg_target = if let Some(r) = register {
-                    if r.is_empty() { None } else { Some(r.trim_start_matches("sip:").to_string()) }
-                } else {
+        Commands::Call {
+            target,
+            username,
+            auth_user,
+            password,
+            register,
+            from,
+            hangup,
+            play,
+            local,
+            record,
+            srtp,
+            webrtc,
+            nack,
+            jitter,
+            total,
+            cps,
+            cancel_prob,
+            codecs,
+            audio_quality,
+            headers,
+            csv_output,
+            csv_interval,
+            addr,
+            dtmf_flows,
+            reinvite_flows,
+            info_flows,
+            jump_warn_ms,
+            ..
+        } => {
+            let is_register = register.is_some() || password.is_some();
+            let reg_target = if let Some(r) = register {
+                if r.is_empty() {
                     None
-                };
-                (
-                    "call",
-                    target.clone(),
-                    username.clone(),
-                    auth_user.clone(),
-                    password.clone(),
-                    *hangup,
-                    play.clone(),
-                    record.clone(),
-                    *srtp,
-                    *webrtc,
-                    Some(*nack),
-                    Some(*jitter),
-                    *local,
-                    *total,
-                    *cps,
-                    is_register,
-                    reg_target,
-                    *cancel_prob,
-                    codecs.clone(),
-                    headers.clone(),
-                    csv_output.clone(),
-                    *csv_interval,
-                    from.clone(),
-                    addr.clone(),
-                    *audio_quality,
-                    *jump_warn_ms,
-                    dtmf_flows.clone(),
-                    reinvite_flows.clone(),
-                    info_flows.clone(),
-                )
+                } else {
+                    Some(r.trim_start_matches("sip:").to_string())
+                }
+            } else {
+                None
+            };
+            (
+                "call",
+                target.clone(),
+                username.clone(),
+                auth_user.clone(),
+                password.clone(),
+                *hangup,
+                play.clone(),
+                record.clone(),
+                *srtp,
+                *webrtc,
+                Some(*nack),
+                Some(*jitter),
+                *local,
+                *total,
+                *cps,
+                is_register,
+                reg_target,
+                *cancel_prob,
+                codecs.clone(),
+                headers.clone(),
+                csv_output.clone(),
+                *csv_interval,
+                from.clone(),
+                addr.clone(),
+                *audio_quality,
+                *jump_warn_ms,
+                dtmf_flows.clone(),
+                reinvite_flows.clone(),
+                info_flows.clone(),
+            )
         }
         Commands::Wait {
             srtp,
@@ -555,7 +563,11 @@ async fn main() -> Result<()> {
         } => {
             let is_register = register.is_some() || password.is_some();
             let reg_target = if let Some(r) = register {
-                if r.is_empty() { None } else { Some(r.trim_start_matches("sip:").to_string()) }
+                if r.is_empty() {
+                    None
+                } else {
+                    Some(r.trim_start_matches("sip:").to_string())
+                }
             } else {
                 None
             };
@@ -564,11 +576,11 @@ async fn main() -> Result<()> {
                 None,
                 username.clone(),
                 auth_user.clone(),
-                    password.clone(),
-                    None,
-                    None,
-                    record.clone(),
-                    *srtp,
+                password.clone(),
+                None,
+                None,
+                record.clone(),
+                *srtp,
                 *webrtc,
                 Some(*nack),
                 Some(*jitter),
@@ -933,7 +945,9 @@ async fn main() -> Result<()> {
             tokio::spawn(async move {
                 use tokio::io::AsyncBufReadExt;
                 let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-                info!("[DTMF] Single call mode: type digits (0-9,*,#,A-D) to send DTMF, 'q' to quit");
+                info!(
+                    "[DTMF] Single call mode: type digits (0-9,*,#,A-D) to send DTMF, 'q' to quit"
+                );
                 while let Ok(Some(line)) = stdin.next_line().await {
                     for ch in line.chars() {
                         if ch == 'q' || ch == 'Q' {

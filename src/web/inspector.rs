@@ -1,5 +1,5 @@
 use super::state::{
-    now_ms, CallDirection, CallState, CallRegistry, SipTraceEntry, WsEvent, MAX_SIP_TRACE,
+    CallDirection, CallRegistry, CallState, MAX_SIP_TRACE, SipTraceEntry, WsEvent, now_ms,
 };
 use rsipstack::rsip::message::HeadersExt;
 use rsipstack::rsip::{Method, SipMessage};

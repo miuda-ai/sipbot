@@ -45,7 +45,12 @@ pub async fn list(config: &Config) -> Vec<MediaFile> {
     if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) != Some("wav".into()) {
+            if path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase())
+                != Some("wav".into())
+            {
                 continue;
             }
             let size = entry.metadata().await.map(|m| m.len()).unwrap_or(0);
@@ -69,11 +74,7 @@ fn wav_info(path: &PathBuf) -> (Option<f64>, Option<u32>, Option<u16>) {
             let spec = reader.spec();
             let frames = reader.duration() as f64;
             let rate = spec.sample_rate;
-            (
-                Some(frames / rate as f64),
-                Some(rate),
-                Some(spec.channels),
-            )
+            (Some(frames / rate as f64), Some(rate), Some(spec.channels))
         }
         Err(_) => (None, None, None),
     }
@@ -96,11 +97,7 @@ pub async fn serve_file(
     };
     let path = media_dir(&state.current_config()).join(name);
     match tokio::fs::read(&path).await {
-        Ok(bytes) => (
-            [(axum::http::header::CONTENT_TYPE, "audio/wav")],
-            bytes,
-        )
-            .into_response(),
+        Ok(bytes) => ([(axum::http::header::CONTENT_TYPE, "audio/wav")], bytes).into_response(),
         Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }
@@ -120,19 +117,13 @@ pub async fn upload(
             match field.bytes().await {
                 Ok(bytes) => {
                     if bytes.len() as u64 > MAX_UPLOAD_BYTES {
-                        return (
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            "file exceeds 10MB limit",
-                        )
+                        return (StatusCode::PAYLOAD_TOO_LARGE, "file exceeds 10MB limit")
                             .into_response();
                     }
                     data = Some(bytes.to_vec());
                 }
                 Err(e) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        format!("read upload: {}", e),
-                    )
+                    return (StatusCode::BAD_REQUEST, format!("read upload: {}", e))
                         .into_response();
                 }
             }

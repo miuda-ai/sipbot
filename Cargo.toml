@@ -16,9 +16,9 @@ serde = { version = "1", features = ["derive"] }
 toml = "1.1.2"
 tracing = "0.1"
 anyhow = "1.0"
-rsipstack = "0.6.13"
+rsipstack = { path = "../rsipstack", version = "0.7.0" }
 tokio-util = "0.7"
-rustrtc = "0.4.0"
+rustrtc = { path = "../rustrtc", version = "0.4.0" }
 audio-codec = "0.4.7"
 clap = { version = "4", features = ["derive"] }
 chrono = "0.4.45"

@@ -21,7 +21,10 @@ use rsipstack::{
         key::{TransactionKey, TransactionRole},
         transaction::Transaction,
     },
-    transport::{SipAddr, SipConnection, TlsConfig, TransportLayer, tcp_listener::TcpListenerConnection, udp::UdpConnection},
+    transport::{
+        SipAddr, SipConnection, TlsConfig, TransportLayer, tcp_listener::TcpListenerConnection,
+        udp::UdpConnection,
+    },
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -663,7 +666,8 @@ impl CallRunner {
             .account
             .reinvite_flows
             .as_deref()
-            .and_then(|s| crate::config::parse_reinvite_flows(s).ok());        let reinvite_media = media_session.clone();
+            .and_then(|s| crate::config::parse_reinvite_flows(s).ok());
+        let reinvite_media = media_session.clone();
         let reinvite_dialog = dialog.clone();
         let reinvite_username = self.account.username.clone();
         let reinvite_cancel = self.cancel_token.clone();
@@ -674,9 +678,14 @@ impl CallRunner {
                     reinvite_username,
                     flows.len()
                 );
+                // `delay` values are absolute offsets from the flow start
+                // ("5s:hold,10s:resume" = hold at t+5s, resume at t+10s),
+                // NOT gaps between consecutive actions.
+                let flow_start = tokio::time::Instant::now();
                 for entry in flows {
+                    let target = flow_start + entry.delay;
                     tokio::select! {
-                        _ = tokio::time::sleep(entry.delay) => {}
+                        _ = tokio::time::sleep_until(target) => {}
                         _ = reinvite_cancel.cancelled() => {
                             info!("[{}] Re-INVITE flow cancelled", reinvite_username);
                             return;
@@ -882,9 +891,7 @@ impl CallRunner {
                 }
                 info!(
                     "[{}] Sending REFER to {} (after {:.1}s)",
-                    refer_to_username,
-                    target,
-                    refer_to_delay as f64
+                    refer_to_username, target, refer_to_delay as f64
                 );
                 let headers = vec![
                     Header::ReferTo(target.clone().into()),
@@ -893,7 +900,10 @@ impl CallRunner {
                         format!("<sip:{}@{}>", refer_to_username, refer_to_domain),
                     ),
                 ];
-                match refer_to_dialog.request(Method::Refer, Some(headers), None).await {
+                match refer_to_dialog
+                    .request(Method::Refer, Some(headers), None)
+                    .await
+                {
                     Ok(Some(resp)) => {
                         info!(
                             "[{}] REFER response: {}",
@@ -1075,8 +1085,9 @@ impl SipBot {
             .as_deref()
             .and_then(crate::config::TransportKind::parse);
         let uses_ws = match transport_kind {
-            Some(crate::config::TransportKind::Ws)
-            | Some(crate::config::TransportKind::Wss) => true,
+            Some(crate::config::TransportKind::Ws) | Some(crate::config::TransportKind::Wss) => {
+                true
+            }
             Some(_) => false,
             None => self.global_config.ws_url.is_some(),
         };
@@ -1877,17 +1888,14 @@ impl SipBot {
             .typed_contact_headers()
             .ok()
             .and_then(|cs| cs.first().cloned())
-            .is_some_and(|c| {
-                matches!(&c.uri.host_with_port.host, Host::IpAddr(ip) if ip.is_unspecified())
-            });
+            .is_some_and(
+                |c| matches!(&c.uri.host_with_port.host, Host::IpAddr(ip) if ip.is_unspecified()),
+            );
         if !needs_fix {
             return;
         }
 
-        let via = request
-            .top_via_header()
-            .ok()
-            .and_then(|v| v.typed().ok());
+        let via = request.top_via_header().ok().and_then(|v| v.typed().ok());
         let Some(via) = via else {
             return;
         };
@@ -2060,17 +2068,13 @@ impl SipBot {
                         // Assertable marker for transfer e2e tests.
                         info!(
                             "[{}] REFER completed with {} ({})",
-                            self.account.username,
-                            body_first,
-                            s
+                            self.account.username, body_first, s
                         );
                     }
                     Some(s) => {
                         info!(
                             "[{}] REFER in progress: {} ({})",
-                            self.account.username,
-                            body_first,
-                            s
+                            self.account.username, body_first, s
                         );
                     }
                     None => {}
@@ -2374,8 +2378,8 @@ impl SipBot {
                 // ── plain reject stage (no tone): respond code immediately ──
                 if let Some(reject_cfg) = &account.reject {
                     if reject_cfg.tone.is_none() {
-                        let sc = StatusCode::try_from(reject_cfg.code)
-                            .unwrap_or(StatusCode::BusyHere);
+                        let sc =
+                            StatusCode::try_from(reject_cfg.code).unwrap_or(StatusCode::BusyHere);
                         info!(
                             "[{}] Reject stage: responding {}",
                             account.username, reject_cfg.code
@@ -2468,7 +2472,9 @@ impl SipBot {
                             "[{}] Reject stage: playing tone then {}",
                             account.username, reject_cfg.code
                         );
-                        if let (Some(session), Some(sdp)) = (media_session.as_ref(), local_sdp.as_ref()) {
+                        if let (Some(session), Some(sdp)) =
+                            (media_session.as_ref(), local_sdp.as_ref())
+                        {
                             let headers = vec![Header::ContentType("application/sdp".into())];
                             if server_dialog_clone
                                 .ringing(Some(headers), Some(sdp.clone().into_bytes()))
@@ -2847,10 +2853,7 @@ impl SipBot {
                 if let Some(announce_cfg) = &account.announce {
                     if let Some(session) = media_session.clone() {
                         let file = announce_cfg.file.replace("{{caller}}", &caller_user);
-                        info!(
-                            "[{}] Announce stage: playing {}",
-                            account.username, file
-                        );
+                        info!("[{}] Announce stage: playing {}", account.username, file);
                         let play = session.play_file_once(
                             username_media.clone(),
                             std::path::Path::new(&file),
@@ -2891,10 +2894,8 @@ impl SipBot {
                                 {
                                     Ok((jump_session, _sdp_j, codec_j)) => {
                                         jump_session.dtmf_notify.set(dtmf_observer.clone());
-                                        let old_info =
-                                            session.local_stream_info();
-                                        let new_info =
-                                            jump_session.local_stream_info();
+                                        let old_info = session.local_stream_info();
+                                        let new_info = jump_session.local_stream_info();
                                         info!(
                                             "[{}] Stream JUMP (no re-INVITE): old={:?} new={:?} codec={}",
                                             account.username, old_info, new_info, codec_j
@@ -2921,8 +2922,7 @@ impl SipBot {
                                                 .saturating_sub(r.started_at_ms);
                                             r.jump_events.push(crate::web::state::JumpEvent {
                                                 t_ms,
-                                                reason: "announce jump_after (in-call)"
-                                                    .to_string(),
+                                                reason: "announce jump_after (in-call)".to_string(),
                                                 old_ssrc: old_info.map(|i| i.0),
                                                 new_ssrc: new_info.map(|i| i.0),
                                             });
@@ -2944,21 +2944,17 @@ impl SipBot {
 
                 let park_token = call_token_for_logic.clone();
                 let username_media = account.username.clone();
-                let media_future = async move {                    if let Some(media) = media_session {
+                let media_future = async move {
+                    if let Some(media) = media_session {
                         if let Some(cfg) = answer_config {
                             match cfg {
                                 AnswerConfig::Echo => {
                                     if bridged {
                                         // The RX bridge already loops remote audio
                                         // back through the jump session.
-                                        info!(
-                                            "[{}] Stage 2: Echo via jump bridge",
-                                            username_media
-                                        );
+                                        info!("[{}] Stage 2: Echo via jump bridge", username_media);
                                         if let Some(path) = recording_path.as_deref() {
-                                            media
-                                                .init_recording(&username_media, path)
-                                                .await;
+                                            media.init_recording(&username_media, path).await;
                                         }
                                         park_token.cancelled().await;
                                         Ok(())
@@ -3111,58 +3107,56 @@ impl SipBot {
                             }
                         }
                     }
-                    _ => {
-                        match wait_timeout {
-                            Some(secs) => {
-                                info!(
-                                    "[{}] Stage 3: Will hangup after {} seconds",
-                                    account.username, secs
-                                );
-                                let dtmf_handle = tokio::spawn(dtmf_future);
-                                tokio::select! {
-                                    res = media_future => {
-                                        if let Err(e) = res {
-                                            error!("[{}] Media error: {:?}", account.username, e);
-                                        }
-                                        info!("[{}] Media finished", account.username);
+                    _ => match wait_timeout {
+                        Some(secs) => {
+                            info!(
+                                "[{}] Stage 3: Will hangup after {} seconds",
+                                account.username, secs
+                            );
+                            let dtmf_handle = tokio::spawn(dtmf_future);
+                            tokio::select! {
+                                res = media_future => {
+                                    if let Err(e) = res {
+                                        error!("[{}] Media error: {:?}", account.username, e);
                                     }
-                                    _ = tokio::time::sleep(Duration::from_secs(secs)) => {
-                                        info!("[{}] Hangup timer expired", account.username);
-                                    }
-                                    _ = control_token.cancelled() => {
-                                        info!("[{}] UI requested hangup", account.username);
-                                    }
-                                    _ = cancel_token.cancelled() => {
-                                        info!("[{}] Cancellation requested during call.", account.username);
-                                    }
-                                    _ = call_token_for_logic.cancelled() => {
-                                        info!("[{}] Call ended remotely during playback.", account.username);
-                                    }
+                                    info!("[{}] Media finished", account.username);
                                 }
-                                dtmf_handle.abort();
-                            }
-                            None => {
-                                let dtmf_handle = tokio::spawn(dtmf_future);
-                                tokio::select! {
-                                    res = media_future => {
-                                        if let Err(e) = res {
-                                            error!("[{}] Media error: {:?}", account.username, e);
-                                        }
-                                    }
-                                    _ = control_token.cancelled() => {
-                                        info!("[{}] UI requested hangup", account.username);
-                                    }
-                                    _ = cancel_token.cancelled() => {
-                                        info!("[{}] Cancellation requested during call.", account.username);
-                                    }
-                                    _ = call_token_for_logic.cancelled() => {
-                                        info!("[{}] Call ended remotely.", account.username);
-                                    }
+                                _ = tokio::time::sleep(Duration::from_secs(secs)) => {
+                                    info!("[{}] Hangup timer expired", account.username);
                                 }
-                                dtmf_handle.abort();
+                                _ = control_token.cancelled() => {
+                                    info!("[{}] UI requested hangup", account.username);
+                                }
+                                _ = cancel_token.cancelled() => {
+                                    info!("[{}] Cancellation requested during call.", account.username);
+                                }
+                                _ = call_token_for_logic.cancelled() => {
+                                    info!("[{}] Call ended remotely during playback.", account.username);
+                                }
                             }
+                            dtmf_handle.abort();
                         }
-                    }
+                        None => {
+                            let dtmf_handle = tokio::spawn(dtmf_future);
+                            tokio::select! {
+                                res = media_future => {
+                                    if let Err(e) = res {
+                                        error!("[{}] Media error: {:?}", account.username, e);
+                                    }
+                                }
+                                _ = control_token.cancelled() => {
+                                    info!("[{}] UI requested hangup", account.username);
+                                }
+                                _ = cancel_token.cancelled() => {
+                                    info!("[{}] Cancellation requested during call.", account.username);
+                                }
+                                _ = call_token_for_logic.cancelled() => {
+                                    info!("[{}] Call ended remotely.", account.username);
+                                }
+                            }
+                            dtmf_handle.abort();
+                        }
+                    },
                 }
 
                 for s in live_sessions {
@@ -3273,7 +3267,10 @@ fn expected_call_ms(account: &crate::config::AccountConfig) -> Option<u64> {
 
 /// Post-call acceptance checks — append findings to `r.issues` so the UI can
 /// flag abnormal calls (fork duplicates are detected at INVITE time).
-fn evaluate_call_health(r: &mut crate::web::state::CallRecord, account: &crate::config::AccountConfig) {
+fn evaluate_call_health(
+    r: &mut crate::web::state::CallRecord,
+    account: &crate::config::AccountConfig,
+) {
     use crate::web::state::CallState;
     let finished = matches!(
         r.state,
@@ -3301,9 +3298,8 @@ fn evaluate_call_health(r: &mut crate::web::state::CallRecord, account: &crate::
                 } else {
                     "stalled playback or remote held the call"
                 };
-                r.issues.push(format!(
-                    "call ran {dur}ms, expected ~{expected}ms — {why}"
-                ));
+                r.issues
+                    .push(format!("call ran {dur}ms, expected ~{expected}ms — {why}"));
             }
         }
     }
@@ -3311,8 +3307,14 @@ fn evaluate_call_health(r: &mut crate::web::state::CallRecord, account: &crate::
 
 /// Extract the user part from a URI string (`sip:1001@host` → `1001`).
 fn caller_user_part(uri: &str) -> String {
-    let stripped = uri.trim().trim_start_matches("sip:").trim_start_matches("sips:");
-    let user = stripped.split(['@', ';', ':', '>', '?']).next().unwrap_or("");
+    let stripped = uri
+        .trim()
+        .trim_start_matches("sip:")
+        .trim_start_matches("sips:");
+    let user = stripped
+        .split(['@', ';', ':', '>', '?'])
+        .next()
+        .unwrap_or("");
     user.to_string()
 }
 
@@ -3467,7 +3469,11 @@ mod tests {
         );
         SipBot::fix_unspecified_contact(&mut req);
         let contact = req.contact_header().unwrap().value().to_string();
-        assert!(contact.contains("sip:caller@203.0.113.5:51372"), "{}", contact);
+        assert!(
+            contact.contains("sip:caller@203.0.113.5:51372"),
+            "{}",
+            contact
+        );
     }
 
     #[test]
@@ -3478,7 +3484,11 @@ mod tests {
         );
         SipBot::fix_unspecified_contact(&mut req);
         let contact = req.contact_header().unwrap().value().to_string();
-        assert!(contact.contains("sip:caller@203.0.113.9:6060"), "{}", contact);
+        assert!(
+            contact.contains("sip:caller@203.0.113.9:6060"),
+            "{}",
+            contact
+        );
     }
 
     #[test]
