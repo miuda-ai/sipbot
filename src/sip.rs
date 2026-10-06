@@ -437,11 +437,10 @@ impl CallRunner {
 
         let credential = if let Some(password) = &self.account.password {
             Some(Credential {
-                username: self
-                    .account
-                    .auth_username
-                    .clone()
-                    .unwrap_or(self.account.username.clone()),
+                username: self.account.username.clone(),
+                // RFC: the digest username may differ from the AOR user
+                // (3CX/Asterisk auth IDs). `None` falls back to `username`.
+                auth_username: self.account.auth_username.clone(),
                 password: password.clone(),
                 realm: Some(self.account.domain.clone()),
             })
@@ -1207,11 +1206,10 @@ impl SipBot {
 
         let credential = if let Some(password) = &self.account.password {
             Some(Credential {
-                username: self
-                    .account
-                    .auth_username
-                    .clone()
-                    .unwrap_or(self.account.username.clone()),
+                username: self.account.username.clone(),
+                // RFC: the digest username may differ from the AOR user
+                // (3CX/Asterisk auth IDs). `None` falls back to `username`.
+                auth_username: self.account.auth_username.clone(),
                 password: password.clone(),
                 realm: Some(self.account.domain.clone()),
             })
@@ -2126,6 +2124,7 @@ impl SipBot {
         let credential = if let Some(password) = &self.account.password {
             Some(Credential {
                 username: self.account.username.clone(),
+                auth_username: self.account.auth_username.clone(),
                 password: password.clone(),
                 realm: Some(self.account.domain.clone()),
             })
