@@ -246,8 +246,12 @@ fn get_audio_caps(codecs: &Option<Vec<String>>, nack_enabled: bool) -> Vec<Audio
                         codec_name: format!("{:?}", ct).to_uppercase(),
                         clock_rate: ct.clock_rate(),
                         channels: ct.channels() as u8,
+                        // Do NOT inherit fmtp from AudioCapability::default()
+                        // (which is the Opus capability): minptime/useinbandfec/
+                        // stereo are Opus-only parameters and must not leak into
+                        // G722/G729 rtpmaps.
+                        fmtp: None,
                         rtcp_fbs: vec!["nack".to_string()],
-                        ..Default::default()
                     }
                 } else {
                     continue;
