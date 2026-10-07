@@ -2127,7 +2127,6 @@ impl SipBot {
                 auth_username: self.account.auth_username.clone(),
                 password: password.clone(),
                 realm: Some(self.account.domain.clone()),
-                auth_username: self.account.auth_username.clone(),
             })
         } else {
             None
