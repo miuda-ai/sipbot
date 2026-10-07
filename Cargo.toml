@@ -37,3 +37,8 @@ serde_json = "1"
 default = ["local-device"]
 local-device = ["dep:cpal", "dep:ringbuf"]
 
+
+# Track the family checkout while rsipstack carries unreleased changes
+# (auth_username on Credential, TLS seam).
+[patch.crates-io]
+rsipstack = { path = "../rsipstack" }
