@@ -34,8 +34,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 fn new_resampler(input_rate: usize, output_rate: usize) -> Option<Resampler<'static>> {
-    let coeffs: &'static mut [f32] =
-        Box::leak(vec![0.0f32; audio_codec::resampler::COEFFS_LEN].into_boxed_slice());
+    // audio-codec 0.4.8+: polyphase coefficients are Q15 i16 (fixed point,
+    // 6144 entries = 12 KB), not f32 — the resampler is allocation-free.
+    let coeffs: &'static mut [i16] =
+        Box::leak(vec![0i16; audio_codec::resampler::COEFFS_LEN].into_boxed_slice());
     Resampler::new(input_rate, output_rate, coeffs).ok()
 }
 
