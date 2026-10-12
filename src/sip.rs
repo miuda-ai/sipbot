@@ -77,6 +77,14 @@ fn wants_tls(to: &Uri, target: &str, account: &AccountConfig) -> bool {
             .is_some_and(|k| k.is_tls())
 }
 
+/// Whether a target/URI explicitly requests TCP transport
+/// (`;transport=tcp`, case-insensitive). Mirrors the probe-service dialing
+/// convention (`sip:echo@host;transport=tcp`) — TCP signalling bypasses
+/// UDP SIP-ALG/DPI that drops WebRTC (`m=audio 9`) offers.
+fn wants_tcp(target: &str) -> bool {
+    target.to_ascii_lowercase().contains("transport=tcp")
+}
+
 #[derive(Clone)]
 struct CallRunner {
     dialog_layer: Arc<DialogLayer>,
@@ -378,6 +386,9 @@ impl CallRunner {
         if wants_tls(&to, &target_uri, &self.account) {
             destination.r#type = Some(Transport::Tls);
         }
+        if wants_tcp(&target_uri) {
+            destination.r#type = Some(Transport::Tcp);
+        }
         if destination.r#type == Some(Transport::Tls) && destination.addr.port.is_none() {
             destination.addr.port = Some(5061.into());
         }
@@ -391,6 +402,21 @@ impl CallRunner {
                 .await
                 .with_context(|| format!("TLS connect to {}", destination))?;
             debug!("[{}] TLS connected to {}", self.account.username, addr);
+        }
+        // Same for outbound TCP (`;transport=tcp`): pre-establish so Via /
+        // Contact carry the TCP transport and the dialog reuses this
+        // connection for in-dialog requests (BYE / re-INVITE).
+        if destination.r#type == Some(Transport::Tcp) {
+            if destination.addr.port.is_none() {
+                destination.addr.port = Some(5060.into());
+            }
+            let (_conn, addr) = dialog_layer
+                .endpoint
+                .transport_layer
+                .lookup(&destination, None)
+                .await
+                .with_context(|| format!("TCP connect to {}", destination))?;
+            debug!("[{}] TCP connected to {}", self.account.username, addr);
         }
 
         let contact =

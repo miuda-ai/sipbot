@@ -544,6 +544,89 @@ code = 486         # currectly not used for caller
    sipbot --conf caller.toml call --total 100 --cps 3
    ```
 
+## Online Regression Testing (rtcprobe)
+
+[rtcprobe](https://probe.rustpbx.com) (`llm.txt`) is a free public SIP/RTP/WebRTC
+diagnostic service — dial its built-in test lines and it scores the call
+(SIP conformance, SDP, RTP/RTCP loss-jitter-RTT, MOS). It is the fastest way to
+smoke-test a sipbot build against a real network peer.
+
+SIP domain `probe.rustpbx.com` (`5060/udp`, `5060/tcp`, `5061/tls`). Media
+auto-adapts to our offer: plain RTP, SRTP/SDES (`--srtp`) and WebRTC
+(`--webrtc`) are all accepted on every line.
+
+### Verified call matrix
+
+All commands below were verified end-to-end (180 → 200, bidirectional RTP,
+clean BYE; packet counts from the final `Progress:` line):
+
+```bash
+WAV=normal.wav   # any 8k/16k mono PCM wav (so the single-call CLI avoids the mic)
+
+# 1. plain RTP over UDP
+sipbot call -t sip:echo@probe.rustpbx.com --play $WAV --hangup 8
+# → 180:1, 200:1, TX/RX ≈ 400p each, loss < 2%
+
+# 2. SRTP / SDES over UDP
+sipbot call -t sip:echo@probe.rustpbx.com --srtp --play $WAV --hangup 8
+
+# 3. WebRTC (ICE + DTLS-SRTP) over TCP signalling
+#    (`;transport=tcp` dials out over TCP — bypasses UDP SIP-ALG/DPI that
+#    drops `m=audio 9` WebRTC offers)
+sipbot call -t 'sip:echo@probe.rustpbx.com;transport=tcp' --webrtc --play $WAV --hangup 8
+
+# 4. SIPS (SIP over TLS, port 5061) + SRTP
+sipbot call -t sips:echo@probe.rustpbx.com --srtp --play $WAV --hangup 8
+
+# 5. RFC 4733 DTMF (the probe reports received keypresses in its report)
+sipbot call -t sip:echo@probe.rustpbx.com --dtmf-flows "2s:5" --play $WAV --hangup 8
+# → ... TX_DTMF: 1
+
+# 6. hold / resume re-INVITEs (absolute offsets from call start)
+sipbot call -t sip:echo@probe.rustpbx.com --reinvite-flows "3s:hold,6s:resume" \
+    --play $WAV --hangup 9
+# → TX packet count ≈ half of a plain call (the held 3 s sends nothing)
+```
+
+Other useful lines: `voicemail` (5 s greeting + beep), `reject` (486 — exercises
+non-2xx handling), `busy` / `offline` (200 → tone → server-side hangup),
+`early` / `ring180` / `ring183` (early-media / ringing variants), `ivr`
+(DTMF menu).
+
+### Machine-readable reports
+
+The dashboard flow is session-based — create a session, dial its temp number,
+poll for the report:
+
+```bash
+# 1. create an echo session
+TOKEN=$(curl -s -X POST https://probe.rustpbx.com/api/test/sessions \
+  -H 'Content-Type: application/json' -d '{"scenario":"echo"}' | jq -r .token)
+
+# 2. dial the session's temp number
+sipbot call -t "sip:$TOKEN@probe.rustpbx.com" --play $WAV --hangup 8
+
+# 3. poll the session → state / call_id / has_report, then fetch the report
+curl -s https://probe.rustpbx.com/api/test/sessions/$TOKEN | jq .
+curl -s https://probe.rustpbx.com/api/result/<call_id> | jq '.result | {score, mos, engine, checks}'
+```
+
+The report includes `score` (0–100), `mos`, per-check pass/warn/fail
+(`one_way_media`, `packet_loss`, `jitter`, `rtcp_feedback`, `dtmf_events`,
+`sdp_*` / `sip_*` conformance, `srtp_sdes` / `dtls_fingerprint` for encrypted
+modes) and the full `sip_flow` ladder.
+
+### Known caveats (observed 2026-10)
+
+- **Report lookup by direct-dial call_id** can return `result not found` on the
+  current deployment even for clean calls — use the session flow above for
+  machine-readable reports.
+- **The probe occasionally never answers our BYE** (~intermittent, seen after
+  re-INVITE flows and on TLS calls). sipbot retransmits per RFC 3261 and the
+  probe's own 60 s session watchdog eventually reaps the call — wrap runs in
+  `timeout 40 sipbot call ...` so CI does not hang.
+- Concurrency is capped (SIP dialogs per UA, default 10) — keep `--cps` low.
+
 ## License
 
 MIT
