@@ -1,6 +1,6 @@
 [package]
 name = "sipbot"
-version = "0.2.73"
+version = "0.2.74"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 repository = "https://github.com/miuda-ai/sipbot"
@@ -16,10 +16,10 @@ serde = { version = "1", features = ["derive"] }
 toml = "1.1.2"
 tracing = "0.1"
 anyhow = "1.0"
-rsipstack = "0.7.3"
+rsipstack = "0.7.5"
 tokio-util = "0.7"
 rustrtc = "0.4.7"
-audio-codec = "0.4.9"
+audio-codec = "0.4.13"
 clap = { version = "4", features = ["derive"] }
 chrono = "0.4.45"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }
@@ -36,9 +36,3 @@ serde_json = "1"
 [features]
 default = ["local-device"]
 local-device = ["dep:cpal", "dep:ringbuf"]
-
-
-# Track the family checkout while rsipstack carries unreleased changes
-# (auth_username on Credential, TLS seam).
-[patch.crates-io]
-rsipstack = { path = "../rsipstack" }
