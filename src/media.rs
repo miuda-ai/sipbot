@@ -9,10 +9,7 @@ use bytes::Bytes;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 #[cfg(feature = "local-device")]
 use ringbuf::{HeapRb, traits::*};
-use rustrtc::config::{
-    AudioCapability, MediaCapabilities, RtcConfiguration, RtcpMuxPolicy, SdpCompatibilityMode,
-    TransportMode,
-};
+use rustrtc::config::{AudioCapability, Keying, MediaCapabilities, RtcConfiguration, RtcpMuxPolicy};
 use rustrtc::media::MediaError;
 use rustrtc::media::MediaKind;
 use rustrtc::media::frame::{AudioFrame, MediaSample};
@@ -511,24 +508,26 @@ impl MediaSession {
         _audio_quality_config: Option<AudioQualityConfig>,
         ts_jump_tolerance_ms: u32,
     ) -> Result<(Self, String, String)> {
-        let mut config = RtcConfiguration::default();
-        if let Some(ip) = external_ip {
-            config.external_ip = Some(ip);
-        }
-        config.transport_mode = if webrtc_enabled {
-            TransportMode::WebRtc
-        } else if srtp_enabled {
-            TransportMode::Srtp
+        // WebRTC peers (browsers/SFUs): full ICE + DTLS-SRTP. Plain SIP
+        // peers (Linphone etc.): direct transport, no WebRTC header
+        // extensions. BUNDLE interop: rustrtc >= 0.6 answers the offered
+        // BUNDLE group and auto-injects sdes:mid into outgoing RTP, so
+        // ortp-style demuxers work (see
+        // test_media_session_answer_bundle_echo_for_linphone_offer).
+        let mut config = if webrtc_enabled {
+            RtcConfiguration::webrtc()
         } else {
-            config.certificates = vec![];
-            TransportMode::Rtp
+            RtcConfiguration::sip()
         };
-        // Plain SIP interop (Linphone etc.): never negotiate RFC 8843 BUNDLE.
-        // We don't send the sdes:mid RTP header extension, so bundle demuxers
-        // (ortp) would drop every packet: "SSRC not found and msg does not
-        // have an extension header".
-        if !webrtc_enabled {
-            config.sdp_compatibility = SdpCompatibilityMode::LegacySip;
+        if let Some(ip) = external_ip {
+            match ip.parse::<std::net::IpAddr>() {
+                Ok(addr) => config.external_ips.push(addr),
+                Err(_) => warn!("invalid external ip: {ip}"),
+            }
+        }
+        if !webrtc_enabled && srtp_enabled {
+            // SDES keying: RTP/SAVP with a=crypto.
+            config.keying = Keying::Sdes;
         }
         let mut audio_caps = get_audio_caps(&codecs, nack_enabled);
         let remote_sdp_upper = remote_sdp.to_uppercase();
@@ -773,21 +772,21 @@ impl MediaSession {
         _audio_quality_config: Option<AudioQualityConfig>,
         ts_jump_tolerance_ms: u32,
     ) -> Result<(Self, String)> {
-        let mut config = RtcConfiguration::default();
-        if let Some(ip) = external_ip {
-            config.external_ip = Some(ip);
-        }
-        config.transport_mode = if webrtc_enabled {
-            TransportMode::WebRtc
-        } else if srtp_enabled {
-            TransportMode::Srtp
+        // See MediaSession::new for the plain SIP (non-WebRTC) config.
+        let mut config = if webrtc_enabled {
+            RtcConfiguration::webrtc()
         } else {
-            config.certificates = vec![];
-            TransportMode::Rtp
+            RtcConfiguration::sip()
         };
-        // See MediaSession::new: don't negotiate BUNDLE with plain SIP peers.
-        if !webrtc_enabled {
-            config.sdp_compatibility = SdpCompatibilityMode::LegacySip;
+        if let Some(ip) = external_ip {
+            match ip.parse::<std::net::IpAddr>() {
+                Ok(addr) => config.external_ips.push(addr),
+                Err(_) => warn!("invalid external ip: {ip}"),
+            }
+        }
+        if !webrtc_enabled && srtp_enabled {
+            // SDES keying: RTP/SAVP with a=crypto.
+            config.keying = Keying::Sdes;
         }
         let audio_caps = get_audio_caps(&codecs, nack_enabled);
         let audio_clock = match audio_caps
@@ -3376,11 +3375,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_media_session_answer_no_bundle_for_linphone_offer() {
-        // Linphone-style offer: a=group:BUNDLE + sdes:mid extmap. Our answer
-        // must NOT echo the BUNDLE group, otherwise ortp demuxes by MID
-        // extension and drops our RTP ("SSRC not found and msg does not have
-        // an extension header").
+    async fn test_media_session_answer_bundle_echo_for_linphone_offer() {
+        // Linphone-style offer: a=group:BUNDLE + sdes:mid extmap. rustrtc
+        // >= 0.6 answers RFC 8843-compliant: the answer echoes the offered
+        // BUNDLE group and mid (strict agents reject their removal), and
+        // rustrtc auto-injects the sdes:mid header extension into our
+        // outgoing RTP, so ortp demuxes by MID instead of dropping every
+        // packet ("SSRC not found and msg does not have an extension
+        // header" — the reason we used to suppress BUNDLE entirely).
         let offer = "v=0\r\n\
 o=alice 1285 868 IN IP4 192.168.3.181\r\n\
 s=Talk\r\n\
@@ -3411,10 +3413,20 @@ a=sendrecv\r\n";
         .await
         .unwrap();
         assert!(
-            !answer_sdp.to_lowercase().contains("a=group:bundle"),
-            "answer must not negotiate BUNDLE: {}",
+            answer_sdp.to_lowercase().contains("a=group:bundle as"),
+            "answer must echo the offered BUNDLE group: {}",
             answer_sdp
         );
+        assert!(
+            answer_sdp.to_lowercase().contains("a=mid:as"),
+            "answer must echo the offered mid: {}",
+            answer_sdp
+        );
+        assert!(
+            answer_sdp.to_lowercase().contains("a=extmap:1"),
+            "answer must echo the offered sdes:mid extmap id: {}",
+            answer_sdp
+       );
         // Codec order follows the offer (opus before pcmu).
         let mline = answer_sdp
             .lines()
